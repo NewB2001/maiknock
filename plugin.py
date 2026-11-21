@@ -1342,7 +1342,7 @@ class MaiKnockPlugin(MaiBotPlugin):
 
         子命令：
         - ``/mk time``                     查看当前时间线状态
-        - ``/mk time +3d`` / ``+12h``      推进故事时间
+        - ``/mk time add 3d`` / ``add 12h`` 推进故事时间
         - ``/mk time back 3d``             回退故事时间（那段时间会被藏起来）
         - ``/mk time set 2026-11-25 09:00`` 把故事时间设为某个绝对时刻
         - ``/mk time off``                 关掉时间线（清隐藏区间 + 追加反向声明）
@@ -1413,11 +1413,11 @@ class MaiKnockPlugin(MaiBotPlugin):
                 return f"设定失败：{exc}"
             return _apply(new_state, "设定故事时间")
 
-        # 推进（+3d / +12h）
-        if head.startswith("+"):
-            delta = self._parse_duration(head[1:])
+        # 推进（add 3d / add 12h）—— 与 back/set 统一的单词子命令
+        if head == "add":
+            delta = self._parse_duration(arg)
             if delta is None:
-                return "无法解析推进幅度。用法：/mk time +3d（或 +12h / +90m）"
+                return "无法解析推进幅度。用法：/mk time add 3d（或 add 12h / add 90m）"
             try:
                 new_state = tl.plan_forward(state, now, delta)
             except ValueError as exc:
@@ -1427,7 +1427,7 @@ class MaiKnockPlugin(MaiBotPlugin):
         return (
             "无法识别的参数。用法：\n"
             "  /mk time                    查看状态\n"
-            "  /mk time +3d                推进故事时间\n"
+            "  /mk time add 3d             推进故事时间\n"
             "  /mk time back 3d            回退故事时间\n"
             "  /mk time set 2026-11-25 09:00  设定绝对时刻\n"
             "  /mk time off                关闭时间线（恢复对话可见）\n"
@@ -1441,7 +1441,7 @@ class MaiKnockPlugin(MaiBotPlugin):
             "/mk diag          —— 查看当前上下文诊断信息\n"
             "/mk hi [话头]     —— 让麦麦立刻主动开口（是否开口由她决定，稍后回读汇报）\n"
             "/mk time          —— 查看虚构时间线状态\n"
-            "/mk time +3d      —— 推进故事时间（只进不退）\n"
+            "/mk time add 3d   —— 推进故事时间（只进不退）\n"
             "/mk time back 3d  —— 回退故事时间（那段时间会被藏起来）\n"
             "/mk time set 2026-11-25 09:00 —— 把故事时间设为某个绝对时刻\n"
             "/mk time off      —— 关闭时间线\n"
@@ -1485,7 +1485,7 @@ class MaiKnockPlugin(MaiBotPlugin):
         `/mk now` / `/mk time off` 会**追加一条反向声明**（R6-21 修的也是这个）
         ⇒ 只有用存下来的那份，反向声明才能一起送到模型。
 
-        ⚠️ **只在「有隐藏区间」时注入** —— 单纯推进时间线（`+3d`）不是失忆，
+        ⚠️ **只在「有隐藏区间」时注入** —— 单纯推进时间线（`add 3d`）不是失忆，
         没必要让麦麦以为那段记忆是空白的。
         ⚠️ **声明不含绝对日期**（R6-18）—— 由 `timeline.py` 写盘时的断言保证。
         """
