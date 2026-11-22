@@ -3,8 +3,8 @@
   "id": "maiknock.webui_companion",
   "version": "0.2.2",
   "name": "麦麦敲门 MaiKnock",
-  "description": "MaiBot WebUI 原生私聊伴侣插件：让麦麦主动来找你聊天、手动一键打招呼、虚构时间线由你掌管（/mk time add 3d 推进剧情）。",
-  "plugin_type": "extension",
+  "description": "WebUI 私聊伴侣插件。让麦麦主动来找你聊天，让你一键打招呼，还能由你掌管她的“现在是哪一天”——把某段时间从她的记忆里藏起来，或直接推进剧情。",
+  "plugin_type": "chat",
   "display": {
     "icon": {
       "type": "local",
@@ -40,6 +40,8 @@
   ],
   "i18n": {
     "default_locale": "zh-CN",
-    "supported_locales": ["zh-CN"]
+    "supported_locales": [
+      "zh-CN"
+    ]
   }
 }
