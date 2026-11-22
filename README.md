@@ -56,17 +56,17 @@
 |---|---|---|
 | `启用插件` | true | 总开关 |
 | `启用主动私聊` | true | 关掉后麦麦不再主动开口，`/mk hi` 仍可用 |
-| `hi_cooldown_minutes` | 3 | `/mk hi` 手动触发的冷却（分钟），防连环触发 |
-| `readback_poll_seconds` | 20 | 触发后回读确认的轮询间隔（秒） |
-| `readback_timeout_seconds` | 240 | 等待麦麦开口的最长回读时间（秒，超时记未响应） |
-| `scan_interval_seconds` | 120 | 主动扫描间隔（秒），最小 30 |
-| `silence_threshold_minutes` | 60 | 静默多久后麦麦可以主动开口（分钟） |
-| `silence_lookback_hours` | 720 | 静默判定回溯窗口（小时），默认 30 天 |
-| `silence_probe_hours` | 87600 | 二次探测窗口（小时），区分"沉默太久"与"从未说过话" |
-| `quiet_hours_start` | 01:00 | 禁止时段开始（24 小时制） |
-| `quiet_hours_end` | 08:00 | 禁止时段结束 |
-| `daily_max` | 5 | 每天最多主动开口次数 |
-| `min_interval_minutes` | 120 | 两次主动开口的最小间隔（分钟） |
+| `hi 冷却（分钟）`（`hi_cooldown_minutes`） | 3 | `/mk hi` 手动触发的冷却（分钟），防连环触发 |
+| `回读轮询间隔（秒）`（`readback_poll_seconds`） | 20 | 触发后回读确认的轮询间隔（秒） |
+| `回读超时（秒）`（`readback_timeout_seconds`） | 240 | 等待麦麦开口的最长回读时间（秒，超时记未响应） |
+| `扫描间隔（秒）`（`scan_interval_seconds`） | 120 | 主动扫描间隔（秒），最小 30 |
+| `静默阈值（分钟）`（`silence_threshold_minutes`） | 60 | 静默多久后麦麦可以主动开口（分钟） |
+| `静默回溯窗口（小时）`（`silence_lookback_hours`） | 720 | 静默判定回溯窗口（小时），默认 30 天 |
+| `静默探测窗口（小时）`（`silence_probe_hours`） | 87600 | 二次探测窗口（小时），区分"沉默太久"与"从未说过话" |
+| `禁言时段开始`（`quiet_hours_start`） | 01:00 | 禁止时段开始（24 小时制） |
+| `禁言时段结束`（`quiet_hours_end`） | 08:00 | 禁止时段结束 |
+| `每日主动上限`（`daily_max`） | 5 | 每天最多主动开口次数 |
+| `最小主动间隔（分钟）`（`min_interval_minutes`） | 120 | 两次主动开口的最小间隔（分钟） |
 
 配置保存在插件目录的 `config.toml`，也可以直接改文件（改完热更新）。
 
