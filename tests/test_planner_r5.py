@@ -164,6 +164,78 @@ check("普通历史消息不被 R5 丢（靠 meta.timestamp 遮蔽那条路走�
       res6.r5_dropped == 0)
 
 print()
+print("=" * 68)
+print("第 7 节：R-18 记忆类注入整段屏蔽 + T-F04 待办擦除回归")
+print("=" * 68)
+
+# 记忆类注入的 meta.timestamp = 构造时刻 NOW ⇒ 常规遮蔽（按 timestamp）碰不到它
+profile_text = (
+    "【人物画像-内部参考】\n以下内容仅供内部推理，不要向用户逐字复述。\n\n"
+    "人类：\n  ## 稳定了解\n- 目标人物喜欢草莓蛋糕\n"
+)
+heuristic_text = "【启发式记忆-内部参考】\n以下是与当前话题相关的历史记忆：\n- 记录1"
+image_text = "【图片记忆-内部参考】\n以下内容来自当前图片的历史同图或相似图记录"
+normal_user_text = "帮我看看【人物画像-内部参考】这个标记是什么意思（正文提及，非注入）"
+
+inj_items = [
+    mk_item(profile_text, NOW, "profile"),
+    mk_item(heuristic_text, NOW, "heuristic"),
+    mk_item(image_text, NOW, "image"),
+    mk_item(normal_user_text, NOW, "normal"),
+]
+
+# 7.1 开关关闭（无隐藏窗口）⇒ 全部放行
+res7a = PP.process_planner_items(inj_items, is_hidden, OFFSET, now_ts=NOW)
+check("R-18 关：4 条 item 全保留", len(res7a.items) == 4)
+check("R-18 关：memory_blocked == 0", res7a.memory_blocked == 0)
+
+# 7.2 开关打开（有隐藏窗口）⇒ 三条注入整段屏蔽，普通消息保留
+res7b = PP.process_planner_items(
+    inj_items, is_hidden, OFFSET, now_ts=NOW, block_memory_injections=True)
+check("R-18 开：屏蔽 3 条记忆注入", res7b.memory_blocked == 3)
+check("R-18 开：只剩 1 条（正文提及标记的普通消息）", len(res7b.items) == 1)
+check("R-18 开：留下的正是那条普通消息",
+      bool(res7b.items) and "帮我看看" in PP._item_text(res7b.items[0]))
+check("R-18 开：有告警说明",
+      any("记忆类注入" in w and "R-18" in w for w in res7b.warnings))
+
+# 7.3 开关打开但注入文本带前导空白 ⇒ 依然按 startswith 命中
+res7c = PP.process_planner_items(
+    [mk_item("\n " + profile_text, NOW, "profile-pad")],
+    is_hidden, OFFSET, now_ts=NOW, block_memory_injections=True)
+check("R-18 开：前导空白不影响命中", res7c.memory_blocked == 1)
+
+# 7.4 T-F04 回归：待办 JSON 里 created_at 在隐藏区间内的条目被滤掉
+import json as _json
+todo_in_hidden = {
+    "id": "t1", "text": "记住哦，我最喜欢吃草莓蛋糕",
+    "created_at": BOUNDARY + 1.0, "kind": "user",
+}
+todo_new = {
+    "id": "t2", "text": "记住暗号：绿萝",
+    "created_at": UNTIL + 120.0, "kind": "bot",  # 回退之后 ⇒ 新记忆（R-13b）
+}
+todo_normal = {
+    "id": "t3", "text": "很老的待办",
+    "created_at": BOUNDARY - 3600.0, "kind": "bot",
+}
+sys_text = (
+    "以下是当前记录活跃的待办事项。\n"
+    + _json.dumps([todo_in_hidden, todo_new, todo_normal], ensure_ascii=False)
+    + "\n这些待办会一直保存。"
+)
+res7d = PP.process_planner_items(
+    [mk_item(sys_text, NOW, "sys")], is_hidden, OFFSET,
+    now_ts=NOW, scrub_schedule=True, block_memory_injections=True)
+check("T-F04：滤掉 1 条区间内待办", res7d.schedule_scrubbed == 1)
+kept_json = _json.loads(PP._item_text(res7d.items[0]).split("\n")[1]) \
+    if len(res7d.items) == 1 else []
+ids = [t.get("id") for t in kept_json]
+check("T-F04：草莓蛋糕没了", "t1" not in ids)
+check("R-13b：回退后写的绿萝待办保留（新记忆语义）", "t2" in ids)
+check("T-F04：不误伤更老的待办", "t3" in ids)
+
+print()
 if FAILED:
     print("❌ %d 项失败：%s" % (len(FAILED), FAILED))
     sys.exit(1)
