@@ -1,0 +1,20 @@
+# 麦麦敲门 MaiKnock 配置示例
+# 复制本文件为 config.toml 后按需修改；config.toml 不会进入版本控制。
+
+[plugin]
+enabled = true
+config_version = "0.2.2"
+
+[proactive]
+enabled = true                 # 是否开启主动私聊
+scan_interval_seconds = 120    # 扫描间隔
+silence_threshold_minutes = 60 # 沉默多久后可能主动找你
+silence_lookback_hours = 720   # 回看窗口（30 天）
+silence_probe_hours = 87600    # 极长兜底窗口
+quiet_hours_start = "01:00"    # 免打扰开始（不主动打扰）
+quiet_hours_end = "08:00"      # 免打扰结束
+daily_max = 5                  # 每天最多主动私聊次数
+min_interval_minutes = 120     # 两次主动私聊最小间隔
+hi_cooldown_minutes = 3        # 手动打招呼冷却
+readback_poll_seconds = 20     # 回读轮询间隔
+readback_timeout_seconds = 240 # 回读超时
