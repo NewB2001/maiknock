@@ -19,10 +19,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # ⚠️ **载体白名单统一在 `carriers.py`**（M4 第⑤步 J）——
 #    planner 与 replyer 共用同一套判定，避免两边口径漂移。
@@ -57,6 +58,128 @@ PLANNER_CURRENT_TIME_RE = re.compile(
 RELABEL_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
+# ---------------------------------------------------------------------------
+# T-F04（P0，测试岗 2026-11-22 坐实）：宿主「待办/日程」是第二条泄漏通道。
+# 宿主把「记住 X」落成 `data/schedules/<session>.json` 的 schedule 项
+# （`desktop_pet/todo_context.py` → `chat_loop_service.py:1055-1060`），
+# **原样追加进 planner 的 system prompt** —— 我们的遮蔽层只处理对话 item，
+# 碰不到这份存储 ⇒ 被遮蔽的内容被麦麦自己写成待办、再被宿主喂回模型。
+# ✅ 可行性：待办注入（:1055）**早于** hook 触发（:1262）⇒ system item 会经过
+#    本 hook ⇒ 在这里把「创建时刻落在隐藏区间内」的待办项从 JSON 里滤掉即可，
+#    不动宿主。待办 JSON 只进 planner 请求（replyer 侧无此注入）⇒ 拦一处全覆盖。
+# ---------------------------------------------------------------------------
+
+#: 待办 JSON 数组扫描的 span 上限（防病态超长文本）。
+_SCHEDULE_JSON_MAX_SPAN = 200_000
+
+# ---------------------------------------------------------------------------
+# R-18（复测 2026-11-22 14:00 坐实，P0 残留）：宿主「记忆类一次性注入」是
+# 第三条泄漏通道。`reasoning_engine._build_planner_injected_user_messages`
+# 每轮往 planner 请求注入三种记忆类内容，全部来自记忆存储（A_Memorix），
+# 其中可能包含**从被遮蔽时段的对话提炼的条目**（复测实测：画像里
+# 「目标人物喜欢草莓蛋糕」正是 11-22 00:04 那句「记住哦，我最喜欢吃草莓蛋糕」
+# 提炼的）。它们**不是 JSON**（scrub_schedule_json 碰不到）、
+# `meta.timestamp` = 构造时刻 now（常规遮蔽也碰不到）。
+# ✅ PM 拍板（2026-11-22）：有隐藏窗口时**整段屏蔽**（宁可少给上下文，
+#    也不能泄漏）——与 blob 侧 `_mask_facts_section` 同一纪律。
+# ✅ 可行性：三种注入都是 planner 请求的普通 item ⇒ 都过本 hook；
+#    replyer 侧 blob 由 hook 之后的请求快照派生 ⇒ 拦一处全覆盖。
+# ⚠️ 用 startswith 判定（三种注入的文本都以标记开头，person_profile.py:186 /
+#    heuristic_injector.py:23 / image_injector.py:13）——
+#    不用 `in`，防止把**正文里恰好提到这些标记的用户消息**误删。
+# ---------------------------------------------------------------------------
+MEMORY_INJECTION_MARKERS = (
+    "【启发式记忆-内部参考】",
+    "【人物画像-内部参考】",
+    "【图片记忆-内部参考】",
+)
+
+
+def _find_json_array_spans(text: str) -> List[Tuple[int, int]]:
+    """扫描文本里所有**平衡的** JSON 数组 span（字符串感知），返回 [(start, end)]。
+
+    只记录「深度回到 0」的**顶层**数组；引号内的括号不算结构。
+    """
+    spans: List[Tuple[int, int]] = []
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "]":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    if i - start <= _SCHEDULE_JSON_MAX_SPAN:
+                        spans.append((start, i + 1))
+                    start = -1
+    return spans
+
+
+def _looks_like_schedule_items(data: Any) -> bool:
+    """判定解析出的 JSON 是否为宿主待办数组。
+
+    识别特征（`src/services/schedules/store.py` 的 item 形状）：
+    list[dict]，元素含数值型 `created_at` 与字符串 `text`。
+    """
+    if not isinstance(data, list) or not data:
+        return False
+    return all(
+        isinstance(x, dict) and isinstance(x.get("created_at"), (int, float)) and "text" in x
+        for x in data
+    )
+
+
+def scrub_schedule_json(text: str, is_hidden: Callable[[float], bool]) -> Tuple[str, int]:
+    """把 system 文本里、**创建时刻落在隐藏区间内**的待办项从 JSON 数组中滤掉。
+
+    :returns: (new_text, dropped_count)
+    ⚠️ 幂等：无命中时原样返回。
+    """
+    if "[" not in text:
+        return text, 0
+    dropped_total = 0
+    # 从后往前替换，避免前一次替换改变后续 span 的偏移
+    for start, end in reversed(_find_json_array_spans(text)):
+        raw = text[start:end]
+        try:
+            data = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            continue
+        if not _looks_like_schedule_items(data):
+            continue
+        kept: List[Dict[str, Any]] = []
+        dropped = 0
+        for it in data:
+            try:
+                created = float(it.get("created_at"))
+            except (TypeError, ValueError):
+                kept.append(it)
+                continue
+            if is_hidden(created):
+                dropped += 1
+                continue
+            kept.append(it)
+        if dropped:
+            text = text[:start] + json.dumps(kept, ensure_ascii=False) + text[end:]
+            dropped_total += dropped
+    return text, dropped_total
+
+
 @dataclass
 class PlannerResult:
     """planner 侧处理结果。"""
@@ -65,6 +188,9 @@ class PlannerResult:
     hidden_items: int = 0
     relabeled_items: int = 0
     current_time_relabeled: bool = False
+    schedule_scrubbed: int = 0  # T-F04：从待办 JSON 里滤掉的条数
+    #: R-18：整段屏蔽的记忆类注入（启发式记忆/人物画像/图片记忆）条数
+    memory_blocked: int = 0
     #: R5 丢弃的跨日提示数（落在隐藏区间内的那几条）
     r5_dropped: int = 0
     warnings: List[str] = field(default_factory=list)
@@ -160,6 +286,8 @@ def process_planner_items(
     relabel_current_time: bool = True,
     msg_id_ts: Optional[Dict[str, float]] = None,
     drop_crossday_in_hidden: bool = True,
+    scrub_schedule: bool = False,
+    block_memory_injections: bool = False,
 ) -> PlannerResult:
     """处理 planner 侧的 items：**先 relabel → 再遮蔽**。
 
@@ -169,6 +297,11 @@ def process_planner_items(
     :param now_ts: 「现在」的 epoch 秒（用于区分「当前时间提示」与「跨日提示」）
     :param msg_id_ts: ``msg_id → 真实 epoch`` 映射（R6-17 第三种载体用）
     :param drop_crossday_in_hidden: R5 —— 跨日提示若落在隐藏区间内则丢弃
+    :param scrub_schedule: T-F04 —— 有隐藏区间时，滤掉 system 文本里
+        创建于隐藏期内的宿主待办项（**只应有隐藏窗口时才传 True**）
+    :param block_memory_injections: R-18 —— 有隐藏区间时，整段屏蔽
+        宿主的记忆类一次性注入（启发式记忆/人物画像/图片记忆）
+        （**只应有隐藏窗口时才传 True**；无隐藏时记忆注入原样放行）
     """
     warnings: List[str] = []
     out: List[Dict[str, Any]] = []
@@ -265,6 +398,50 @@ def process_planner_items(
             "未找到 planner 侧的「时间：」item（relabel 漏掉当前时间）"
         )
 
+    # ---------- 第 1.5 步（T-F04 P0）：system 文本里的宿主「待办/日程」JSON ----------
+    # 创建时刻落在隐藏区间内的待办 ⇒ 从注入文本里滤掉（否则麦麦被"自己的笔记"提醒）
+    schedule_scrubbed = 0
+    if scrub_schedule:
+        for idx, item in enumerate(out):
+            if not isinstance(item, dict):
+                continue
+            text0 = _item_text(item)
+            if not text0 or "[" not in text0:
+                continue
+            new_text0, dropped = scrub_schedule_json(text0, is_hidden)
+            if dropped:
+                out[idx] = _replace_item_text(item, new_text0)
+                schedule_scrubbed += dropped
+        if schedule_scrubbed:
+            warnings.append(
+                f"已从宿主待办上下文隐藏 {schedule_scrubbed} 条创建于被遮蔽期内的日程项（T-F04）"
+            )
+
+    # ---------- 第 1.6 步（R-18 P0 残留）：屏蔽宿主「记忆类一次性注入」 ----------
+    # 三种注入（启发式记忆/人物画像/图片记忆）的内容来自记忆存储，
+    # 可能含被遮蔽时段提炼的条目，且不是 JSON、meta.timestamp=now ⇒
+    # 前面的遮蔽与待办擦除都碰不到 ⇒ 有隐藏窗口时整段屏蔽。
+    memory_blocked = 0
+    if block_memory_injections:
+        kept_inj: List[Dict[str, Any]] = []
+        for item in out:
+            if not isinstance(item, dict):
+                kept_inj.append(item)
+                continue
+            text_m = _item_text(item)
+            if text_m and any(
+                text_m.lstrip().startswith(mk) for mk in MEMORY_INJECTION_MARKERS
+            ):
+                memory_blocked += 1
+                continue
+            kept_inj.append(item)
+        if memory_blocked:
+            out = kept_inj
+            warnings.append(
+                "已整段屏蔽 %d 条宿主记忆类注入（启发式记忆/人物画像/图片记忆，R-18）"
+                % memory_blocked
+            )
+
     # ---------- 第 2 步：遮蔽（判据用 meta.timestamp，**与文本无关**） ----------
     kept: List[Dict[str, Any]] = []
     for item in out:
@@ -283,5 +460,7 @@ def process_planner_items(
         relabeled_items=relabeled,
         current_time_relabeled=current_time_done,
         r5_dropped=r5_dropped,
+        schedule_scrubbed=schedule_scrubbed,
+        memory_blocked=memory_blocked,
         warnings=warnings,
     )
