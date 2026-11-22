@@ -1,0 +1,12 @@
+# 运行配置：用户本地生成，不入版本控制（示例见 config.example.toml）
+config.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 编辑器
+.idea/
+.vscode/
