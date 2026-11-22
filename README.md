@@ -3,7 +3,7 @@
 > 给 [MaiBot](https://github.com/Mai-with-u/MaiBot) 做的 WebUI 私聊伴侣插件。
 > 让麦麦**主动来找你聊天**，让你**一键打招呼**，还能**由你掌管她的"现在是哪一天"**——把某段时间从她的记忆里藏起来，或直接推进剧情。
 
-- **版本**：v0.2.0
+- **版本**：v0.2.1
 - **插件 ID**：`maiknock.webui_companion`
 - **兼容**：MaiBot 1.3.11 ~ 1.4.x，plugin-sdk 2.15+
 - **协议**：MIT
