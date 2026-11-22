@@ -11,6 +11,16 @@
 _manifest.json 与 config.toml 无法引用 Python 常量，改由启动自检
 _check_version_consistency() 比对并告警。
 
+0.2.2 变更要点（2026-11-22 15:10，R-22/R-22b）：
+- R-22【P0 第四通道】：有隐藏窗口时从 tool_definitions 摘除 query_memory /
+  query_person_profile（模型主动检索会把记忆库内容经工具输出带回 prompt，
+  整段屏蔽碰不到 FunctionCallOutputItem；工具调不到 ⇒ 没有输出 ⇒ 没有泄漏）
+- R-22b【结构缺口】：query_memory 检索结果会被宿主构造成
+  【长期记忆检索结果-内部参考】独立 item 透传给 replyer ⇒ replyer hook
+  在 blob 查找之前整条剔除（含无 blob 的提前 return 路径）
+- 回归：224 项断言全过（+6）
+- 记忆存储已按 PM 指令清理（<=2026-11-21 全清，详见《记忆存储清理报告-20261122_1505》）
+
 0.2.1 变更要点（2026-11-22 复测修复，测试岗《修复复测报告-20261122_1400》）：
 - R-18（P0 残留）：宿主「记忆类一次性注入」（启发式记忆/人物画像/图片记忆）
   可能含被遮蔽时段提炼的条目 ⇒ 有隐藏窗口时整段屏蔽（planner_processor
@@ -93,7 +103,7 @@ _MK_BLOCK_START_RE = re.compile(r"(?m)^\[\d{2}:\d{2}:\d{2}\]")
 
 # 插件版本号唯一来源（审计 A-3）：Python 侧一律引用此常量；
 # _manifest.json / config.toml 无法引用，由 _check_version_consistency() 启动自检比对告警。
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # ---------------------------------------------------------------------------
 # F2 虚构时间线：纯逻辑模块 timeline.py
@@ -1712,6 +1722,19 @@ class MaiKnockPlugin(MaiBotPlugin):
         for w in res.warnings:
             logger.warning("[MaiKnock] planner 侧：%s", w)
 
+        # ---------- R-22（PM 2026-11-22 拍板）：摘除记忆检索类工具 ----------
+        # 有隐藏窗口时，从工具目录剔除 query_memory / query_person_profile ——
+        # 模型主动检索会把记忆库里的被藏时段内容经工具输出带回 prompt（第四条通道）。
+        # 工具调不到 ⇒ 没有输出 ⇒ 没有泄漏。hook 每轮都触发 ⇒ 每轮目录都被过滤。
+        filtered_tools = None
+        if state.has_hidden_window() and isinstance(kwargs.get("tool_definitions"), list):
+            filtered_tools, tools_removed = mk_planner.filter_memory_tools(kwargs["tool_definitions"])
+            if tools_removed:
+                logger.info(
+                    "[MaiKnock] 已从工具目录摘除 %d 个记忆检索工具（query_memory/query_person_profile，R-22）",
+                    tools_removed,
+                )
+
         # ---------- 叙事声明注入（机制 3 · R6-12：每轮注入到 items 末尾）----------
         # ⚠️ 必须在**遮蔽之后**注入 ⇒ 声明要活到最后（不被遮蔽、不被倒扫挤出）
         final_items = res.items
@@ -1726,6 +1749,8 @@ class MaiKnockPlugin(MaiBotPlugin):
 
         new_kwargs = dict(kwargs)
         new_kwargs["items"] = final_items
+        if filtered_tools is not None:
+            new_kwargs["tool_definitions"] = filtered_tools
         return {"action": "continue", "modified_kwargs": new_kwargs}
 
     @HookHandler(
@@ -1753,6 +1778,32 @@ class MaiKnockPlugin(MaiBotPlugin):
         stream_id = str(kwargs.get("session_id") or "")
         reply_message_id = str(kwargs.get("reply_message_id") or "")
 
+        # ---------- R-22b（复测更正报告 2026-11-22 15:00）----------
+        # `query_memory` 的检索结果会被宿主构造成以
+        # 【长期记忆检索结果-内部参考】开头的独立 item 透传给 replyer
+        # （query_memory.py:146/335）⇒ 有隐藏窗口时整条剔除。
+        # ⚠️ startswith 判定（与 planner 侧同一纪律），防误删正文提及标记的消息。
+        # ⚠️ 必须放在 blob 查找之前 —— 没有 blob 时也会提前 return，不能漏拦。
+        new_items = None
+        if state.has_hidden_window():
+            kept_items = []
+            ref_dropped = 0
+            for it in items:
+                if isinstance(it, dict):
+                    t = _mk_item_text(it)
+                    if t and t.lstrip().startswith(
+                        mk_planner.REPLYER_MEMORY_REFERENCE_MARKER
+                    ):
+                        ref_dropped += 1
+                        continue
+                kept_items.append(it)
+            if ref_dropped:
+                items = kept_items
+                new_items = kept_items
+                logger.info(
+                    "[MaiKnock] 已屏蔽 %d 条长期记忆检索结果透传（R-22b）", ref_dropped
+                )
+
         # 找出承载 blob 的 UserMessageItem（replyer 侧历史恒为一块 blob）
         # ⚠️ 必须用**正则**判断，不能用字面量 "[HH:MM:SS]" —— 实际内容是
         # `[16:50:07]` 这种真实时刻，字面量匹配**永远不中**（23:10 实测踩过：
@@ -1767,14 +1818,20 @@ class MaiKnockPlugin(MaiBotPlugin):
             if _MK_BLOCK_START_RE.search(text):
                 target_idx = i
                 break
-        if target_idx < 0:
+        def _continue_with_filtered() -> Dict[str, Any]:
+            """R-22b 已剔除记忆透传时的提前返回：必须把过滤后的 items 回传。"""
+            if new_items is not None:
+                return {"action": "continue", "modified_kwargs": {**dict(kwargs), "items": new_items}}
             return {"action": "continue"}
+
+        if target_idx < 0:
+            return _continue_with_filtered()
 
         # T-C06：先切块，再按「未匹配块数」判据迭代扩窗取候选集
         blocks = mk_matcher.split_blob(text) if mk_matcher else []
         cands = await self._f2_fetch_candidates(stream_id, blocks or None)
         if not cands:
-            return {"action": "continue"}
+            return _continue_with_filtered()
 
         item = items[target_idx]
         text = _mk_item_text(item)
@@ -1787,7 +1844,7 @@ class MaiKnockPlugin(MaiBotPlugin):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[MaiKnock] replyer 侧改写失败，本轮放行原样：%r", exc)
-            return {"action": "continue"}
+            return _continue_with_filtered()
 
         if res.hidden_blocks or res.relabeled_blocks or res.current_time_relabeled:
             logger.info(
