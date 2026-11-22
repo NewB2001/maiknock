@@ -11,6 +11,21 @@
 _manifest.json 与 config.toml 无法引用 Python 常量，改由启动自检
 _check_version_consistency() 比对并告警。
 
+0.2.1 变更要点（2026-11-22 复测修复，测试岗《修复复测报告-20261122_1400》）：
+- R-18（P0 残留）：宿主「记忆类一次性注入」（启发式记忆/人物画像/图片记忆）
+  可能含被遮蔽时段提炼的条目 ⇒ 有隐藏窗口时整段屏蔽（planner_processor
+  第 1.6 步 MEMORY_INJECTION_MARKERS，startswith 判定防误删）
+- R-19（P2）：扩窗档位 24/96/384 收敛为 24/96 —— 永远失配的块不再驱动
+  第三档 384h 取数（hook 超时上限 6000ms，库大了会贵）
+- R-20（P2）：版本号 bump 0.2.1 + /mk diag 显示版本（修复前后可区分）
+- R-13b 语义拍板（PM 2026-11-22）：回退之后、回退会话期间新写下的
+  待办/记忆 = 新时间线的新记忆，**不隐藏**（created_at 落在隐藏区间外
+  本来就不滤，与实现一致；语义边界已写进《时间回滚设计》）
+- R-17 判定为误诊：工具续跑轮走回 chat_loop_step（reasoning_engine.py:479
+  → chat_loop_step，hook 挂在其中）⇒ hook 每轮触发；复测两份快照里
+  草莓蛋糕待办两轮都不在 ⇒ 擦除未失效。第二轮出现的「绿萝」待办
+  created_at=13:51:21 > 回退上界 13:49:54，属 R-13b 新记忆语义
+
 本版变更要点（M2 扫描循环 + 审计 A 系列修复）：
 - M2 扫描循环落地：_scan_loop / _scan_once / _in_quiet_hours（跨天安全）/
   _daily_quota_exceeded / _bump_daily_count / _silence_duration_seconds；
@@ -56,6 +71,7 @@ import json
 import logging
 import os
 import re
+import struct
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -77,7 +93,7 @@ _MK_BLOCK_START_RE = re.compile(r"(?m)^\[\d{2}:\d{2}:\d{2}\]")
 
 # 插件版本号唯一来源（审计 A-3）：Python 侧一律引用此常量；
 # _manifest.json / config.toml 无法引用，由 _check_version_consistency() 启动自检比对告警。
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # ---------------------------------------------------------------------------
 # F2 虚构时间线：纯逻辑模块 timeline.py
@@ -562,7 +578,7 @@ class MaiKnockPlugin(MaiBotPlugin):
         rest = parts[2].strip() if len(parts) >= 3 else ""
 
         if sub == "bind":
-            reply = self._cmd_bind(stream_id, platform, user_id)
+            reply = await self._cmd_bind(stream_id, platform, user_id)
         elif sub == "diag":
             reply = self._cmd_diag(kwargs)
             if stream_id:
@@ -597,9 +613,30 @@ class MaiKnockPlugin(MaiBotPlugin):
 
     # ---- 子命令实现 ----
 
-    def _cmd_bind(self, stream_id: str, platform: str, user_id: str) -> str:
+    async def _cmd_bind(self, stream_id: str, platform: str, user_id: str) -> str:
         if not stream_id:
             return "绑定失败：当前上下文没有聊天流 ID。请在 WebUI 私聊窗口里执行 /mk bind"
+        # T-F03（测试岗 2026-11-22，静态分析）：群聊里敲 /mk bind 会把主动私聊
+        # 目标绑到群聊流 ⇒ F1 的私聊逻辑全错位。⇒ 校验目标必须是**私聊流**。
+        # 宿主能力 `chat.get_private_streams` 返回
+        # {"success": bool, "streams": [{"stream_id"/"session_id", ...}]}
+        # （plugin_runtime/capabilities/data.py:304-310 + _serialize_stream）。
+        if platform:
+            try:
+                res = await self.ctx.call_capability("chat.get_private_streams", platform=platform)
+                streams = (res or {}).get("streams") if isinstance(res, dict) else None
+                if isinstance(streams, list):
+                    private_ids = {
+                        str(s.get("stream_id") or s.get("session_id") or "")
+                        for s in streams if isinstance(s, dict)
+                    }
+                    if stream_id not in private_ids:
+                        return (
+                            "绑定失败：当前聊天流不是私聊流。"
+                            "麦麦敲门只管私聊，请到 WebUI 的私聊窗口里执行 /mk bind。"
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[MaiKnock] 校验私聊流失败，放行绑定（platform=%s）：%r", platform, exc)
         state = self._load_state()
         old = state.get("bound_stream_id")
         state["bound_stream_id"] = stream_id
@@ -673,6 +710,7 @@ class MaiKnockPlugin(MaiBotPlugin):
         bound = state.get("bound_stream_id", "（未绑定）")
         lines = [
             "MaiKnock 诊断",
+            f"插件版本：{VERSION}（R-20：修复前后可区分）",
             f"当前流：{stream_id or '（空）'}",
             f"平台：{platform or '（空）'}",
             f"用户：{user_id or '（空）'}",
@@ -1224,6 +1262,16 @@ class MaiKnockPlugin(MaiBotPlugin):
         s = self._parse_hhmm(start)
         e = self._parse_hhmm(end)
         if s is None or e is None or s == e:
+            # T-E01（测试岗 2026-11-22）：配置非法（如 25:00）时静默禁用禁止时段
+            # ⇒ 用户以为有禁言保护、实际没有。⇒ 解析失败时打一条去重告警
+            # （s == e 的空区间是合法配置，不告警）。
+            if (s is None or e is None) and not getattr(self, "_quiet_hours_warned", False):
+                self._quiet_hours_warned = True
+                logger.warning(
+                    "[MaiKnock] proactive.quiet_hours 配置非法（start=%r end=%r），"
+                    "禁言时段已被静默禁用，请修正为 HH:MM（0-23:0-59）",
+                    start, end,
+                )
             return False  # 配置非法或区间为空，视为不禁止
         if s < e:
             # 同一天内：s <= now < e
@@ -1357,12 +1405,20 @@ class MaiKnockPlugin(MaiBotPlugin):
             state = tl.TimelineState()
 
         text = (rest or "").strip()
-        if not text:
+        if not text or text.strip().lower() == "time":
+            # T-A13（测试岗 2026-11-22）：`/mk time time` 与 `/mk time` 等价（查状态）
             return tl.describe_state(state, now)
 
         parts = text.split(maxsplit=1)
         head = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
+
+        # 测试岗 T-A08（2026-11-22 坐实）：旧实现**先写盘后渲染**，
+        # 极端幅度（如 add 999999999999999999999d）在 describe_state 里
+        # strftime 溢出抛 OverflowError ⇒ 状态已落盘、命令无回复、
+        # 之后每一轮 hook 都崩 ⇒ 遮蔽整体失效。
+        # ⇒ 修复：① 偏移幅度上限（±100 年）前置校验；② **先渲染成功再写盘**。
+        _MAX_OFFSET_SEC = 100.0 * 365.25 * 86400.0
 
         def _apply(new_state, action: str) -> str:
             # R6-18 自检：声明里不得出现绝对日期（否则回退后麦麦能读出今天几号）
@@ -1370,6 +1426,15 @@ class MaiKnockPlugin(MaiBotPlugin):
                 tl.assert_declaration_has_no_absolute_date(new_state.declaration)
             except ValueError as exc:
                 return f"操作已放弃：{exc}"
+            if abs(float(new_state.offset_sec or 0.0)) > _MAX_OFFSET_SEC:
+                return (
+                    "操作已放弃：时间偏移超出上限（±100 年）。"
+                    "状态未写入，时间线保持原样。"
+                )
+            try:
+                desc = tl.describe_state(new_state, now)
+            except (OverflowError, OSError, ValueError, struct.error) as exc:
+                return f"操作已放弃：时间幅度超出可表示范围，状态未写入（{exc}）"
             if not self._save_timeline(new_state):
                 return f"{action}失败：时间线状态写入失败（详见插件日志）"
             logger.info(
@@ -1377,7 +1442,7 @@ class MaiKnockPlugin(MaiBotPlugin):
                 action, new_state.mode, new_state.offset_sec,
                 new_state.boundary_ts, new_state.hidden_until_ts,
             )
-            return f"{action}完成。\n" + tl.describe_state(new_state, now)
+            return f"{action}完成。\n" + desc
 
         # 恢复现实时间（PM 拍板：追加反向声明，不撤旧声明）
         if head in ("now", "reset", "real"):
@@ -1406,7 +1471,10 @@ class MaiKnockPlugin(MaiBotPlugin):
         if head == "set":
             target = self._parse_target_time(arg)
             if target is None:
-                return "无法解析目标时刻。用法：/mk time set 2026-11-25 09:00"
+                # T-A14（测试岗 2026-11-22）：示例**不含绝对日期** ——
+                # 回退态下 _send_text 的统一脱敏会把示例里的 `2026-11-25`
+                # 抹成「日期已隐去」⇒ 教用户敲一条错的命令。
+                return "无法解析目标时刻。用法：/mk time set <YYYY-MM-DD> <HH:MM>"
             try:
                 new_state = tl.plan_set_story_time(state, now, target)
             except ValueError as exc:
@@ -1429,7 +1497,7 @@ class MaiKnockPlugin(MaiBotPlugin):
             "  /mk time                    查看状态\n"
             "  /mk time add 3d             推进故事时间\n"
             "  /mk time back 3d            回退故事时间\n"
-            "  /mk time set 2026-11-25 09:00  设定绝对时刻\n"
+            "  /mk time set <YYYY-MM-DD> <HH:MM>  设定绝对时刻\n"
             "  /mk time off                关闭时间线（恢复对话可见）\n"
             "  /mk now                     恢复到现实时间"
         )
@@ -1443,7 +1511,7 @@ class MaiKnockPlugin(MaiBotPlugin):
             "/mk time          —— 查看虚构时间线状态\n"
             "/mk time add 3d   —— 推进故事时间（只进不退）\n"
             "/mk time back 3d  —— 回退故事时间（那段时间会被藏起来）\n"
-            "/mk time set 2026-11-25 09:00 —— 把故事时间设为某个绝对时刻\n"
+            "/mk time set <YYYY-MM-DD> <HH:MM> —— 把故事时间设为某个绝对时刻\n"
             "/mk time off      —— 关闭时间线\n"
             "/mk now           —— 恢复到现实时间\n"
             "/mk help          —— 显示本帮助"
@@ -1520,7 +1588,7 @@ class MaiKnockPlugin(MaiBotPlugin):
 
         return _dt.datetime.now().isoformat()
 
-    async def _f2_fetch_candidates(self, stream_id: str):
+    async def _f2_fetch_candidates(self, stream_id: str, blocks=None):
         """取 `get_recent` 候选集（**迭代扩窗**，P22 / R6-30）。
 
         ⚠️ `hours` **每次都要显式传**（能力默认 24.0，`capabilities/data.py:508`）。
@@ -1533,11 +1601,28 @@ class MaiKnockPlugin(MaiBotPlugin):
         `ctx.call_capability("message.get_recent", ...)`。
         且该能力在 `_CAPABILITY_RESULT_KEYS` 里登记为返回 **`messages` 列表**
         （不是整个 dict）⇒ **不要**去取 `res["messages"]`。
+
+        ⚠️ T-C06（测试岗 2026-11-22 坐实）：旧实现「拿到非空候选就 return」
+        ⇒ 24h 窗口几乎永远非空 ⇒ 96/384 两档从未被用到 ⇒
+        回退跨度 >24h 时，更早的对话永远匹配不上 ⇒ **漏遮蔽**。
+        ⇒ 规格口径：传入 blocks 时按「未匹配块数」判据迭代扩窗 ——
+          24h 有候选但仍有块对不上 ⇒ 扩到 96h，取**匹配块数最多**的一档；
+          全部对齐则提前返回。
+        ⚠️ R-19（复测 2026-11-22，P2）：**不再设 384h 第三档** ——
+          只要存在永远失配的块（噪声/宿主不保留的形状），旧三档会让
+          **每一轮** replyer 都跑满 24/96/384 三次取数（实测 11ms，库大了
+          会逼近 hook 6000ms 超时上限）。96h 已覆盖常规回退跨度（±100 年
+          上限约束的是 offset，不是取数窗；回退跨度 >96h 属罕见场景，
+          接受少遮并靠「保留不删 + 告警」兜底）。
+        未传 blocks（兼容旧调用形态）保持旧口径：拿非空候选即返回。
         """
         if mk_matcher is None:
             return []
+        best_cands = None
+        best_matched = -1
         last_err = None
-        for hours, limit in ((24, 300), (96, 600), (384, 1200)):
+        # R-19：档位 (hours, limit) —— 384h 档已移除（见上）
+        for hours, limit in ((24, 300), (96, 600)):
             try:
                 res = await self.ctx.call_capability(
                     "message.get_recent",
@@ -1556,8 +1641,18 @@ class MaiKnockPlugin(MaiBotPlugin):
                 last_err = RuntimeError("get_recent 返回空候选")
                 continue
             cands = mk_matcher.build_candidates(messages)
-            if cands:
-                return cands
+            if not cands:
+                continue
+            if blocks is None:
+                return cands  # 兼容旧口径：拿非空候选即返回
+            matched, report = mk_matcher.match_blocks(blocks, cands)
+            if report.matched > best_matched:
+                best_matched = report.matched
+                best_cands = cands
+            if report.matched == report.total:
+                return cands  # 全部对齐，无需扩窗
+        if best_cands is not None:
+            return best_cands
         if last_err is not None:
             logger.warning("[MaiKnock] get_recent 取候选失败，本轮 replyer 侧不遮蔽：%r", last_err)
         return []
@@ -1591,6 +1686,8 @@ class MaiKnockPlugin(MaiBotPlugin):
                 is_hidden=state.is_hidden,
                 offset_sec=state.offset_sec,
                 now_ts=time.time(),
+                scrub_schedule=state.has_hidden_window(),
+                block_memory_injections=state.has_hidden_window(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[MaiKnock] planner 侧改写失败，本轮放行原样：%r", exc)
@@ -1601,6 +1698,16 @@ class MaiKnockPlugin(MaiBotPlugin):
                 "[MaiKnock] planner 侧改写：%s，时间提示%s",
                 res.summary(),
                 "已改" if res.current_time_relabeled else "未找到",
+            )
+        if res.schedule_scrubbed:
+            logger.info(
+                "[MaiKnock] 已从宿主待办上下文隐藏 %d 条创建于遮蔽期内的日程（T-F04）",
+                res.schedule_scrubbed,
+            )
+        if res.memory_blocked:
+            logger.info(
+                "[MaiKnock] 已整段屏蔽 %d 条宿主记忆类注入（启发式记忆/人物画像/图片记忆，R-18）",
+                res.memory_blocked,
             )
         for w in res.warnings:
             logger.warning("[MaiKnock] planner 侧：%s", w)
@@ -1663,7 +1770,9 @@ class MaiKnockPlugin(MaiBotPlugin):
         if target_idx < 0:
             return {"action": "continue"}
 
-        cands = await self._f2_fetch_candidates(stream_id)
+        # T-C06：先切块，再按「未匹配块数」判据迭代扩窗取候选集
+        blocks = mk_matcher.split_blob(text) if mk_matcher else []
+        cands = await self._f2_fetch_candidates(stream_id, blocks or None)
         if not cands:
             return {"action": "continue"}
 
