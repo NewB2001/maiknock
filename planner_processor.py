@@ -94,6 +94,55 @@ MEMORY_INJECTION_MARKERS = (
     "【图片记忆-内部参考】",
 )
 
+# ---------------------------------------------------------------------------
+# R-22（0.2.1 实机复测 2026-11-22 14:40 坐实）：第四条记忆通道 = **模型主动检索**。
+# 有隐藏窗口时，模型调 `query_memory` / `query_person_profile`，工具输出
+# （FunctionCallOutputItem）把记忆库里的被藏时段内容原样带回 prompt ——
+# 整段屏蔽（第 1.6 步）碰不到工具输出。
+# ✅ PM 拍板（2026-11-22）：**摘除工具** —— 有隐藏窗口时把这两个记忆检索工具
+#    从 `tool_definitions` 里剔除（hook 载荷本就带 tool_definitions，
+#    chat_loop_service.py:1266 发出、:1292-1299 接受 hook 改写）。
+#    工具调不到 ⇒ 没有输出 ⇒ 没有泄漏。回退恢复后工具原样回来。
+# ⚠️ hook 每轮都触发（R-17 复核结论）⇒ 每轮的工具目录都会被过滤，
+#    不存在「只在第一轮摘掉」的漏洞。
+# ---------------------------------------------------------------------------
+MEMORY_TOOL_NAMES = ("query_memory", "query_person_profile")
+
+#: R-22b（复测更正报告 2026-11-22 15:00）：query_memory 的检索结果还会被宿主
+#: `_build_replyer_memory_reference`（query_memory.py:146/335）构造成以该标记
+#: 开头的**独立 item 自动透传给 replyer** ⇒ replyer hook 也要拦
+#:（plugin.py 侧用 startswith 判定，防误删正文提及）。
+REPLYER_MEMORY_REFERENCE_MARKER = "【长期记忆检索结果-内部参考】"
+
+
+def filter_memory_tools(
+    tool_definitions: Any,
+) -> Tuple[List[Any], int]:
+    """有隐藏窗口时，从 hook 载荷的 tool_definitions 里剔除记忆检索类工具。
+
+    :param tool_definitions: hook kwargs 里的 tool_definitions
+        （OpenAI function 结构列表：`{"type":"function","function":{"name":...}}`）
+    :returns: (新列表, 剔除数量)；载荷非法时原样返回 (原值, 0)
+    ⚠️ 幂等：无命中时原样返回。
+    """
+    if not isinstance(tool_definitions, list):
+        return tool_definitions, 0
+    kept: List[Any] = []
+    removed = 0
+    for td in tool_definitions:
+        name = ""
+        if isinstance(td, dict):
+            fn = td.get("function")
+            if isinstance(fn, dict):
+                name = str(fn.get("name") or "").strip()
+            else:
+                name = str(td.get("name") or "").strip()
+        if name in MEMORY_TOOL_NAMES:
+            removed += 1
+            continue
+        kept.append(td)
+    return kept, removed
+
 
 def _find_json_array_spans(text: str) -> List[Tuple[int, int]]:
     """扫描文本里所有**平衡的** JSON 数组 span（字符串感知），返回 [(start, end)]。
