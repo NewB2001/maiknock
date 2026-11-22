@@ -236,6 +236,27 @@ check("R-13b：回退后写的绿萝待办保留（新记忆语义）", "t2" in 
 check("T-F04：不误伤更老的待办", "t3" in ids)
 
 print()
+print("=" * 68)
+print("第 8 节：R-22 记忆检索工具摘除 + R-22b 标记")
+print("=" * 68)
+
+def _td(name):
+    return {"type": "function", "function": {"name": name, "description": name, "parameters": {}}}
+
+tools = [_td("reply"), _td("query_memory"), _td("wait"), _td("query_person_profile")]
+kept, removed = PP.filter_memory_tools(tools)
+check("R-22：剔除 2 个记忆工具", removed == 2)
+check("R-22：保留 2 个普通工具", len(kept) == 2)
+check("R-22：留下的不含记忆工具",
+      all(t["function"]["name"] not in PP.MEMORY_TOOL_NAMES for t in kept))
+kept2, removed2 = PP.filter_memory_tools(kept)
+check("R-22：幂等（再跑一遍 0 剔除）", removed2 == 0 and len(kept2) == 2)
+kept3, removed3 = PP.filter_memory_tools("不是列表")
+check("R-22：非法载荷原样返回", kept3 == "不是列表" and removed3 == 0)
+check("R-22b：replyer 标记常量与宿主一致",
+      PP.REPLYER_MEMORY_REFERENCE_MARKER == "【长期记忆检索结果-内部参考】")
+
+print()
 if FAILED:
     print("❌ %d 项失败：%s" % (len(FAILED), FAILED))
     sys.exit(1)
