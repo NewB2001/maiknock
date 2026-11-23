@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(r"E:\Softw\MaiBot\plugins\maiknock")))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import carriers as C  # noqa: E402
 import matcher as M  # noqa: E402

@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "maiknock.webui_companion",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "name": "麦麦敲门 MaiKnock",
-  "description": "WebUI 私聊伴侣插件。让麦麦主动来找你聊天，让你一键打招呼，还能由你掌管她的“现在是哪一天”——把某段时间从她的记忆里藏起来，或直接推进剧情。",
+  "description": "WebUI私聊体验增强！1、让麦麦主动来找你聊天；2、用旁白的方式掌控聊天剧情的时间线（就像时光机一样）；3、让麦麦用小说体的方式说话（比人格配置更稳定）；",
   "plugin_type": "chat",
   "display": {
     "icon": {

@@ -18,7 +18,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-PLUG = Path(r"E:\Softw\MaiBot\plugins\maiknock")
+PLUG = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUG))
 
 import blob_processor as BP  # noqa: E402

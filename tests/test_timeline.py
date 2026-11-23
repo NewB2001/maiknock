@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(r"E:\Softw\MaiBot\plugins\maiknock")))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import timeline as tl  # noqa: E402
 
@@ -91,27 +91,24 @@ check("下界取更早", approx(s6.boundary_ts, min(s3.boundary_ts, expect_new_b
       f"got={s6.boundary_ts} expect={min(s3.boundary_ts, expect_new_boundary)}")
 check("上界取更晚", approx(s6.hidden_until_ts, max(s3.hidden_until_ts, now2)))
 check("并集覆盖两段", s6.is_hidden(NOW - 2 * DAY) and s6.is_hidden(now2 - DAY))
-check("两次回退后声明累计两条", s6.declaration.count("就当没有发生过") == 2,
+# T-D01（2026-11-22）：声明只送最新一代 —— 描述并集窗口，不累计
+check("两次回退后声明只有一代", s6.declaration.count("就当没有发生过") == 1,
       f"count={s6.declaration.count('就当没有发生过')}")
+check("旧代退役进历史", "就当没有发生过" in s6.declaration_history[0] if s6.declaration_history else False,
+      f"history={len(s6.declaration_history)}")
 
-print("=== 7. set 绝对时刻（只进不退） ===")
+print("=== 7. set 绝对时刻（往回 = 自动翻译成 back） ===")
 s7 = tl.plan_set_story_time(s, NOW, NOW + 5 * DAY)
 check("offset = +5d", approx(s7.offset_sec, 5 * DAY))
-try:
-    tl.plan_set_story_time(s7, NOW, NOW + DAY)
-    check("早于当前故事时刻被拒", False, "未抛错")
-except ValueError:
-    check("早于当前故事时刻被拒", True)
-
-print("=== 8. /mk now 恢复 ===")
-s8 = tl.plan_reset_to_real_now(s3, NOW)
-check("offset 归零", approx(s8.offset_sec, 0.0))
-check("mode off", s8.mode == tl.MODE_OFF)
-check("清隐藏下界", s8.boundary_ts is None)
-check("清隐藏上界", s8.hidden_until_ts is None)
-check("追加反向声明", "恢复正常" in s8.declaration)
-check("旧声明保留(append-only)", "就当没有发生过" in s8.declaration)
-check("反向声明在旧声明之后", s8.declaration.index("就当没有发生过") < s8.declaration.index("恢复正常"))
+# 在未来内部倒车（目标仍领先现实时刻）：跳过的只是「还没发生的剧情」，
+# 没有真实消息可藏 ⇒ 直接改偏移，不产生隐藏区间
+s7b = tl.plan_set_story_time(s7, NOW, NOW + DAY)
+check("未来内倒车 = 偏移 +1d 且无隐藏区间", approx(s7b.offset_sec, DAY) and not s7b.has_hidden_window())
+# 设到现实之前：有真实消息要藏 ⇒ 走 plan_backward
+s7c = tl.plan_set_story_time(s7, NOW, NOW - DAY)
+check("设到过去 = 偏移 -1d", approx(s7c.offset_sec, -DAY))
+check("设到过去 = 藏起 (NOW-1d, NOW]", approx(s7c.boundary_ts, NOW - DAY) and approx(s7c.hidden_until_ts, NOW))
+check("设到过去 = 声明已生成", "就当没有发生过" in s7c.declaration)
 
 print("=== 9. 脱敏 P9 ===")
 raw = "最近真实消息：11-21 03:49:26「/mk diag」\n现实时间：2026-11-21 18:57:00\n普通文本 12345"
@@ -175,19 +172,6 @@ check("forward 状态不显示负数已隐去", "已隐去：（无）" in d_fwd
 check("forward 状态无负小时数", "-48.00" not in d_fwd, d_fwd)
 
 print()
-print("=== 15. R6-21：/mk time off 必须清区间 + 追加反向声明 ===")
-off = tl.plan_off(b3, NOW)
-check("off 后 mode=off", off.mode == tl.MODE_OFF, off.mode)
-check("off 后 offset 归零", approx(off.offset_sec, 0.0))
-check("off 后隐藏下界已清", off.boundary_ts is None)
-check("off 后隐藏上界已清", off.hidden_until_ts is None)
-check("off 后旧声明保留(append-only)", "就当没有发生过" in off.declaration)
-check("off 后追加反向声明", "恢复正常" in off.declaration, off.declaration)
-check("off 后反向声明在旧声明之后",
-      off.declaration.index("就当没有发生过") < off.declaration.index("恢复正常"))
-check("off 后 is_hidden 全 False", not off.is_hidden(NOW) and not off.is_hidden(NOW - DAY))
-
-print()
 print("=== 16. R6-22：多次回退的跨度分叉要在文案里注明 ===")
 now2 = NOW + 3600
 m1 = tl.plan_backward(s, NOW, -3 * DAY)
@@ -215,7 +199,6 @@ for bad, label in [
         check(f"{label} 被断言拦下", True)
 for good, label in [
     (tl.build_back_declaration(3), "自动回退声明"),
-    (tl.build_reverse_declaration(), "自动反向声明"),
     ("最近 3 天发生的事就当没有发生过", "相对时长白名单"),
 ]:
     try:
@@ -226,7 +209,7 @@ for good, label in [
 
 print()
 print("=== 18. 死代码已接上：_DECLARATION_RELATIVE 真被引用 ===")
-_src = Path(r"E:\Softw\MaiBot\plugins\maiknock\timeline.py").read_text(encoding="utf-8")
+_src = (Path(__file__).resolve().parent.parent / "timeline.py").read_text(encoding="utf-8")
 check("_DECLARATION_RELATIVE 出现 >=2 次（定义+使用）",
       _src.count("_DECLARATION_RELATIVE") >= 2, f"count={_src.count('_DECLARATION_RELATIVE')}")
 

@@ -61,6 +61,11 @@ def to_display_message_id(message_id: Any) -> str:
 #: 正文或 reply_style 里若出现**行首** `[HH:MM:SS]` 会多切一块 ⇒ 兜底必须留着。
 BLOCK_START_RE = re.compile(r"(?m)^\[(\d{2}:\d{2}:\d{2})\]")
 
+#: 宿主接在**最后一块**正文后面的尾部提示的公共前缀
+#: （`creative_language.py:90-92` 三个变体共用）。
+#: ⚠️ T-B08：末块正文被它拖长 ⇒ 必然失配 ⇒ 末块比对前按它截断。
+TRAILING_HINT_MARKER = "你正在和对方私聊"
+
 #: 宿主说话人前缀（**复刻** `message_adapter.py:20-23`，不 import 宿主模块，避免上游改名的耦合）。
 #: 格式：`HH:MM:SS[msg_id:xxx][说话人]正文`
 SPEAKER_PREFIX_RE = re.compile(
@@ -267,8 +272,19 @@ def build_candidates(messages: Sequence[Dict[str, Any]]) -> List[Candidate]:
     每条消息取三个字段：
     - `timestamp`（epoch 字符串）
     - `processed_plain_text`（**带说话人前缀** ⇒ 要剥）
-    - `message_info.user_info.nickname`（说话人）
+    - `message_info.user_info.user_nickname`（说话人，T-C01 修正后为真实键）
     """
+    # 第一遍：先收集每条消息的归一化正文（供回复消息拆「引用原文 + 新正文」用，T-C02）
+    normalized: Dict[str, str] = {}
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        mid = str(msg.get("message_id") or "")
+        p = msg.get("processed_plain_text")
+        if not p:
+            p = _extract_raw_text(msg)
+        normalized[mid] = normalize_content(p or "")
+
     out: List[Candidate] = []
     for msg in messages or []:
         if not isinstance(msg, dict):
@@ -298,6 +314,28 @@ def build_candidates(messages: Sequence[Dict[str, Any]]) -> List[Candidate]:
                 display_id=to_display_message_id(raw_mid),
             )
         )
+        # ⚠️ 回复消息（T-C02，测试岗 2026-11-22 坐实）：
+        #    blob 里回复块的正文只有**新正文**（引用壳在说话人字段，`reply_prompt.py:452-481`），
+        #    而库里 `processed_plain_text` = **被引原文 + 空格 + 新正文**（`message_receive/message.py:495`）。
+        #    ⇒ 「整段正文相等」与 LCP 前缀兜底双双失配 ⇒ 落在隐藏区间也删不掉（漏遮蔽）。
+        #    ⇒ 对回复消息追加一个「剥掉引用原文」的候选变体（同一真实消息，删哪条都等价）。
+        reply_to = str(msg.get("reply_to") or "")
+        if reply_to:
+            quoted = normalized.get(reply_to)
+            if quoted and quoted in content:
+                rest = content.split(quoted, 1)[1].lstrip(" \n")
+                if rest:
+                    out.append(
+                        Candidate(
+                            ts=ts,
+                            hhmmss=hhmmss,
+                            speaker_raw=speaker,
+                            content=rest,
+                            raw=msg,
+                            message_id=raw_mid,
+                            display_id=to_display_message_id(raw_mid),
+                        )
+                    )
     out.sort(key=lambda c: c.ts)
     return out
 
@@ -324,7 +362,12 @@ def _epoch_to_hhmmss(ts: float) -> str:
 def _extract_speaker(msg: Dict[str, Any]) -> str:
     info = msg.get("message_info") or {}
     user_info = info.get("user_info") or {}
-    for key in ("nickname", "user_name", "card_name", "username"):
+    # ⚠️ 宿主 `get_recent` 真实序列化的字段名是 `user_nickname` / `user_cardname`
+    #    （`plugin_runtime/host/message_utils.py:29-32` 的 UserInfoDict）。
+    #    旧键（nickname/user_name/card_name/username）是离线脚本里的假形状，
+    #    生产里一个都不存在 ⇒ 说话人键从未生效（测试岗 T-C01，2026-11-22 坐实）。
+    #    真实键放最前，旧键保留兼容离线测试台。
+    for key in ("user_nickname", "user_cardname", "nickname", "user_name", "card_name", "username"):
         v = user_info.get(key)
         if v:
             return str(v)
@@ -409,6 +452,7 @@ def match_blocks(
 
     last_cand_idx = -1  # 顺序约束：块 i 的候选不得早于块 i-1 的候选
 
+    is_last = len(blocks) - 1
     for blk in blocks:
         pool = by_time.get(blk.hhmmss, [])
         if not pool:
@@ -418,6 +462,11 @@ def match_blocks(
         blk_speaker = normalize_speaker(blk.speaker_raw)
         # ⚠️ blob 侧正文**已剥过前缀** ⇒ 不再剥（否则表情包占位会被误吞）
         blk_content = normalize_content(blk.content, strip_prefix=False)
+        # ⚠️ T-B08（测试岗 2026-11-22）：宿主把尾部提示（「你正在和对方私聊…」）
+        #    接在**最后一块**正文后面 ⇒ 末块正文永远多一截 ⇒ 必然失配。
+        #    ⇒ 末块按公共前缀截掉尾部提示再参与比对（提示本身不受影响，它不在块边界里）。
+        if blk.index == is_last and TRAILING_HINT_MARKER in blk_content:
+            blk_content = blk_content.split(TRAILING_HINT_MARKER, 1)[0].rstrip()
 
         # 候选过滤：说话人相等（若 blob 说话人可解析）+ 顺序约束
         narrowed: List[int] = []
@@ -436,7 +485,17 @@ def match_blocks(
 
         picked: Optional[int] = None
         if len(narrowed) == 1:
-            picked = narrowed[0]
+            # ⚠️ T-C09（测试岗 2026-11-22）：唯一候选**也不免检正文**。
+            #    扩窗修好后（T-C06，24→96→384h）候选池变大，「碰巧同秒」的唯一候选
+            #    可能根本不是目标块 ⇒ 直接采纳 = 错删入口。
+            #    保守口径：正文相等或 LCP≥12 才采纳；对不上 ⇒ 保留不删 + 告警
+            #    （宁可少遮不可错删，与既有纪律一致）。
+            ci = narrowed[0]
+            if (
+                candidates[ci].content == blk_content
+                or lcp_len(candidates[ci].content, blk_content) >= LCP_MIN
+            ):
+                picked = ci
         else:
             # tie-break ①：整段正文完全相等
             exact = [ci for ci in narrowed if candidates[ci].content == blk_content]

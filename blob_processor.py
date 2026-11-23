@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Tuple
 
 try:
     # ⚠️ 兄弟模块不能裸 import —— 宿主 `sys.path` 不含插件目录（踩坑 66）
@@ -178,9 +179,9 @@ def process_blob(
                     "未找到「当前时间：」提示行（relabel 漏掉当前时间）—— "
                     "兜底判据是代码级常量，不依赖模板占位符"
                 )
-        deleted_heads = [b.head_line for b in to_delete]
+        deleted_heads = [b.head_line for b in to_delete]  # noqa: F841（日志排障用）
         text, relabeled = _relabel_block_heads(
-            text, blocks, matched, deleted_heads, offset_sec)
+            text, blocks, matched, {b.index for b in to_delete}, offset_sec)
         if relabeled == 0 and blocks:
             warnings.append("没有任何块被 relabel（可能块首格式与预期不符）")
 
@@ -207,7 +208,7 @@ def _relabel_block_heads(
     text: str,
     blocks: Sequence[BlobBlock],
     matched: Dict[int, Candidate],
-    deleted_starts: Sequence[int],
+    deleted_indices: Collection[int],
     offset_sec: float,
 ) -> Tuple[str, int]:
     """给**幸存块**的块首补日期。
@@ -217,31 +218,37 @@ def _relabel_block_heads(
     ⚠️⚠️ **不能用字符偏移反查块**（踩坑 R6-30 延伸）：
     删除块之后文本偏移全变了 ⇒ `m.start()` 与原块 `start` 对不上 ⇒ 会匹配到**错误的块**
     （实测把 `当前时间：` 行当成块首改了）。
-    ⇒ **正确做法**：按**块首文本**（`head_line` 的方括号前缀）建立索引，
-    在**新文本**上重新扫描，只改那些**内容匹配已知块首**的位置。
+    ⇒ **正确做法**：按**块首方括号文本**建立索引，在**新文本**上重新扫描。
+
+    ⚠️⚠️⚠️ **同键多块必须用 FIFO 队列**（测试岗 T-C03，2026-11-22 坐实）：
+    同一时分秒、跨天的两个块，方括号键相同；若按**单值**键建索引，后者覆盖前者
+    ⇒ 两块都被标成同一天 ⇒ 日期改错（生产数据里同一秒多条消息很常见）。
+    ⇒ 队列按**幸存块在文本中的出现顺序**入队（未匹配块也入队，占位 None）；
+      重扫描 `finditer` 的顺序 == 块在文本中的顺序（块边界只由行首块首定义，R6-19）；
+      每命中一次弹出一个，天然对齐同键的多个块。
+    ⇒ 被删除的块不在新文本里 ⇒ 不入队（重扫描也扫不到它们）。
     """
-    # 建立 「块首方括号文本 → 候选」索引（用块首的完整行做键更稳）
-    head_to_cand: Dict[str, Candidate] = {}
+    head_to_cands: Dict[str, deque] = {}
     for blk in blocks:
-        cand = matched.get(blk.index)
-        if cand is None:
-            continue
+        if blk.index in deleted_indices:
+            continue  # 被删除的块不在新文本里，不入队
         m = BLOCK_START_RE.match(blk.head_line)
         if m:
-            head_to_cand[m.group(0)] = cand
+            head_to_cands.setdefault(m.group(0), deque()).append(matched.get(blk.index))
 
-    if not head_to_cand:
+    if not head_to_cands:
         return text, 0
 
     out: List[str] = []
     pos = 0
     count = 0
     for m in BLOCK_START_RE.finditer(text):
-        key = m.group(0)
-        cand = head_to_cand.get(key)
+        queue = head_to_cands.get(m.group(0))
+        if not queue:
+            continue  # 不是已知块首（或该键的队列已弹空）⇒ 不动
+        cand = queue.popleft()
         if cand is None:
-            continue  # 不是已知块首（或该块未匹配）⇒ 不动
-        # ⚠️ 还要确认这个位置确实是**行首的块首**，而不是正文里恰好出现的 `[HH:MM:SS]`
+            continue  # 该位置是未匹配块（保留不删）⇒ 不动日期
         out.append(text[pos:m.start()])
         out.append("[%s]" % _format_story(cand.ts, offset_sec))
         pos = m.end()

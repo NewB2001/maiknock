@@ -7,7 +7,7 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(r"E:\Softw\MaiBot\plugins\maiknock")))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import declaration as D  # noqa: E402
 import date_forms as DF  # noqa: E402

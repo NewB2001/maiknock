@@ -3,13 +3,106 @@
 
 功能规划：
 - F1 主动私聊：静默超时后让麦麦主动开口（官方 maisaka.proactive.trigger 能力）
-- F2 虚构时间线：/mk time 推进剧情时间，钩子改写注入给模型的「当前时间」与相对时间标注
+- F2 剧情时间线：/mk now|add|back|set 四命令，钩子改写注入给模型的「当前时间」与相对时间标注
 - F3 手动打招呼：/mk hi 立即让麦麦开口
 
 版本号单一来源：见下方 VERSION 常量（审计 A-3：此前版本号散落 6 处手动编辑——
 文档串 / config_version / 加载日志 / help / _manifest.json / config.toml，极易漂移）。
 _manifest.json 与 config.toml 无法引用 Python 常量，改由启动自检
 _check_version_consistency() 比对并告警。
+
+0.3.0（2026-11-24 已发布）：0.2.2 之后的**所有**变更统一累积在本版本。
+    ⚠️ 版本号只在发布时前进，开发期小修小改不涨号（PM 2026-11-23 拍板）。
+    0.3.0 由 PM 测试收尾时拍板改定（2026-11-24：F2 命令面大改 + F4 开关真值
+    新机制 + 两个新逻辑模块，体量远超补丁号，测试方建议采纳）。
+    本版本 F2 命令面大改（PM 拍板：用户是来娱乐的，只留四条时间线命令）：
+    - 四命令：/mk now=查看剧情时间（唯一入口）/ /mk add 3d [剧情提示词] /
+      /mk back 10h [剧情提示词] / /mk set 2026-11-25 09:00 [剧情提示词]。
+      剧情提示词走 TimelineState.narrative，
+      每轮与声明一同注入（带魔数前缀、无绝对日期断言）。
+    - 删除命令：手动绑定（改为任意 /mk 自动绑定）、诊断、风格守卫对照表、
+      帮助、/mk time 全家（含 off）。timeline.plan_off / plan_reset_to_real_now
+      （/mk set now，PM 2026-11-24 拍板删除）同步删除。
+    - 配置节 [timeline]「启用剧情时间线」曾短暂加入又删除（PM 2026-11-24 拍板）：
+      四条命令默认开启，不设开关——插件只是把麦麦本来就有的剧情时间概念做成可控，不是创造。
+
+0.3.4 变更要点（2026-11-23，PM 五条拍板：纯文案与 UI 措辞，运行逻辑零变化）：
+    1) 主动私聊节描述去掉「防打扰的限制」尾巴；
+    2) 冷场两字段改同名标题 + 最早/最晚后缀（前端大屏两列网格，相邻声明天然同行并排）；
+    3) 「夜间免打扰时段」改名「免打扰时段（麦麦在这段时间内不会找你）」，描述不再提拖动；
+    4) 风格守卫节描述改成一段麦麦发言示例（直观演示三段式）；
+    5) 内心/动作开关描述显式标注「只在启用小说体格式时生效」。
+       注：宿主前端不支持 depends_on（schema 有此键、dist JS 无处理），无法做
+       「启用关闭→两开关自动隐藏/置灰」的联动 UI；运行时 enabled=false 时守卫
+       整体跳过（两开关天然失效），语义等价，用文案补足依赖关系。
+
+0.3.3 变更要点（2026-11-23，PM 三条拍板：抽签网格化 + 免打扰多时段 + F4 全量生效）：
+- 抽签以 **2 分钟为步长**（偶数分钟）：与扫描节奏同网格（扫描 tick=120s），用户对 1~2 分钟
+  误差无感，避免无谓的秒级粒度。⚠️ 语义澄清（PM 误以为每 2 分钟重抽）：goal 仍是**一次
+  抽签落盘复用**——抽中 76 就在第 76 分钟找；没回复则触发后清空重抽。「再随机一次」
+  0.3.2 就是这么实现的，本版只改抽签粒度。
+- 免打扰时段重构：quiet_hours_start/end 两个文本框 → `免打扰时段: List[QuietSpanConfig]`
+  多时段列表，每项是「开始/结束」双联整点下拉（00:00~23:00 共 24 档）。宿主前端列表
+  编辑器支持添加/删除/拖拽排序（plugin-config JS 的 dnd-kit sortable 已查证）。
+  语义：空清单=无免打扰；开始==结束=该段无效；开始>结束=跨天（如 22:00~06:00）。
+- **删除 style_guard.scope / managed_group_ids**（PM：受管清单是「麦麦聊天室」插件的事，
+  且未开发，不该出现在麦麦敲门；麦麦敲门默认影响所有聊天）。_f4_gate 简化为
+  模块可用+enabled ⇒ 全量生效；风格守卫不再有受管对照表命令。
+  style_guard.managed_session/compute_session_id 保留未删（宿主升级回归对照仍有价值）。
+- 回滚备份：backups/maiknock-v033-quiet-spans-20261123/
+
+0.3.2 变更要点（2026-11-23，主动私聊节奏人性化 + F4 开关中文化，PM 四条拍板）：
+- 静默阈值改**随机区间**：silence_threshold_minutes(最早,60) + 新增 silence_threshold_max_minutes(最晚,90)。
+  每次冷场在区间内抽一个「本次目标」（落盘 pstate.silence_goal_sec 复用，避免每轮重抽导致
+  触发时刻分布偏向早端）；触发成功后清空重抽。不再有「60 分钟准点找」的机械感。
+- **删除 min_interval_minutes（两次最小间隔）**：PM 认定与冷场区间冗余（120>90 完全覆盖，
+  实际效果 = 第二次至少等 120 分钟，不自然）。防骚扰改由「**触发后冷场计时重置**」承担：
+  _scan_once 里 silence = min(距用户最后发言, 距上次自动触发 last_effective)——找过一次
+  （无论用户回没回）都要重新等满一个随机冷场区间。⚠️ 这是删 min_interval 后防连环骚扰的
+  唯一屏障：没有它，用户持续不回复时 silence 恒超阈值，扫描循环会每 tick 触发。
+- **删除 hi_cooldown_minutes（/mk hi 冷却）**：PM 拍板「手动技能不该有冷却，我不会给自己刷屏」。
+  防叠触发靠 pending 锁位 + 回读窗口（原有）；_do_proactive_trigger 的 cooldown_sec 参数保留，
+  两个调用方现均传 0。
+- F4 开关中文化 + 扁平化：[style_guard.blocks] inner_enabled/action_enabled →
+  [style_guard] 直属中文字段 `内心想法` / `动作环境`（TOML/Python/pydantic 均支持中文标识符；
+  SDK extra="ignore" ⇒ 旧 blocks 节被忽略）。_f4_blocks 读新键、兼容回退旧 blocks.inner_enabled；
+  _cmd_styleguard 同步。UI 不再出现英文 key 与嵌套类型行。
+- 回滚备份：backups/maiknock-v032-interval-random-20261123/
+
+0.3.1 变更要点（2026-11-23，配置页大瘦身——只动文案与字段增删，运行逻辑零变化）：
+- 删 8 个用户永远不需要碰的内部配置项（代码侧 _cfg_int / fmt.get 本就有同值兜底，
+  删字段 = 恒走默认值，行为不变）：proactive.scan_interval_seconds(120) /
+  readback_poll_seconds(20) / readback_timeout_seconds(240) / silence_lookback_hours(720) /
+  silence_probe_hours(87600)；style_guard.format 整节（inner_markers → DEFAULT_INNER_MARKERS、
+  max_retries → 1、两条重生文案 → enforce() 签名默认值）
+- scope 改 Literal 下拉（防手拼错）；config_version 加 hidden=true（SDK 支持，
+  plugin-config 前端确认遵守）；所有 label/description/节 docstring 重写为大白话
+- PluginConfigBase extra="ignore"（maibot_sdk/config.py:51）⇒ 旧 config.toml 残留键被忽略不报错
+
+0.3.0 变更要点（2026-11-23，F4 小说体风格守卫 —— 规格经外部技术评审 + 逐条复核）：
+- 新增纯逻辑模块 style_guard.py（无 IO、无宿主依赖，可离线单测 tests/test_style_guard.py）：
+  三段式契约生成（四种开关组合）、块扫描、显式内心标记转换（（内心：…）→【内心：…】，
+  迁移主路径）、缺块判定、按开关删块（空正文保护）、会话识别（md5 公式镜像宿主
+  utils_session.py:8-42）
+- 挂两个新 hook（F2 的两个不动）：
+  * before_model_request 第二个 handler，名 `maiknock_style_guard` —— ⚠️ 同 mode/order
+    下按 handler 名字母序执行（hook_dispatcher.py:358-364），r < s ⇒ 排在
+    `maiknock_replier_timeline` 之后，F2 的 strip_declarations 不会碰 F4 的 item；
+    **改名即翻车**
+  * after_response，名 `maiknock_style_guard_after`（⚠️ 不可与 before 同名：宿主组件表
+    full_name 全局唯一，同名时 after 覆盖 before 注册条目 → 契约注入静默失效）：
+    缺块 → {"retry": true, ...}（插件侧上限压到 1 次，retry_count>=1 放行）；
+    格式问题 → {"response": 改写文本}。⚠️ 返回协议必须是
+    {"action": "continue", "modified_kwargs": {...}}（hook_dispatcher.py:548/619-621
+    只认 modified_kwargs，裸 dict 被静默丢弃——评审 P0-2）
+- 配置段 [style_guard]（config.get_plugin 读取，禁用 ctx.config.get——F1 踩过的坑）：
+  enabled / scope（bound_only|bound_and_webui_group，不设 all）/ managed_group_ids /
+  blocks.inner_enabled / blocks.action_enabled / format.inner_markers / format.max_retries
+- 新命令风格守卫对照表（公式算出的 hash 并排打印，供宿主升级回归；已于 0.2.3 随 scope 功能删除）
+- 已知边界见《MaiKnock-F4小说体风格守卫-需求理解与技术方案-20261123.md》§4：
+  开=每轮必有是尽力保证（重生上限 1）；无标记内心不转换；宿主 reply_private.prompt:11
+  有「不要输出括号」与人格指令矛盾（实测 system item 拔河获胜）；整条全括号时空正文
+  保护会残留关闭块
 
 0.2.2 变更要点（2026-11-22 15:10，R-22/R-22b）：
 - R-22【P0 第四通道】：有隐藏窗口时从 tool_definitions 摘除 query_memory /
@@ -27,7 +120,7 @@ _check_version_consistency() 比对并告警。
   第 1.6 步 MEMORY_INJECTION_MARKERS，startswith 判定防误删）
 - R-19（P2）：扩窗档位 24/96/384 收敛为 24/96 —— 永远失配的块不再驱动
   第三档 384h 取数（hook 超时上限 6000ms，库大了会贵）
-- R-20（P2）：版本号 bump 0.2.1 + /mk diag 显示版本（修复前后可区分）
+- R-20（P2）：版本号 bump 0.2.1 + 诊断命令显示版本（修复前后可区分；诊断命令已于 0.2.3 删除）
 - R-13b 语义拍板（PM 2026-11-22）：回退之后、回退会话期间新写下的
   待办/记忆 = 新时间线的新记忆，**不隐藏**（created_at 落在隐藏区间外
   本来就不滤，与实现一致；语义边界已写进《时间回滚设计》）
@@ -56,8 +149,10 @@ _check_version_consistency() 比对并告警。
 - on_unload 取消未完成回读任务（热重载防孤儿化）
 - 0.1.3 = M3 最小闭环（/mk hi 手动触发主动开口）：
 - /mk hi：调用 maisaka.proactive.trigger 让麦麦立刻主动开口（支持 <话头> 参数）
-  - F1-2：触发不保证开口——后台轮询回读 get_recent 确认她是否真开口，结果以
-    「【MaiKnock 回读】」消息发回聊天流；未响应记入 runtime_state 计数
+  - F1-2：触发不保证开口——后台轮询回读 get_recent 确认她是否真开口；
+    未响应记入 runtime_state 计数。0.2.3 起回读结果**只写插件日志**，
+    不再往聊天流发「【MaiKnock 回读】…」消息（PM 2026-11-24：那种系统日志腔
+    会进对话历史被麦麦学舌，暴露插件存在）
   - F1-4（最小版）：per-stream 冷却 + pending 锁位，防止连环触发互相覆盖
   （将来 F1 定时器与 /mk hi 共用同一组锁位）
 - 0.1.2 = M1.6 评审修复 + 附录 C（N-1/N-2）：
@@ -80,11 +175,23 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import struct
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
+
+# F-14（0.2.3 回归轮二·P2）：tomllib 是 Python 3.11+ 标准库；低版本用 tomli 兜底。
+# 原先在函数内局部 import，ImportError 会被 except Exception 吞掉 → 静默回退宿主段
+# （症状与 F-12 一模一样、零提示），提到模块级一次性定案
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # Python < 3.11
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 # ⚠️ `HookMode` / `HookOrder` **不在 maibot_sdk 顶层导出**，只在 components 里
@@ -103,7 +210,7 @@ _MK_BLOCK_START_RE = re.compile(r"(?m)^\[\d{2}:\d{2}:\d{2}\]")
 
 # 插件版本号唯一来源（审计 A-3）：Python 侧一律引用此常量；
 # _manifest.json / config.toml 无法引用，由 _check_version_consistency() 启动自检比对告警。
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 
 # ---------------------------------------------------------------------------
 # F2 虚构时间线：纯逻辑模块 timeline.py
@@ -136,7 +243,7 @@ try:  # pragma: no cover - 加载失败只降级，不阻断插件其余功能
     _date_forms_spec.loader.exec_module(_date_forms_mod)
 
     # ⚠️ **declaration.py 必须在 timeline.py 之前加载**（2026-11-21 23:45）：
-    # timeline.py 的 `build_back_declaration` / `build_reverse_declaration`
+    # timeline.py 的 `build_back_declaration`
     # 现在**转发**到 declaration.py（文案统一，避免两套漂移）。
     # ⇒ 顺序反了会让 timeline 永远走内联降级分支。
     _declaration_path = Path(__file__).parent / "declaration.py"
@@ -229,6 +336,46 @@ except Exception as _mk_exc:  # noqa: BLE001
         _mk_exc,
     )
 
+# ---------------------------------------------------------------------------
+# F4 小说体风格守卫：纯逻辑模块 style_guard.py（无 IO、无宿主依赖，可离线单测）
+#
+# ⚠️ 必须按文件路径加载（裸 `import style_guard` 会 ImportError，踩坑 66：
+#    宿主把插件**父目录**加进 sys.path，不是插件目录本身）。
+# ⚠️ R6-29 纪律：加载失败必须可见（独立 error 日志），不许静默降级——
+#    静默降级是本项目历史上最贵的坑。
+# ---------------------------------------------------------------------------
+mk_style_guard = None
+try:  # pragma: no cover - 加载失败只降级 F4，不阻断插件其余功能
+    mk_style_guard = _load_sibling("style_guard", "style_guard.py")
+except Exception as _sg_exc:  # noqa: BLE001
+    mk_style_guard = None
+    logger.error("[MaiKnock] F4 风格守卫模块 style_guard.py 加载失败，F4 功能不可用：%r", _sg_exc)
+
+
+# ---------------------------------------------------------------------------
+# 纯逻辑模块：proactive_policy.py（F1 策略）+ commands.py（命令参数解析）
+#
+# 0.2.3 测试报告建议 ⑤：这两个模块原先**内联在下面的实例方法里**，离线测不了
+# （要 import 整个 plugin.py 就得把 maibot_sdk 一起桩起来）。
+# 抽出后 UT-B 组（命令解析）与 UT-C 组（抽签/免打扰）可以纯 Python 离线单测。
+#
+# ⚠️ 只做「搬家」，判定口径逐字不变；调用点见下面各处转调。
+# ⚠️ 必须按文件路径加载（裸 import 会 ImportError，踩坑 66）——
+# ⚠️ R6-29 纪律：加载失败必须可见（独立 error 日志），不许静默降级。
+# ---------------------------------------------------------------------------
+mk_proactive_policy = None
+mk_commands = None
+try:  # pragma: no cover - 加载失败只降级这两块纯逻辑，不阻断插件其余功能
+    mk_proactive_policy = _load_sibling("proactive_policy", "proactive_policy.py")
+except Exception as _pp_exc:  # noqa: BLE001
+    mk_proactive_policy = None
+    logger.error("[MaiKnock] 纯逻辑模块 proactive_policy.py 加载失败，F1 策略判定不可用：%r", _pp_exc)
+try:  # pragma: no cover
+    mk_commands = _load_sibling("commands", "commands.py")
+except Exception as _cmd_exc:  # noqa: BLE001
+    mk_commands = None
+    logger.error("[MaiKnock] 纯逻辑模块 commands.py 加载失败，命令参数解析不可用：%r", _cmd_exc)
+
 
 # ---------------------------------------------------------------------------
 # 配置模型（自动生成 config.toml 与 WebUI 配置页）
@@ -238,53 +385,84 @@ except Exception as _mk_exc:  # noqa: BLE001
 
 
 class PluginSection(PluginConfigBase):
-    """插件总开关。"""
+    """麦麦敲门的总开关。"""
 
     __ui_label__ = "插件设置"
 
-    enabled: bool = Field(default=True, description="是否启用麦麦敲门", json_schema_extra={"label": "启用插件"})
-    config_version: str = Field(default=VERSION, description="配置结构版本", json_schema_extra={"label": "配置版本"})
+    enabled: bool = Field(
+        default=True, description="关掉后整个插件不会加载（此项由宿主读取，不是插件内部开关）",
+        json_schema_extra={"label": "启用麦麦敲门"})
+    config_version: str = Field(
+        default=VERSION, description="配置结构版本（宿主要求保留此项，无需修改）",
+        json_schema_extra={"label": "配置版本", "hidden": True})
+
+
+class QuietSpanConfig(PluginConfigBase):
+    """一个免打扰时段。开始==结束 = 该段无效；开始>结束 = 跨天（如 22:00~06:00）。"""
+
+    __ui_label__ = "免打扰时段"
+
+    开始: Literal[
+        "00:00", "01:00", "02:00", "03:00", "04:00", "05:00",
+        "06:00", "07:00", "08:00", "09:00", "10:00", "11:00",
+        "12:00", "13:00", "14:00", "15:00", "16:00", "17:00",
+        "18:00", "19:00", "20:00", "21:00", "22:00", "23:00",
+    ] = Field(default="01:00", json_schema_extra={"label": "开始"})
+    结束: Literal[
+        "00:00", "01:00", "02:00", "03:00", "04:00", "05:00",
+        "06:00", "07:00", "08:00", "09:00", "10:00", "11:00",
+        "12:00", "13:00", "14:00", "15:00", "16:00", "17:00",
+        "18:00", "19:00", "20:00", "21:00", "22:00", "23:00",
+    ] = Field(default="08:00", json_schema_extra={"label": "结束"})
 
 
 class ProactiveConfig(PluginConfigBase):
-    """F1 主动私聊的防骚扰配置。"""
+    """太久没聊天时，麦麦会主动发消息来找你。"""
 
-    __ui_label__ = "主动私聊"
+    __ui_label__ = "麦麦主动找你聊天"
 
-    enabled: bool = Field(default=False, description="是否启用主动私聊扫描（静默超时后麦麦主动开口）", json_schema_extra={"label": "启用主动私聊"})
-    hi_cooldown_minutes: int = Field(
-        default=3, ge=0, le=1440,
-        description="/mk hi 手动触发的冷却（分钟，F1-4 防连环触发）", json_schema_extra={"label": "hi 冷却（分钟）"})
-    readback_poll_seconds: int = Field(
-        default=20, ge=5, le=120,
-        description="触发后回读确认的轮询间隔（秒）", json_schema_extra={"label": "回读轮询间隔（秒）"})
-    readback_timeout_seconds: int = Field(
-        default=240, ge=30, le=1800,
-        description="触发后等待麦麦开口的最长回读时间（秒，超时记未响应）", json_schema_extra={"label": "回读超时（秒）"})
-    scan_interval_seconds: int = Field(
-        default=120, ge=30, le=3600, description="扫描间隔（秒），最小 30", json_schema_extra={"label": "扫描间隔（秒）"})
+    enabled: bool = Field(
+        default=False, description="打开后，冷场时间一到，她就可能主动发消息来找你",
+        json_schema_extra={"label": "开启主动找你"})
     silence_threshold_minutes: int = Field(
-        default=60, ge=5, le=1440, description="静默多久后麦麦可以主动开口（分钟）", json_schema_extra={"label": "静默阈值（分钟）"})
-    silence_lookback_hours: int = Field(
-        default=720, ge=1, le=8760,
-        description=(
-            "静默判定回溯窗口（小时）：在最近这么多小时的消息里找「最后一次用户发言」。"
-            "默认 720 小时（30 天）——必须显著大于静默阈值，否则用户沉默一旦超过窗口，"
-            "反而取不到那条发言导致永远判不出静默（睡过夜就不触发）"
-        ), json_schema_extra={"label": "静默回溯窗口（小时）"})
-    silence_probe_hours: int = Field(
-        default=87600, ge=1, le=87600,
-        description=(
-            "静默判定二次探测窗口（小时）：主回溯窗口内找不到用户发言时，用这个更大的窗口"
-            "再查一次，用来区分「沉默太久」（该找她了）与「从未说过话」（不该打扰）。"
-            "默认 87600 小时（10 年）——上限即默认值，意味着除非用户明确调小，"
-            "几乎不存在「沉默超过探测窗口」的隐含行为"
-        ), json_schema_extra={"label": "静默探测窗口（小时）"})
-    quiet_hours_start: str = Field(default="01:00", description="禁止时段开始（HH:MM，24 小时制）", json_schema_extra={"label": "禁言时段开始"})
-    quiet_hours_end: str = Field(default="08:00", description="禁止时段结束（HH:MM，24 小时制）", json_schema_extra={"label": "禁言时段结束"})
-    daily_max: int = Field(default=5, ge=1, le=50, description="每天最多主动开口次数", json_schema_extra={"label": "每日主动上限"})
-    min_interval_minutes: int = Field(
-        default=120, ge=10, le=1440, description="两次主动开口的最小间隔（分钟）", json_schema_extra={"label": "最小主动间隔（分钟）"})
+        default=60, ge=5, le=1440,
+        description="冷场区间的最早值：比如 60 = 至少一小时没说话她才可能来找你。"
+        "实际来找你的时刻在「最早」和「最晚」之间随机挑一个，不会准点出现",
+        json_schema_extra={"label": "冷场多久之后来找你·最早（分钟）"})
+    silence_threshold_max_minutes: int = Field(
+        default=90, ge=5, le=1440,
+        description="冷场区间的最晚值：比如 90 = 最晚一个半小时内一定来找你。"
+        "设成和「最早」一样大就退回固定时刻",
+        json_schema_extra={"label": "冷场多久之后来找你·最晚（分钟）"})
+    daily_max: int = Field(
+        default=5, ge=1, le=50, description="一天之内，她最多主动来找你几次",
+        json_schema_extra={"label": "每天最多主动几次"})
+    免打扰时段: List[QuietSpanConfig] = Field(
+        default_factory=lambda: [QuietSpanConfig()],
+        description="可添加多条。开始==结束 = 该段无效；开始>结束 = 跨天（如 22:00~06:00）",
+        json_schema_extra={"label": "免打扰时段（麦麦在这段时间内不会找你）", "max_items": 12})
+
+
+class StyleGuardConfig(PluginConfigBase):
+    """让麦麦的回复固定成三段式，就像这样：【他今天好像不太开心……】（把刚倒的水轻轻推到鸣人手边）先喝点水吧。"""
+
+    __ui_label__ = "小说体说话格式"
+
+    enabled: bool = Field(
+        default=True,
+        description="打开后，她的每条回复都会固定成三段：【】内心 →（动作）→ 直接说话。"
+        "下面的「内心想法」「动作/环境」两个开关只有在这一项打开时才起作用",
+        json_schema_extra={"label": "启用小说体格式"})
+    内心想法: bool = Field(
+        default=True,
+        description="只在「启用小说体格式」打开时生效。开：每条回复都带【内心想法】（没有就让她重说一遍）；"
+        "关：回复里永远不会出现【】内容",
+        json_schema_extra={"label": "内心想法【】"})
+    动作环境: bool = Field(
+        default=True,
+        description="只在「启用小说体格式」打开时生效。开：每条回复都带（动作或环境描写）（没有就让她重说一遍）；"
+        "关：回复里永远不会出现（）内容",
+        json_schema_extra={"label": "动作/环境（）"})
 
 
 class MaiknockConfig(PluginConfigBase):
@@ -293,7 +471,9 @@ class MaiknockConfig(PluginConfigBase):
     __ui_label__ = "麦麦敲门"
 
     plugin: PluginSection = Field(default_factory=PluginSection, description="插件开关")
-    proactive: ProactiveConfig = Field(default_factory=ProactiveConfig, description="主动私聊设置")
+    proactive: ProactiveConfig = Field(default_factory=ProactiveConfig, description="麦麦主动找你聊天")
+
+    style_guard: StyleGuardConfig = Field(default_factory=StyleGuardConfig, description="小说体说话格式")
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +510,14 @@ class MaiKnockPlugin(MaiBotPlugin):
         self._config_fail_count: int = 0
         # 配置自校验是否失败（C-2：插件侧用自己的模型再校验一遍宿主给的原始 TOML）
         self._config_invalid: bool = False
+        # F-12（0.2.3 回归轮 2026-11-24 实测·P1）：宿主 config.get_plugin 返回的是
+        # 它自己读文件后的**缓存段**（保留未知键、缺失新键不填默认值），且宿主
+        # watchfiles 丢变更通知时缓存陈旧是永久的 ⇒ F4 开关真值一律以原始
+        # config.toml 为准（_effective_style_guard）。这里缓存原始文件的
+        # (mtime, [style_guard] 段)，mtime 没变就复用，变了才重读
+        self._f4_raw_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+        # 旧格式 [style_guard.blocks] 接管的 warning 去重指纹（值组合变了才再打）
+        self._f4_legacy_warn_key: Optional[Tuple[Optional[bool], Optional[bool]]] = None
 
     # ---- 生命周期（B-2：宿主只调用 on_load/on_unload/on_config_update）----
 
@@ -344,6 +532,10 @@ class MaiKnockPlugin(MaiBotPlugin):
             self._validate_config_self(raw_cfg)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[MaiKnock] 加载时配置自校验未能完成：%r", exc)
+        # F-10/F-12：预热原始 config.toml 缓存并提前告警旧格式——
+        # F4 开关真值每次 gate 都以原始文件为准（_effective_style_guard），
+        # 这里只是让迁移 warning 在加载时就打出来，不等第一条消息
+        self._detect_legacy_style_guard()
         self._ensure_scan_loop()
 
     def _check_version_consistency(self) -> None:
@@ -379,15 +571,49 @@ class MaiKnockPlugin(MaiBotPlugin):
     @staticmethod
     def _read_toml_config_version(path: Path) -> str:
         """读 config.toml 的 [plugin].config_version（无 tomllib 或解析失败时返回空串）。"""
-        try:
-            import tomllib
-        except ImportError:  # Python < 3.11
+        if tomllib is None:  # F-14：Python < 3.11 且无 tomli
             return ""
         try:
             data = tomllib.loads(path.read_text(encoding="utf-8"))
             return str((data.get("plugin") or {}).get("config_version") or "")
         except Exception:  # noqa: BLE001
             return ""
+
+    def _detect_legacy_style_guard(self) -> None:
+        """启动/配置变更时预热原始 config.toml 缓存，并提前告警旧格式。
+
+        ⚠️ 根因订正（0.2.3 回归轮 2026-11-24 实测，F-12·P1）：宿主
+        ``config.get_plugin`` 返回的是它自己读文件后的**缓存段**——保留
+        ``blocks`` 未知键、缺失新键**不填**默认值；宿主 watchfiles 丢变更
+        通知时这份缓存**陈旧是永久的**（on_config_update 不触发）。早前
+        「pydantic 归一化剥掉 blocks」的判断是错的，特此更正。
+
+        ⇒ F4 开关真值不能信宿主段：``_effective_style_guard`` 每次 gate 都
+        以原始 config.toml 为准（mtime 缓存）。本方法只负责 ①预热缓存；
+        ②旧格式迁移 warning 在加载时就打，不等第一条消息。
+        """
+        self._f4_legacy_warn_key = None
+        raw = self._raw_style_guard()
+        if not raw:
+            return
+        blocks = raw.get("blocks")
+        if (
+            isinstance(blocks, dict)
+            and ("inner_enabled" in blocks or "action_enabled" in blocks)
+            and "内心想法" not in raw
+            and "动作环境" not in raw
+        ):
+            key = (
+                bool(blocks.get("inner_enabled", True)),
+                bool(blocks.get("action_enabled", True)),
+            )
+            if self._f4_legacy_warn_key != key:
+                self._f4_legacy_warn_key = key
+                logger.warning(
+                    "[MaiKnock] 检测到旧版配置 [style_guard.blocks]——开关真值已按它生效："
+                    "内心想法=%s 动作/环境=%s。在 WebUI 配置页保存一次设置即可彻底迁移成新格式",
+                    key[0], key[1],
+                )
 
     async def on_unload(self) -> None:
         """SDK 契约要求：宿主卸载插件时调用。
@@ -421,11 +647,13 @@ class MaiKnockPlugin(MaiBotPlugin):
             self._validate_config_self(raw_cfg)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[MaiKnock] 配置变更后自校验未能完成：%r", exc)
+        # F-10：config.toml 可能被改过（WebUI 保存 / 手编），重新检测旧格式接管
+        self._detect_legacy_style_guard()
         # M2：配置变更可能启用/调整扫描循环；幂等确保它在跑（热重载后宿主可能重新推配置）
         self._ensure_scan_loop()
 
     # ---- 数据存取（N-2：拆文件 + 原子写）----
-    # bindings.json     —— 低频写（用户 /mk bind），绑定信息
+    # bindings.json     —— 低频写（敲任意 /mk 命令时自动绑定），绑定信息
     # runtime_state.json —— 高频写（F1 扫描循环的每日计数/上次触发时间，M2 启用）
     # 两者均为原子写（tmp + os.replace），并发或崩溃不会损坏 JSON。
     # 注意：data_dir 不含 bot 维度（build_plugin_paths 用 project_root），多 bot 同跑会共享。
@@ -547,9 +775,8 @@ class MaiKnockPlugin(MaiBotPlugin):
         「现在是几月几号」，故事时间回退了三天她却知道绝对日期 → 当场穿帮。
 
         ⚠️ 必须做成统一出口，不能逐个命令各写一遍：
-        `/mk diag` 的「最近真实消息：11-21 03:49:26」与 `/mk time` 的
-        「现实时间：2026-11-21 18:57:00」**两处都会漏**，
-        后者尤其隐蔽 —— 它是用户主动查询的命令，输出照样进对话历史被麦麦看到。
+        `/mk now` 的「现实时间：2026-11-21 18:57:00」等命令输出**都会**
+        进对话历史被麦麦看到 —— 逐个命令各写一遍必然有漏网的。
         """
         state = self._load_timeline()
         payload = text
@@ -567,7 +794,7 @@ class MaiKnockPlugin(MaiBotPlugin):
 
     @Command(
         "mk",
-        description="麦麦敲门：bind 绑定私聊流 / diag 诊断 / hi 打招呼 / time 时间线 / help 帮助",
+        description="麦麦敲门：now 查看剧情时间线 / add 推进 / back 回退 / set 设定 / hi 让麦麦开口",
         pattern=r"^/mk\b",
     )
     async def handle_mk(self, **kwargs: Any):
@@ -578,36 +805,40 @@ class MaiKnockPlugin(MaiBotPlugin):
         platform = str(kwargs.get("platform") or "")
         user_id = str(kwargs.get("user_id") or "")
 
-        # B-6：归一化 @机器人 前缀（如「@麦麦 /mk bind」），取 /mk 起始部分
+        # B-6：归一化 @机器人 前缀（如「@麦麦 /mk now」），取 /mk 起始部分
         idx = text.find("/mk")
         if idx > 0:
             text = text[idx:]
 
+        # 自动绑定（0.2.3）：私聊里敲任何 /mk 命令 ⇒ 该流自动成为「麦麦主动找你」的目标，
+        # 不再有手动绑定命令（PM 2026-11-23 拍板：能删的命令就删）。
+        # 校验失败（拿不到私聊清单/不是私聊流）一律静默跳过，绝不挡命令。
+        bind_note = await self._auto_bind(stream_id, platform, user_id)
+
         parts = text.split(maxsplit=2)  # ["/mk", 子命令, 其余]
-        sub = parts[1].lower() if len(parts) >= 2 else "help"
+        sub = parts[1].lower() if len(parts) >= 2 else ""
         rest = parts[2].strip() if len(parts) >= 3 else ""
 
-        if sub == "bind":
-            reply = await self._cmd_bind(stream_id, platform, user_id)
-        elif sub == "diag":
-            reply = self._cmd_diag(kwargs)
-            if stream_id:
-                reply += "\n" + await self._cmd_diag_async_detail(stream_id)
-        elif sub == "hi":
+        if sub == "hi":
             reply = await self._cmd_hi(rest, stream_id)
-        elif sub in ("time", "nowtime"):
-            reply = self._cmd_time(rest)
-        elif sub == "now":
-            # /mk now = /mk time now（恢复到现实时间，追加反向声明）
-            reply = self._cmd_time("now")
-        elif sub == "help":
-            reply = self._cmd_help()
+        elif sub in ("now", "add", "back", "set"):
+            reply = await self._cmd_timeline(sub, rest)
         else:
-            reply = f"未知的子命令：{sub}。试试 /mk help"
+            reply = (
+                "麦麦敲门命令：\n"
+                "/mk now —— 看麦麦理解中的剧情时间\n"
+                "/mk add 3d 这三天我们去了海边 —— 剧情时间推进 3 天（建议附带剧情提示）\n"
+                "/mk back 10h 夜深之后 —— 剧情时间回到 10 小时前（建议附带剧情提示）\n"
+                "/mk set 09:00 此时你只觉得 —— 直接指定剧情时间（建议附带剧情提示）\n"
+                "/mk hi 马上过来给我讲讲今天的事 —— 让麦麦立刻主动开口（hi 后面直接写想让她做的事）"
+            )
+
+        if bind_note:
+            reply = bind_note + "\n" + reply
 
         # 回复统一带【MaiKnock】前缀（审计 13:24 第 15 条加固）：回读排除规则
         # 「startswith('【MaiKnock')」因此对所有插件回复完备——否则回读窗口内
-        # 敲 bind/diag/time/help 会被误判成麦麦开口
+        # 敲 now/add/back/set/hi 会被误判成麦麦开口
         if not reply.startswith("【MaiKnock"):
             reply = f"【MaiKnock】{reply}"
 
@@ -623,43 +854,37 @@ class MaiKnockPlugin(MaiBotPlugin):
 
     # ---- 子命令实现 ----
 
-    async def _cmd_bind(self, stream_id: str, platform: str, user_id: str) -> str:
-        if not stream_id:
-            return "绑定失败：当前上下文没有聊天流 ID。请在 WebUI 私聊窗口里执行 /mk bind"
-        # T-F03（测试岗 2026-11-22，静态分析）：群聊里敲 /mk bind 会把主动私聊
-        # 目标绑到群聊流 ⇒ F1 的私聊逻辑全错位。⇒ 校验目标必须是**私聊流**。
-        # 宿主能力 `chat.get_private_streams` 返回
-        # {"success": bool, "streams": [{"stream_id"/"session_id", ...}]}
-        # （plugin_runtime/capabilities/data.py:304-310 + _serialize_stream）。
-        if platform:
-            try:
-                res = await self.ctx.call_capability("chat.get_private_streams", platform=platform)
-                streams = (res or {}).get("streams") if isinstance(res, dict) else None
-                if isinstance(streams, list):
-                    private_ids = {
-                        str(s.get("stream_id") or s.get("session_id") or "")
-                        for s in streams if isinstance(s, dict)
-                    }
-                    if stream_id not in private_ids:
-                        return (
-                            "绑定失败：当前聊天流不是私聊流。"
-                            "麦麦敲门只管私聊，请到 WebUI 的私聊窗口里执行 /mk bind。"
-                        )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[MaiKnock] 校验私聊流失败，放行绑定（platform=%s）：%r", platform, exc)
+    async def _auto_bind(self, stream_id: str, platform: str, user_id: str) -> str:
+        """私聊里敲 /mk ⇒ 自动绑定该流为「麦麦主动找你」的目标（替代原手动绑定命令）。
+
+        返回给用户看的提示（未新绑定返回空串）。任何失败都静默跳过：
+        绑定只是 F1 的目标记录，绝不能挡住娱乐命令。
+        """
+        if not stream_id or not platform:
+            return ""
         state = self._load_state()
-        old = state.get("bound_stream_id")
+        if str(state.get("bound_stream_id") or "") == stream_id:
+            return ""
+        try:
+            res = await self.ctx.call_capability("chat.get_private_streams", platform=platform)
+            streams = (res or {}).get("streams") if isinstance(res, dict) else None
+            private_ids = {
+                str(s.get("stream_id") or s.get("session_id") or "")
+                for s in (streams or []) if isinstance(s, dict)
+            }
+            if stream_id not in private_ids:
+                return ""  # 群聊等非私聊流：不绑定也不提示（T-F03 口径）
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock] 自动绑定校验失败，跳过（platform=%s）：%r", platform, exc)
+            return ""
         state["bound_stream_id"] = stream_id
         state["bound_platform"] = platform
         state["bound_user_id"] = user_id
         state["bound_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        saved = self._save_state(state)
-        logger.info("[MaiKnock] 绑定聊天流：%s (platform=%s user=%s saved=%s)", stream_id, platform, user_id, saved)
-        if not saved:
-            return "绑定写入失败：状态文件无法保存，请查看宿主日志。"
-        if old and old != stream_id:
-            return f"已换绑：\n旧流 {old}\n新流 {stream_id}"
-        return f"绑定成功！\n聊天流：{stream_id}\n平台：{platform}（M2 将在此流上实现主动私聊）"
+        self._save_state(state)
+        logger.info("[MaiKnock] 自动绑定聊天流：%s (platform=%s user=%s)", stream_id, platform, user_id)
+        return "（已把本窗口设为「麦麦主动找你」的目标）"
+
 
     # ---- N-1：消息过滤助手（F1 静默判定的前置件）----
     # 命令消息（is_command=True，含 /mk 自身）与通知（is_notify=True）都会入库，
@@ -710,59 +935,7 @@ class MaiKnockPlugin(MaiBotPlugin):
             real.append(m)
         return real
 
-    def _cmd_diag(self, kwargs: Dict[str, Any]) -> str:
-        stream_id = str(kwargs.get("stream_id") or "")
-        platform = str(kwargs.get("platform") or "")
-        user_id = str(kwargs.get("user_id") or "")
-        is_op = kwargs.get("is_local_operator")
-        keys = sorted(kwargs.keys())
-        state = self._load_state()
-        bound = state.get("bound_stream_id", "（未绑定）")
-        lines = [
-            "MaiKnock 诊断",
-            f"插件版本：{VERSION}（R-20：修复前后可区分）",
-            f"当前流：{stream_id or '（空）'}",
-            f"平台：{platform or '（空）'}",
-            f"用户：{user_id or '（空）'}",
-            f"本地操作者：{is_op}",
-            f"已绑定流：{bound}",
-            f"上下文字段：{', '.join(keys)}",
-        ]
-        # ⚠️ **R6-29（建议②）**：形态表降级时让用户**看见** ——
-        # 比日志更有效（用户敲 /mk diag 就能确认防护是否生效）。
-        if tl is None:
-            lines.append("日期形态表：模块未加载 ⚠️（F2 不可用）")
-        elif not getattr(tl, "_DATE_FORMS_READY", False):
-            lines.append("日期形态表：已降级 ⚠️（绝对日期可能不被拦截）")
-        else:
-            lines.append("日期形态表：正常")
-        return "\n".join(lines)
 
-    async def _cmd_diag_async_detail(self, stream_id: str) -> str:
-        """异步补充段：最近真实用户消息（N-1 过滤验证）。"""
-        try:
-            result = await self.ctx.message.get_recent(chat_id=stream_id, limit=50)
-            msgs = result if isinstance(result, list) else (
-                result.get("messages", []) if isinstance(result, dict) else []
-            )
-            if not msgs:
-                return "最近真实消息：（get_recent 返回 0 条）"
-            real = await self._get_real_user_messages(stream_id)
-            if real:
-                last = real[-1]
-                try:
-                    ts = time.strftime("%m-%d %H:%M:%S", time.localtime(float(last.get("timestamp"))))
-                except (TypeError, ValueError):
-                    ts = str(last.get("timestamp"))
-                text = str(last.get("processed_plain_text") or "")[:30]
-                return (
-                    f"最近真实消息：{ts}「{text}」\n"
-                    f"过滤统计：原始 {len(msgs)} 条 → 用户真实发言 {len(real)} 条"
-                    f"（已排除命令/通知/麦麦自己）"
-                )
-            return f"最近真实消息：（无）——原始 {len(msgs)} 条全部为命令/通知/麦麦自己的消息"
-        except Exception as exc:  # noqa: BLE001
-            return f"最近真实消息：查询失败 {exc!r}"
 
     # ---- F3：/mk hi 手动触发主动开口（M3 最小闭环）----
     # F1-2：proactive.trigger 只是"提交任务"（enqueue_proactive_task），
@@ -841,6 +1014,11 @@ class MaiKnockPlugin(MaiBotPlugin):
 
         校验失败**不抛异常、不清缓存**：宿主此时已停用业务，插件侧报错即可；
         配置读取本身是成功的，缓存仍应保留（否则每次读都重试、刷日志）。
+
+        ⚠️ F-08（0.2.3 测试报告 2026-11-24）：**最常见的失败路径上本方法不会被调用**——
+        宿主判配置非法时插件只加载配置管理，on_load / on_config_update 都不执行，
+        此时「插件侧零日志」是设计使然而非缺陷。本方法真正兜住的只有上面②的
+        解读差异与正常运行期的配置变更；不要指望它在宿主判非法时留下插件侧日志。
         """
         try:
             MaiknockConfig(**raw)
@@ -929,7 +1107,8 @@ class MaiKnockPlugin(MaiBotPlugin):
         （PM 15:40 拍板）：手动触发只占用自己的锁位 `last_trigger_manual`，
         不推进自动扫描的 `last_trigger` / `last_trigger_global`——
         手动是明确意图，自动才有「打扰预算」。否则用户手动敲一次 /mk hi，
-        接下来 2 小时（min_interval_minutes）自动扫描就不该再主动找他。
+        接下来一个随机冷场区间内自动扫描也不该再主动找他
+        （0.3.2 起静默计时被 last_trigger_manual 重置，天然满足）。
         """
         now = time.time()
         runtime = self._load_json(self._RUNTIME_FILE)
@@ -947,7 +1126,7 @@ class MaiKnockPlugin(MaiBotPlugin):
             )
         if now - last_effective < cooldown_sec:
             remain = int(cooldown_sec - (now - last_effective))
-            return False, f"触发被冷却拦截：距上次主动触发还需约 {remain} 秒（防连环轰炸，可用 /mk diag 查看状态）"
+            return False, f"触发被冷却拦截：距上次主动触发还需约 {remain} 秒（防连环轰炸）"
         if target in self._proactive_pending:
             return False, "已有一笔主动触发在等待麦麦响应——先等她开口，或等回读超时后再试"
 
@@ -1035,7 +1214,9 @@ class MaiKnockPlugin(MaiBotPlugin):
         if not target:
             return "触发失败：找不到目标聊天流。请在 WebUI 私聊窗口里执行 /mk hi"
 
-        cooldown_sec = await self._cfg_int("proactive.hi_cooldown_minutes", 3) * 60
+        # 0.3.2 起 /mk hi 不再设冷却（PM 拍板：手动技能不该有冷却）；
+        # 防叠触发靠 pending 锁位 + 回读窗口（_do_proactive_trigger 原有）。
+        # cooldown_sec 传 0：手动锁位 last_trigger_manual 仍落盘（用于重置静默计时）。
         topic = rest.strip()
         # F1-2：intent 写成明确指令而非情境描述
         intent = "请现在主动向用户发起一条消息：自然地打个招呼并开启一个新话题。"
@@ -1043,14 +1224,16 @@ class MaiKnockPlugin(MaiBotPlugin):
             intent += f"话头：{topic}"
 
         ok, msg = await self._do_proactive_trigger(
-            target, intent, "MaiKnock /mk hi 手动触发", cooldown_sec, set(), manual=True
+            target, intent, "MaiKnock /mk hi 手动触发", 0, set(), manual=True
         )
         if not ok:
             return msg
         head = msg
         if topic:
             head += f"，话头：{topic}"
-        return head + "\n她是否真的开口由她自己决定——稍后我会用「【MaiKnock 回读】」汇报结果。"
+        # F-03（0.2.3 测试报告坐实）：0.2.3 起回读结果只写插件日志、不再进聊天流，
+        # 旧文案「稍后我会用『【MaiKnock 回读】』汇报结果」承诺了一条永远不会来的回执
+        return head + "\n她是否真的开口由她自己决定——如果等了一会儿还没动静，再敲一次 /mk hi 就行。"
 
     async def _readback_proactive_result(self, target: str, trigger_ts: float, exclude_texts: set) -> None:
         """F1-2 触发后回读：轮询 get_recent 看麦麦是否真产出了新消息。"""
@@ -1105,22 +1288,15 @@ class MaiKnockPlugin(MaiBotPlugin):
         stats = runtime.setdefault("proactive_stats", {})
         stats["triggered_total"] = int(stats.get("triggered_total", 0)) + 1
         if found_text:
-            report = f"【MaiKnock 回读】麦麦开口了：「{found_text}」"
-            logger.info("[MaiKnock] 回读确认：麦麦已开口（stream=%s）", target)
+            logger.info("[MaiKnock] 回读确认：麦麦已开口（stream=%s）：“%s”", target, found_text)
         else:
             stats["no_response_total"] = int(stats.get("no_response_total", 0)) + 1
-            report = (
-                f"【MaiKnock 回读】{timeout} 秒内未见麦麦的新消息——"
-                "这一轮她决定不开口（触发不保证开口，属已知行为），已记一次未响应。"
-            )
             logger.info("[MaiKnock] 回读超时：麦麦未响应（stream=%s）", target)
         self._write_json(self._RUNTIME_FILE, runtime)
 
-        try:
-            # F2/P9：回读报告同样走统一出口，回退生效时脱敏
-            await self._send_text(report, target)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[MaiKnock] 回读结果发送失败：%s", exc)
+        # ⚠️ PM 2026-11-24：回读结果**不再发进聊天流**。此前「【MaiKnock 回读】…」
+        # 是麦麦账号发出的消息，会进对话历史——她翻自己的历史时把这种系统日志腔
+        # 学舌出来，暴露插件存在。回读结果只写插件日志（上面 logger.info）。
 
     # ---- F1：M2 扫描循环（静默超时自动触发主动开口）----
     # 自检清单（审计 13:47，技术事实与踩坑.md:100-116）关键点落地：
@@ -1138,7 +1314,7 @@ class MaiKnockPlugin(MaiBotPlugin):
         Runner 侧硬拦截**——`runner_main.py:2357-2359` 在 `meta.config_error` 非空时
         直接 `make_error_response("插件配置错误，业务暂停")`，**根本不会调用插件的
         handle_mk** ⇒ 命令进不了插件 ⇒ 兜底启动不可能发生（实测：config_error 下
-        敲 /mk diag 无任何插件侧日志、无回复）。
+        敲 /mk 命令无任何插件侧日志、无回复）。
 
         但仍保留一道防御：配置自校验失败（C-2）时不启动扫描循环——
         避免任何路径下用宿主已判非法、插件也未校验过的值驱动主动开口。
@@ -1196,8 +1372,8 @@ class MaiKnockPlugin(MaiBotPlugin):
         state = self._load_state()
         target = str(state.get("bound_stream_id") or "")
         if not target:
-            self._scan_log_skip("未绑定聊天流（请在 WebUI 私聊执行 /mk bind）")
-            return  # 未绑定，静默等待用户 /mk bind
+            self._scan_log_skip("未绑定聊天流（用户在私聊里敲任意 /mk 命令即可自动绑定）")
+            return  # 未绑定，静默等待用户敲任意 /mk 命令触发自动绑定
 
         now = time.time()
         # 1. 禁止时段（跨天处理）
@@ -1208,24 +1384,24 @@ class MaiKnockPlugin(MaiBotPlugin):
         if target in self._proactive_pending:
             self._scan_log_skip("上一笔主动触发仍在等待麦麦响应")
             return
-        # 3. 冷却（全局 + per-stream，复用落盘锁位）
-        min_interval = await self._cfg_int("proactive.min_interval_minutes", 120) * 60
+        # 3. 上次自动触发时刻（0.3.2 起删除固定 min_interval 冷却——PM 认定与冷场区间
+        #    冗余且生硬。防骚扰改由第 5 步的「触发后冷场计时重置」承担；
+        #    锁位本身保留，用于压缩静默时长）
         runtime = self._load_json(self._RUNTIME_FILE)
         pstate = runtime.get("proactive_state", {})
         last_effective = max(
             float(pstate.get("last_trigger", {}).get(target, 0.0)),
             float(pstate.get("last_trigger_global", 0.0)),
         )
-        cooldown_left = min_interval - (now - last_effective)
-        if cooldown_left > 0:
-            self._scan_log_skip("冷却中（距上次主动开口未到最小间隔）")
-            return
         # 4. 每日上限（落盘按天重置）
         if await self._daily_quota_exceeded():
             self._scan_log_skip("今日主动开口次数已达上限")
             return
-        # 5. 静默时长判定
-        threshold = await self._cfg_int("proactive.silence_threshold_minutes", 60) * 60
+        # 5. 静默时长判定（0.3.2：随机区间——每次冷场在 [最早, 最晚] 内抽一个「本次目标」）
+        min_sec = await self._cfg_int("proactive.silence_threshold_minutes", 60) * 60
+        max_sec = await self._cfg_int("proactive.silence_threshold_max_minutes", 90) * 60
+        if max_sec < min_sec:  # 用户把最晚设得比最早还小：兜底收敛，别让区间倒挂
+            max_sec = min_sec
         silence = await self._silence_duration_seconds(target)
         if silence is None:
             # ⚠️ 这里的提前 return 在下面的 manual 重置**之前**（16:50 审计指出）：
@@ -1241,57 +1417,129 @@ class MaiKnockPlugin(MaiBotPlugin):
         # 用户 2 分钟内收到两条主动消息。修正后「所有形式的用户互动都重置静默
         # 计时」这个模型才自洽。
         # 取 min = 取最近的那次互动；max(0.0, ...) 防时钟回拨/未来时间戳出负数。
-        # ⚠️ 只影响「静默计时」，**不**动冷却（min_interval）与 daily_count——
-        # 决策 4 的四条全部保留（手动不消耗自动额度、不被 120 分钟挡住、不写自动锁位）。
+        # ⚠️ 只影响「静默计时」，**不**动触发锁位与 daily_count——
+        # 决策 4 的四条全部保留（手动不消耗自动额度、不写自动锁位）。
         manual_ts = float((pstate.get("last_trigger_manual") or {}).get(target, 0.0))
         if manual_ts > 0:
             silence = min(silence, max(0.0, now - manual_ts))
+        # 触发后冷场重置（0.3.2，替代原 min_interval 冷却——删固定冷却后防连环骚扰
+        # 的**唯一屏障**，不可删）：距上次自动触发越近，有效静默越短。
+        # 她刚找过你（无论你回没回），都要重新等满一个随机冷场区间。
+        if last_effective > 0:
+            silence = min(silence, max(0.0, now - last_effective))
         self._scan_log_silence(silence / 60)
-        if silence < threshold:
-            self._scan_log_skip("静默时长未达阈值")
+        # 随机目标抽签（0.3.2 / 0.3.3 修正）：「这次要等到多久」在 [min, max] 内随机。
+        # 语义（PM 0.3.3 确认）：**一次抽签、落盘复用**——抽中 76 就在第 76 分钟找；
+        # 没回复则触发后清空重抽（见下方触发成功分支）。扫描 tick 只是每 2 分钟
+        # 看一眼表，不是重抽。0.3.3 起抽签以 **2 分钟为步长**（偶数分钟）：
+        # 与扫描节奏同网格，秒级粒度无意义。
+        # 若每轮重抽，silence 刚过 min 就每 tick 都有概率命中小区间值，触发时刻
+        # 会系统性偏向早端。读-改-写之间无 await（原子段，A-1 同款纪律）。
+        fresh = self._load_json(self._RUNTIME_FILE)
+        fpstate = fresh.setdefault("proactive_state", {})
+        goal_raw = fpstate.get("silence_goal_sec")
+        goal = float(goal_raw) if isinstance(goal_raw, (int, float)) else None
+        # 抽签/越界重抽的判定在纯逻辑模块里（proactive_policy.py，可离线单测）
+        if mk_proactive_policy is not None:
+            need_draw = not mk_proactive_policy.goal_in_range(goal, min_sec, max_sec)
+            draw = lambda: mk_proactive_policy.draw_silence_goal(min_sec, max_sec)  # noqa: E731
+        else:  # 纯逻辑模块加载失败 ⇒ 退回内联同逻辑（行为一致，不静默降级）
+            need_draw = goal is None or not (min_sec <= goal <= max_sec)
+            draw = lambda: (min_sec // 60 + random.randrange(0, (max_sec - min_sec) // 60 + 1, 2)) * 60  # noqa: E731
+        if need_draw:
+            goal = draw()
+            fpstate["silence_goal_sec"] = goal
+            self._write_json(self._RUNTIME_FILE, fresh)
+        if silence < goal:
+            self._scan_log_skip(
+                f"静默未达本次随机目标（还需约 {max(0, int((goal - silence) / 60))} 分钟）"
+            )
             return
 
-        # 满足 → 触发（复用公共链路，锁位/回读/计数统一）
+        # 满足 → 触发（复用公共链路，锁位/回读/计数统一）；cooldown 传 0（0.3.2 删固定冷却）
         intent = "用户已经有一段时间没有发消息了，请主动向用户发起一条消息，自然地打个招呼并开启一个新话题。"
         ok, msg = await self._do_proactive_trigger(
-            target, intent, "MaiKnock M2 静默扫描", min_interval, set()
+            target, intent, "MaiKnock M2 静默扫描", 0, set()
         )
         if ok:
             self._bump_daily_count()
+            # 清空随机目标，下次触发重新抽签——不清的话每次都等到同一时长，随机性失效。
+            # ⚠️ 必须重新读盘再写：_do_proactive_trigger 刚写过锁位，
+            # 用旧快照写盘会把锁位覆盖回旧值（A-1 同款坑）
+            fresh = self._load_json(self._RUNTIME_FILE)
+            fresh.setdefault("proactive_state", {})["silence_goal_sec"] = None
+            self._write_json(self._RUNTIME_FILE, fresh)
             self._scan_last_reason = ""  # 重置跳过原因状态，便于下一轮状态变化被记录
-            logger.info("[MaiKnock] M2 静默扫描已触发（stream=%s 静默 %.0f 分钟）", target, silence / 60)
+            logger.info(
+                "[MaiKnock] M2 静默扫描已触发（stream=%s 静默 %.0f 分钟，本次随机目标 %.0f 分钟）",
+                target, silence / 60, goal / 60,
+            )
         else:
             logger.warning("[MaiKnock] M2 静默扫描触发被拦：%s", msg)
 
     async def _in_quiet_hours(self, now: float) -> bool:
-        """禁止时段判定（跨天安全）：start > end 表示跨天（如 22:00-08:00）。"""
-        start = await self._cfg_str("proactive.quiet_hours_start", "01:00")
-        end = await self._cfg_str("proactive.quiet_hours_end", "08:00")
+        """免打扰时段判定（0.3.3：多区间列表，每段「开始/结束」双联整点下拉）。
+
+        - 空清单 = 没有免打扰时段；
+        - 开始 == 结束 = 空区间，该段跳过；
+        - 开始 > 结束 = 跨天（如 22:00~06:00）；
+        - 段配置非法（解析失败）→ 打一次去重告警并跳过该段（T-E01 同款：非法静默禁用）。
+        """
+        try:
+            cfg = await self._plugin_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock] 配置读取失败，本轮免打扰判定按「无时段」处理：%r", exc)
+            return False
+        pro = cfg.get("proactive") if isinstance(cfg, dict) else None
+        spans = pro.get("免打扰时段") if isinstance(pro, dict) else None
+        if not isinstance(spans, list) or not spans:
+            return False
+        # 非法段告警（去重一次）——判定本身在纯逻辑模块里（可离线单测）
+        if mk_proactive_policy is not None:
+            bad = mk_proactive_policy.invalid_spans(spans)
+            if bad and not getattr(self, "_quiet_hours_warned", False):
+                self._quiet_hours_warned = True
+                span = bad[0]
+                logger.warning(
+                    "[MaiKnock] 免打扰时段配置非法（%r~%r），该段已被静默跳过，请重新选择整点",
+                    span.get("开始"), span.get("结束"),
+                )
+            return mk_proactive_policy.in_quiet_hours(spans, mk_proactive_policy.local_minutes(now))
+        # 纯逻辑模块加载失败 ⇒ 退回内联同逻辑（行为一致，不静默降级）
         lt = time.localtime(now)
         minutes = lt.tm_hour * 60 + lt.tm_min
-        s = self._parse_hhmm(start)
-        e = self._parse_hhmm(end)
-        if s is None or e is None or s == e:
-            # T-E01（测试岗 2026-11-22）：配置非法（如 25:00）时静默禁用禁止时段
-            # ⇒ 用户以为有禁言保护、实际没有。⇒ 解析失败时打一条去重告警
-            # （s == e 的空区间是合法配置，不告警）。
-            if (s is None or e is None) and not getattr(self, "_quiet_hours_warned", False):
-                self._quiet_hours_warned = True
-                logger.warning(
-                    "[MaiKnock] proactive.quiet_hours 配置非法（start=%r end=%r），"
-                    "禁言时段已被静默禁用，请修正为 HH:MM（0-23:0-59）",
-                    start, end,
-                )
-            return False  # 配置非法或区间为空，视为不禁止
-        if s < e:
-            # 同一天内：s <= now < e
-            return s <= minutes < e
-        # 跨天：now >= s（当晚）或 now < e（次日凌晨）
-        return minutes >= s or minutes < e
+        for span in spans:
+            if not isinstance(span, dict):
+                continue
+            s = self._parse_hhmm(str(span.get("开始") or ""))
+            e = self._parse_hhmm(str(span.get("结束") or ""))
+            if s is None or e is None:
+                if not getattr(self, "_quiet_hours_warned", False):
+                    self._quiet_hours_warned = True
+                    logger.warning(
+                        "[MaiKnock] 免打扰时段配置非法（%r~%r），该段已被静默跳过，请重新选择整点",
+                        span.get("开始"), span.get("结束"),
+                    )
+                continue
+            if s == e:
+                continue  # 空区间（下拉选了同一个整点）
+            if s < e:
+                if s <= minutes < e:
+                    return True
+            else:  # 跨天：now >= s（当晚）或 now < e（次日凌晨）
+                if minutes >= s or minutes < e:
+                    return True
+        return False
 
     @staticmethod
     def _parse_hhmm(value: str) -> Optional[int]:
-        """解析 HH:MM 为分钟数，非法返回 None。"""
+        """解析 HH:MM 为分钟数，非法返回 None。
+
+        实现在纯逻辑模块 proactive_policy.py（可离线单测）；此处保留薄封装，
+        对外接口不变（外部调用方仍可用 ``MaiKnockPlugin._parse_hhmm``）。
+        """
+        if mk_proactive_policy is not None:
+            return mk_proactive_policy.parse_hhmm(value)
         try:
             parts = value.strip().split(":")
             if len(parts) != 2:
@@ -1366,7 +1614,13 @@ class MaiKnockPlugin(MaiBotPlugin):
 
     @staticmethod
     def _parse_duration(text: str) -> Optional[float]:
-        """解析时长：``3d`` / ``12h`` / ``90m`` / ``30s``；纯数字按小时计。"""
+        """解析时长：``3d`` / ``12h`` / ``90m`` / ``30s``；纯数字按小时计。
+
+        实现在纯逻辑模块 commands.py（可离线单测）；此处保留薄封装，
+        对外接口不变。
+        """
+        if mk_commands is not None:
+            return mk_commands.parse_duration(text)
         import re
 
         raw = (text or "").strip().lower().replace(" ", "")
@@ -1382,7 +1636,13 @@ class MaiKnockPlugin(MaiBotPlugin):
 
     @staticmethod
     def _parse_target_time(text: str) -> Optional[float]:
-        """解析绝对目标时刻：``2026-11-25 09:00`` / ``2026-11-25``。"""
+        """解析绝对目标时刻：``2026-11-25 09:00`` / ``2026-11-25``。
+
+        实现在纯逻辑模块 commands.py（可离线单测）；此处保留薄封装，
+        对外接口不变。
+        """
+        if mk_commands is not None:
+            return mk_commands.parse_target_time(text)
         raw = (text or "").strip()
         if not raw:
             return None
@@ -1393,18 +1653,20 @@ class MaiKnockPlugin(MaiBotPlugin):
                 continue
         return None
 
-    def _cmd_time(self, rest: str) -> str:
-        """F2 虚构时间线：查看 / 推进 / 回退 / 设定 / 关闭 / 恢复。
 
-        **只进不退**（决策 1）：推进只能往前；回退是独立子命令（开分支线，与决策 1 不冲突）。
 
-        子命令：
-        - ``/mk time``                     查看当前时间线状态
-        - ``/mk time add 3d`` / ``add 12h`` 推进故事时间
-        - ``/mk time back 3d``             回退故事时间（那段时间会被藏起来）
-        - ``/mk time set 2026-11-25 09:00`` 把故事时间设为某个绝对时刻
-        - ``/mk time off``                 关掉时间线（清隐藏区间 + 追加反向声明）
-        - ``/mk time now`` / ``/mk now``   恢复到现实时间（追加反向声明）
+    async def _cmd_timeline(self, sub: str, rest: str) -> str:
+        """F2 剧情时间线四命令：now 查看 / add 推进 / back 回退 / set 设定。
+
+        - ``/mk now``                          查看麦麦理解中的剧情时间（唯一入口）
+        - ``/mk add 3d 这三天我们…``            剧情时间推进 3 天
+        - ``/mk back 10h 夜深之后…``            剧情时间回到 10 小时前（那段时间会被藏起来）
+        - ``/mk set 2026-11-25 09:00 此时…``    直接指定剧情时间（设到过去 = 自动按回退处理，跳过的时间藏起来）；
+          时间三种写法都行：``2026-11-25 09:01:02`` / ``2026-11-25 09:01`` / ``2026-11-25``，
+          没写的部分落到整分 / 当天 00:00:00，「现在几点」的具体感受交给剧情提示词自由发挥
+
+        剧情提示词可带可不带：带了会作为叙事注入给麦麦；不带 = 让她自由发挥
+        （并清掉上一次的提示词，不无限期生效）。
         """
         if tl is None:
             return "时间线模块未就绪（timeline.py 加载失败），F2 不可用。详见插件日志。"
@@ -1414,26 +1676,14 @@ class MaiKnockPlugin(MaiBotPlugin):
         if state is None:
             state = tl.TimelineState()
 
-        text = (rest or "").strip()
-        if not text or text.strip().lower() == "time":
-            # T-A13（测试岗 2026-11-22）：`/mk time time` 与 `/mk time` 等价（查状态）
-            return tl.describe_state(state, now)
-
-        parts = text.split(maxsplit=1)
-        head = parts[0].lower()
-        arg = parts[1].strip() if len(parts) > 1 else ""
-
-        # 测试岗 T-A08（2026-11-22 坐实）：旧实现**先写盘后渲染**，
-        # 极端幅度（如 add 999999999999999999999d）在 describe_state 里
-        # strftime 溢出抛 OverflowError ⇒ 状态已落盘、命令无回复、
-        # 之后每一轮 hook 都崩 ⇒ 遮蔽整体失效。
-        # ⇒ 修复：① 偏移幅度上限（±100 年）前置校验；② **先渲染成功再写盘**。
+        # 测试岗 T-A08（2026-11-22 坐实）：极端幅度会在渲染时 OverflowError ⇒
+        # 状态已落盘、命令无回复。⇒ ①幅度上限前置校验；②**先渲染成功再写盘**。
         _MAX_OFFSET_SEC = 100.0 * 365.25 * 86400.0
 
-        def _apply(new_state, action: str) -> str:
-            # R6-18 自检：声明里不得出现绝对日期（否则回退后麦麦能读出今天几号）
+        def _apply(new_state, action: str, narrative: str = "") -> str:
+            # R6-18：剧情提示词不得含绝对日期（否则回退后麦麦能读出今天几号）
             try:
-                tl.assert_declaration_has_no_absolute_date(new_state.declaration)
+                new_state = tl.apply_narrative(new_state, narrative)
             except ValueError as exc:
                 return f"操作已放弃：{exc}"
             if abs(float(new_state.offset_sec or 0.0)) > _MAX_OFFSET_SEC:
@@ -1448,84 +1698,128 @@ class MaiKnockPlugin(MaiBotPlugin):
             if not self._save_timeline(new_state):
                 return f"{action}失败：时间线状态写入失败（详见插件日志）"
             logger.info(
-                "[MaiKnock] 时间线变更：%s mode=%s offset=%.0fs hidden=[%s, %s]",
+                "[MaiKnock] 时间线变更：%s mode=%s offset=%.0fs hidden=[%s, %s] 剧情提示=%s",
                 action, new_state.mode, new_state.offset_sec,
                 new_state.boundary_ts, new_state.hidden_until_ts,
+                "有" if new_state.narrative else "无",
             )
             return f"{action}完成。\n" + desc
 
-        # 恢复现实时间（PM 拍板：追加反向声明，不撤旧声明）
-        if head in ("now", "reset", "real"):
-            return _apply(tl.plan_reset_to_real_now(state, now), "恢复到现实时间")
+        text = (rest or "").strip()
 
-        # 关掉时间线（R6-21：清隐藏区间 + 追加反向声明 —— 取消失忆必须同时撤销叙事）
-        if head == "off":
-            return _apply(tl.plan_off(state, now), "关闭时间线")
+        # ---- /mk now：查看（唯一入口）----
+        if sub == "now":
+            if text:
+                return "查看不需要参数，直接发 /mk now 就好。"
+            return tl.describe_state(state, now)
 
-        # 回退
-        if head in ("back", "backward"):
-            delta = self._parse_duration(arg)
+        # ---- /mk add 3d [剧情提示词] ----
+        if sub == "add":
+            parts = text.split(maxsplit=1)
+            delta = self._parse_duration(parts[0]) if parts else None
             if delta is None:
-                return "无法解析回退幅度。用法：/mk time back 3d（或 12h / 90m）"
-            if delta >= 0:
-                delta = -delta
-            try:
-                new_state = tl.plan_backward(state, now, delta)
-            except ValueError as exc:
-                # R6-20：故事时间仍在未来时回退 → 明确报错、不写盘，
-                # 避免生成倒挂的空区间（负数显示 + 无谓触发脱敏）。
-                return f"回退失败：{exc}"
-            return _apply(new_state, f"回退 {abs(delta) / 86400.0:.2f} 天")
-
-        # 设定绝对时刻
-        if head == "set":
-            target = self._parse_target_time(arg)
-            if target is None:
-                # T-A14（测试岗 2026-11-22）：示例**不含绝对日期** ——
-                # 回退态下 _send_text 的统一脱敏会把示例里的 `2026-11-25`
-                # 抹成「日期已隐去」⇒ 教用户敲一条错的命令。
-                return "无法解析目标时刻。用法：/mk time set <YYYY-MM-DD> <HH:MM>"
-            try:
-                new_state = tl.plan_set_story_time(state, now, target)
-            except ValueError as exc:
-                return f"设定失败：{exc}"
-            return _apply(new_state, "设定故事时间")
-
-        # 推进（add 3d / add 12h）—— 与 back/set 统一的单词子命令
-        if head == "add":
-            delta = self._parse_duration(arg)
-            if delta is None:
-                return "无法解析推进幅度。用法：/mk time add 3d（或 add 12h / add 90m）"
+                return "无法解析推进幅度。用法：/mk add 3d 这三天我们去了海边（幅度支持 3d / 12h / 90m；剧情提示可省略）"
+            if delta <= 0:
+                return "推进的幅度必须是正数（往未来走）。要往回走请用 /mk back"
+            narrative = parts[1].strip() if len(parts) > 1 else ""
             try:
                 new_state = tl.plan_forward(state, now, delta)
             except ValueError as exc:
                 return f"推进失败：{exc}"
-            return _apply(new_state, f"推进 {delta / 3600.0:.2f} 小时")
+            return _apply(new_state, f"推进 {delta / 3600.0:.2f} 小时", narrative)
 
-        return (
-            "无法识别的参数。用法：\n"
-            "  /mk time                    查看状态\n"
-            "  /mk time add 3d             推进故事时间\n"
-            "  /mk time back 3d            回退故事时间\n"
-            "  /mk time set <YYYY-MM-DD> <HH:MM>  设定绝对时刻\n"
-            "  /mk time off                关闭时间线（恢复对话可见）\n"
-            "  /mk now                     恢复到现实时间"
-        )
+        # ---- /mk back 10h [剧情提示词] ----
+        if sub == "back":
+            parts = text.split(maxsplit=1)
+            delta = self._parse_duration(parts[0]) if parts else None
+            if delta is None:
+                return "无法解析回退幅度。用法：/mk back 10h 夜深之后（幅度支持 10h / 3d / 90m；剧情提示可省略）"
+            if delta <= 0:
+                # F-04（0.2.3 测试报告）：与 add 对称的非正数前置校验
+                return "回退的幅度必须是正数（往过去走）。要往未来走请用 /mk add"
+            narrative = parts[1].strip() if len(parts) > 1 else ""
+            try:
+                new_state = tl.plan_backward(state, now, -delta)
+            except ValueError as exc:
+                return f"回退失败：{exc}"
+            return _apply(new_state, f"回退 {delta / 3600.0:.2f} 小时", narrative)
 
-    def _cmd_help(self) -> str:
-        return (
-            f"麦麦敲门 MaiKnock v{VERSION}\n"
-            "/mk bind          —— 在 WebUI 私聊中绑定本聊天流\n"
-            "/mk diag          —— 查看当前上下文诊断信息\n"
-            "/mk hi [话头]     —— 让麦麦立刻主动开口（是否开口由她决定，稍后回读汇报）\n"
-            "/mk time          —— 查看虚构时间线状态\n"
-            "/mk time add 3d   —— 推进故事时间（只进不退）\n"
-            "/mk time back 3d  —— 回退故事时间（那段时间会被藏起来）\n"
-            "/mk time set <YYYY-MM-DD> <HH:MM> —— 把故事时间设为某个绝对时刻\n"
-            "/mk time off      —— 关闭时间线\n"
-            "/mk now           —— 恢复到现实时间\n"
-            "/mk help          —— 显示本帮助"
-        )
+        # ---- /mk set 09:00 [剧情提示词] ----
+        if sub == "set":
+            if not text:
+                return "用法：/mk set 09:00 此时你只觉得…（时间支持四种写法：日期+时刻（带秒或只到分）/ 只写日期 / 只给时刻 = 故事当天的该时刻；没写的部分落到整分或当天 00:00:00；剧情提示可省略）"
+            target, narrative = self._split_set_arg(text)
+            if target is None:
+                # F-02 残留（0.2.3 回归轮坐实）：只给时刻（09:00）= 故事当天的该时刻。
+                # 按**故事当前日**算（state.story_now），不是现实日——回退态下故事
+                # 已退到 3 天前，「当天 09:00」必须是故事里那天，否则语义跳
+                target, narrative = self._split_time_only(text, state.story_now(now))
+            if target is None:
+                # T-A14 / F-02：示例不得含绝对日期——回退态下出站脱敏会把示例日期
+                # 抹成「日期已隐去」，用户照抄必失败
+                return "无法解析目标时刻。用法：/mk set 09:00 此时你只觉得…"
+            try:
+                new_state = tl.plan_set_story_time(state, now, target)
+            except ValueError as exc:
+                return f"设定失败：{exc}"
+            return _apply(new_state, "设定故事时间", narrative)
+
+        # 无兜底分支：handle_mk 的分发只把 now/add/back/set 传进来，
+        # 「未知的子命令」永远不可达（0.2.3 测试报告 F-07：死代码已删）
+
+    @staticmethod
+    def _split_set_arg(text: str):
+        """/mk set 的参数拆分：目标时刻 + 剧情提示词。
+
+        支持 ``2026-11-25 09:00 剧情…`` / ``2026-11-25 剧情…`` / ``2026-11-25``。
+        解析失败返回 (None, None)。
+
+        实现在纯逻辑模块 commands.py（可离线单测）；此处保留薄封装，
+        对外接口不变。
+        """
+        if mk_commands is not None:
+            return mk_commands.split_set_arg(text)
+        raw = (text or "").strip()
+        if not raw:
+            return None, None
+        ts = MaiKnockPlugin._parse_target_time(raw)
+        if ts is not None:
+            return ts, ""
+        parts = raw.split(maxsplit=2)
+        if len(parts) >= 2:
+            ts = MaiKnockPlugin._parse_target_time(parts[0] + " " + parts[1])
+            if ts is not None:
+                return ts, (parts[2].strip() if len(parts) > 2 else "")
+        ts = MaiKnockPlugin._parse_target_time(parts[0])
+        if ts is not None:
+            return ts, (parts[1].strip() if len(parts) > 1 else "")
+        return None, None
+
+    @staticmethod
+    def _split_time_only(text: str, anchor_story_ts: float):
+        """``/mk set`` 只给时刻的解析（F-02 残留修复）：``09:00`` = 故事当天的该时刻。
+
+        实现在纯逻辑模块 commands.py（可离线单测）；此处保留薄封装，
+        纯逻辑模块加载失败时退回内联同逻辑（不静默降级）。
+        """
+        if mk_commands is not None:
+            return mk_commands.split_time_only(text, anchor_story_ts)
+        import re as _re
+
+        raw = (text or "").strip()
+        if not raw:
+            return None, None
+        parts = raw.split(maxsplit=1)
+        m = _re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", parts[0])
+        if not m:
+            return None, None
+        h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+        if not (0 <= h <= 23 and 0 <= mi <= 59 and 0 <= s <= 59):
+            return None, None
+        lt = time.localtime(anchor_story_ts)
+        day_start = float(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+        ts = day_start + h * 3600.0 + mi * 60.0 + s
+        return ts, (parts[1].strip() if len(parts) > 1 else "")
 
     # ------------------------------------------------------------------
     # F2 第②步：A + G 合流 —— 挂两个 hook
@@ -1549,8 +1843,13 @@ class MaiKnockPlugin(MaiBotPlugin):
             return None
         if state is None:
             return None
-        # 只有「有偏移」或「有隐藏区间」时才需要改写
-        if not state.offset_sec and not state.has_hidden_window():
+        # 有偏移 / 有隐藏区间 / 有剧情提示词，任一成立都需要改写
+        # （偏移可能归零但仍带着剧情提示词 ⇒ 也要注入）
+        if (
+            not state.offset_sec
+            and not state.has_hidden_window()
+            and not (getattr(state, "narrative", "") or "").strip()
+        ):
             return None
         return state
 
@@ -1560,8 +1859,8 @@ class MaiKnockPlugin(MaiBotPlugin):
         ⚠️ **用状态里存的 `state.declaration`（不是现场生成）** ——
         机制 3 的 **D1** 要求：声明必须持久化，插件在 `on_load` / 首次 hook 调用时重新注入一次；
         而且 `declaration` 是 **append-only**（PM 拍板 C），
-        `/mk now` / `/mk time off` 会**追加一条反向声明**（R6-21 修的也是这个）
-        ⇒ 只有用存下来的那份，反向声明才能一起送到模型。
+        新声明会**替换**旧声明（旧代退役进历史）
+        ⇒ 只有用存下来的那份，最新一代声明才能送到模型。
 
         ⚠️ **只在「有隐藏区间」时注入** —— 单纯推进时间线（`add 3d`）不是失忆，
         没必要让麦麦以为那段记忆是空白的。
@@ -1746,6 +2045,15 @@ class MaiKnockPlugin(MaiBotPlugin):
                 item_id=self._f2_decl_item_id(),
                 timestamp=self._f2_now_iso(),
             )
+        # 剧情提示词（0.2.3）：/mk add|back|set 附带的叙事，每轮注入（与声明同理）
+        narr = (getattr(state, "narrative", "") or "").strip()
+        if narr:
+            final_items = mk_decl.inject_declaration(
+                final_items,
+                narr,
+                item_id="maiknock-timeline-narrative",
+                timestamp=self._f2_now_iso(),
+            )
 
         new_kwargs = dict(kwargs)
         new_kwargs["items"] = final_items
@@ -1886,10 +2194,277 @@ class MaiKnockPlugin(MaiBotPlugin):
                 item_id=self._f2_decl_item_id(),
                 timestamp=self._f2_now_iso(),
             )
+        # 剧情提示词（0.2.3）：同声明，replyer 侧也必须注入
+        narr = (getattr(state, "narrative", "") or "").strip()
+        if narr:
+            new_items = mk_decl.inject_declaration(
+                new_items,
+                narr,
+                item_id="maiknock-timeline-narrative",
+                timestamp=self._f2_now_iso(),
+            )
 
         new_kwargs = dict(kwargs)
         new_kwargs["items"] = new_items
         return {"action": "continue", "modified_kwargs": new_kwargs}
+
+    # ------------------------------------------------------------------
+    # F4 小说体风格守卫（规格 §3.1 / §3.3 / §3.7）
+    #
+    # 三段式契约：【】内心 / （）环境动作 / 裸文本口头语言。
+    # 两个 hook（F2 的两个不动）：
+    #   * before_model_request —— 注入契约（本 handler 名必须按字母序排在
+    #     `maiknock_replier_timeline` 之后：r < s；改名即翻车，见模块头 0.3.0 说明）
+    #   * after_response —— 缺块打回重生（插件侧上限 1 次）/ 格式问题代码改写
+    # ⚠️ 返回协议一律 {"action": "continue", "modified_kwargs": {...}}——
+    #    裸 {"response": ...} / {"retry": ...} 会被宿主静默丢弃（hook_dispatcher.py:548/619-621）。
+    # ------------------------------------------------------------------
+
+    async def _f4_gate(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """F4 闸门：模块可用 + 配置启用 ⇒ 返回 [style_guard] 配置段；否则 None。
+
+        0.3.3 起**对所有聊天全量生效**（PM 拍板：受管清单是「麦麦聊天室」插件的事，
+        麦麦敲门不该管生效范围）——不再按 session 过滤。
+        ⚠️ 配置只走 _plugin_config()（内部 config.get_plugin）——禁用 ctx.config.get，
+        那读的是宿主全局主配置（F1 踩过的坑，plugin.py:778-797）。
+        """
+        if mk_style_guard is None:
+            return None
+        try:
+            cfg = await self._plugin_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock][F4] 配置读取失败，本轮守卫不生效：%r", exc)
+            return None
+        sg = cfg.get("style_guard") if isinstance(cfg, dict) else None
+        if not isinstance(sg, dict) or not bool(sg.get("enabled", True)):
+            return None
+        # F-12（0.2.3 回归轮坐实·P1）：宿主段可能陈旧且永不刷新（watchfiles 丢
+        # 变更通知时 on_config_update 不触发）⇒ 开关真值一律以原始 config.toml
+        # 为准合成：原文新键 > 旧版 blocks 接管 > 宿主段兜底。mtime 没变只付
+        # 一次 stat 的开销，宿主缓存陈旧与否不再影响开关
+        return self._effective_style_guard(sg)
+
+    def _raw_style_guard(self) -> Optional[Dict[str, Any]]:
+        """读原始 config.toml 的 [style_guard] 段（mtime 指纹缓存，F-12 真值来源）。
+
+        返回值语义：dict = 文件里的 [style_guard]（可能为空 dict = 段不存在/解析失败）；
+        None = config.toml 缺失或不可 stat。读失败会缓存 ``(mtime, {})`` 避免刷屏，
+        mtime 一变自然重试。
+
+        ⚠️ 本函数是 F4 开关真值的唯一来源（F-12）——任何读失败都意味着真值路径
+        走不通、症状与「宿主缓存陈旧」一模一样，**一律 error 级喊出来**（F-14），
+        不允许静默回退宿主段。
+        """
+        try:
+            path = Path(__file__).parent / "config.toml"
+            mtime = path.stat().st_mtime
+        except OSError:
+            self._f4_raw_cache = None
+            return None
+        cached = self._f4_raw_cache
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        if tomllib is None:
+            # F-14：解析器不可用（Python < 3.11 且没装 tomli）——真值路径整体
+            # 走不通，必须 error 级提示，不允许被 except 链静默吞掉
+            logger.error(
+                "[MaiKnock] 无可用 TOML 解析器（需 Python 3.11+ 的 tomllib，或 pip 安装 tomli），"
+                "F4 开关真值回退宿主段——请尽快补齐解析器"
+            )
+            self._f4_raw_cache = (mtime, {})
+            return {}
+        try:
+            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            self._f4_raw_cache = None
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "[MaiKnock] 读取原始 config.toml 失败，F4 开关真值回退宿主段（症状"
+                "与宿主缓存陈旧相同，务必排查）：%r",
+                exc,
+            )
+            self._f4_raw_cache = (mtime, {})
+            return {}
+        sg = raw.get("style_guard")
+        if not isinstance(sg, dict):
+            sg = {}
+        self._f4_raw_cache = (mtime, sg)
+        return sg
+
+    def _effective_style_guard(self, host_sg: Dict[str, Any]) -> Dict[str, Any]:
+        """合成 F4 开关真值——**原始 config.toml 优先，宿主段兜底**（F-12）。
+
+        优先级（0.2.3 回归轮拍板，同时闭合 F-10 / F-11 / F-12）：
+          1. 原文写了新键（内心想法/动作环境）→ 以原文为准（用户亲手写的才是真相；
+             缺的那侧按规格缺省 True，不吃陈旧宿主段的 legacy 值）；
+          2. 原文只有旧版 [style_guard.blocks] → 用 blocks 旧键接管（F-10 场景）；
+          3. 原文读不到 / 没有 [style_guard] 段 → 回退宿主段（尽力而为）。
+        """
+        raw = self._raw_style_guard()
+        if not raw:
+            return host_sg
+        if "内心想法" in raw or "动作环境" in raw:
+            merged = dict(host_sg)
+            merged["内心想法"] = bool(raw.get("内心想法", True))
+            merged["动作环境"] = bool(raw.get("动作环境", True))
+            return merged
+        blocks = raw.get("blocks")
+        if isinstance(blocks, dict) and (
+            "inner_enabled" in blocks or "action_enabled" in blocks
+        ):
+            overrides: Dict[str, bool] = {}
+            if "inner_enabled" in blocks:
+                overrides["内心想法"] = bool(blocks["inner_enabled"])
+            if "action_enabled" in blocks:
+                overrides["动作环境"] = bool(blocks["action_enabled"])
+            key = (overrides.get("内心想法"), overrides.get("动作环境"))
+            if self._f4_legacy_warn_key != key:
+                self._f4_legacy_warn_key = key
+                logger.warning(
+                    "[MaiKnock] 开关真值取自旧版 [style_guard.blocks]（原始 config.toml）："
+                    "内心想法=%s 动作/环境=%s。在 WebUI 配置页保存一次即可彻底迁移成新格式",
+                    key[0], key[1],
+                )
+            return {**host_sg, **overrides}
+        return host_sg
+
+    @staticmethod
+    def _f4_blocks(sg: Dict[str, Any]) -> "tuple[bool, bool]":
+        """取两大块开关（缺省 true，规格 §1.2）。"""
+        # F-12 订正：宿主 config.get_plugin 返回的是它读文件后的**缓存段**（保留
+        # blocks、缺失新键不填默认值，且可能永久陈旧）⇒ 上面的 legacy 回退对宿主段
+        # 也可能真的走到。_f4_gate 传入的 sg 已由 _effective_style_guard 以原始
+        # config.toml 为准合成；这里的回退只是最后一道保险
+        legacy = sg.get("blocks") if isinstance(sg.get("blocks"), dict) else {}
+        return (
+            bool(sg.get("内心想法", legacy.get("inner_enabled", True))),
+            bool(sg.get("动作环境", legacy.get("action_enabled", True))),
+        )
+
+    @HookHandler(
+        "maisaka.replyer.before_model_request",
+        name="maiknock_style_guard",  # ⚠️ 字母序排在 maiknock_replier_timeline 之后，改名即翻车
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+    )
+    async def _hook_replier_style_contract(self, **kwargs):
+        """F4 请求前：向 items 末尾注入三段式契约（按开关动态生成，注入幂等）。"""
+        session_id = str(kwargs.get("session_id") or "")
+        sg = await self._f4_gate(session_id)
+        if sg is None:
+            return {"action": "continue"}
+        items = kwargs.get("items")
+        if not isinstance(items, list) or not items:
+            return {"action": "continue"}
+        inner_enabled, action_enabled = self._f4_blocks(sg)
+        contract = mk_style_guard.build_contract(inner_enabled, action_enabled)
+        new_items = mk_style_guard.inject_contract(items, contract, timestamp=self._f2_now_iso())
+        logger.info(
+            "[MaiKnock][F4] 契约已注入 session=%s（inner=%s action=%s）",
+            session_id[:12] or "（空）", inner_enabled, action_enabled,
+        )
+        # ⚠️ 必须复制整份 kwargs 再改 items——只回 {"items": ...} 会丢
+        #    item_schema_version 等字段（协议校验整包丢弃且只打一条 warning）
+        new_kwargs = dict(kwargs)
+        new_kwargs["items"] = new_items
+        return {"action": "continue", "modified_kwargs": new_kwargs}
+
+    @HookHandler(
+        "maisaka.replyer.after_response",
+        name="maiknock_style_guard_after",  # ⚠️ 不能与 before 同名：宿主组件表按 full_name 全局唯一，
+        #     同名会让 after 覆盖 before 的注册条目 → 契约注入静默失效（2026-11-23 实机踩坑）
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+    )
+    async def _hook_replier_style_enforce(self, **kwargs):
+        """F4 响应后：①显式内心标记转换 → ②缺块判定（打回重生，上限 1 次）→ ③按开关删块。
+
+        ⚠️ 改写与重生一个回合二选一（宿主先改写再判重生，同时返回语义错乱）；
+        ⚠️ retry_count >= max_retries 时不再打回，接受当前回复（尽力保证，非数学保证）。
+        """
+        session_id = str(kwargs.get("session_id") or "")
+        sg = await self._f4_gate(session_id)
+        if sg is None:
+            return {"action": "continue"}
+        response = str(kwargs.get("response") or "")
+        if not response.strip():
+            return {"action": "continue"}
+
+        fmt = sg.get("format") if isinstance(sg.get("format"), dict) else {}
+        markers_raw = fmt.get("inner_markers")
+        markers = (
+            [str(m) for m in markers_raw if str(m).strip()]
+            if isinstance(markers_raw, list) else None
+        )
+        try:
+            max_retries = int(fmt.get("max_retries", 1))
+        except (TypeError, ValueError):
+            max_retries = 1
+        retry_inner = str(fmt.get("retry_reason_inner") or "").strip() or None
+        retry_action = str(fmt.get("retry_reason_action") or "").strip() or None
+        try:
+            retry_count = int(kwargs.get("retry_count") or 0)
+        except (TypeError, ValueError):
+            retry_count = 0
+
+        inner_enabled, action_enabled = self._f4_blocks(sg)
+        # F-09（0.2.3 测试报告）：打回重生的指令按开关状态生成——关掉另一侧时
+        # 明确告诉模型「禁写不等于可以省略」，降低二次重生率
+        if not retry_inner:
+            retry_inner = (
+                "刚才的回复漏了【】内心想法——这不能省。请重新输出整条回复："
+                "每段先用【】写她此刻真实但没说出口的想法，再说话。"
+                + ("同时仍然不要出现任何（）动作/环境描写。" if not action_enabled else "")
+            )
+        if not retry_action:
+            retry_action = (
+                "刚才的回复漏了（）动作/环境描写——这不能省。请重新输出整条回复："
+                "每段先用（）写贴合当下情绪的肢体动作或环境描写，再说话。"
+                + ("注意：禁写内心想法不代表可以省略（），不要连动作一起丢掉。" if not inner_enabled else "")
+            )
+        result = mk_style_guard.enforce(
+            response,
+            inner_enabled=inner_enabled,
+            action_enabled=action_enabled,
+            markers=markers,
+            retry_reason_inner=retry_inner,
+            retry_reason_action=retry_action,
+        )
+
+        # ---- 缺块 → 打回重生（二选一：不产出改写文本）----
+        if result.retry_reason:
+            if retry_count >= max_retries:
+                logger.info(
+                    "[MaiKnock][F4] 缺块（%s）但已达插件侧重生上限（retry_count=%s max=%s），放行当前回复",
+                    result.matched_rule, retry_count, max_retries,
+                )
+                return {"action": "continue"}
+            logger.info(
+                "[MaiKnock][F4] 缺块打回重生：%s（session=%s retry_count=%s）",
+                result.matched_rule, session_id[:12] or "（空）", retry_count,
+            )
+            return {"action": "continue", "modified_kwargs": {
+                "retry": True,
+                "retry_reason": result.retry_reason,
+                "matched_regex": result.matched_rule,
+            }}
+
+        # ---- 格式问题 → 代码改写（免费、确定）----
+        if result.final_text is not None and result.final_text != response:
+            parts = []
+            if result.converted:
+                parts.append(f"内心标记转换 {result.converted} 处")
+            if result.deleted_inner:
+                parts.append(f"删内心块 {result.deleted_inner} 处")
+            if result.deleted_action:
+                parts.append(f"删动作块 {result.deleted_action} 处")
+            if result.empty_body_protected:
+                parts.append("空正文保护生效（保留原文）")
+            logger.info("[MaiKnock][F4] 已改写回复：%s", "；".join(parts) or "（微调）")
+            return {"action": "continue", "modified_kwargs": {"response": result.final_text}}
+        return {"action": "continue"}
+
 
 
 def _mk_item_text(item: Dict[str, Any]) -> str:
