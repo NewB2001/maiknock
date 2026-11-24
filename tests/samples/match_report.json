@@ -1,0 +1,123 @@
+{
+  "snapshots": 18,
+  "candidates": 145,
+  "total_blocks": 409,
+  "matched": 397,
+  "ambiguous": 130,
+  "match_rate": 0.9706601466992665,
+  "unmatched_reasons": {
+    "有候选但正文不等": 1,
+    "说话人带 [回复了…] 引用块": 8,
+    "无同秒同人候选（消息未落库/时间差）": 3
+  },
+  "per_snapshot": [
+    {
+      "file": "1795237949892.json",
+      "blocks": 17,
+      "matched": 17,
+      "rate": 1.0
+    },
+    {
+      "file": "1795241236891.json",
+      "blocks": 18,
+      "matched": 18,
+      "rate": 1.0
+    },
+    {
+      "file": "1795246318115.json",
+      "blocks": 19,
+      "matched": 19,
+      "rate": 1.0
+    },
+    {
+      "file": "1795246625126.json",
+      "blocks": 19,
+      "matched": 18,
+      "rate": 0.9473684210526315
+    },
+    {
+      "file": "1795247438280.json",
+      "blocks": 20,
+      "matched": 20,
+      "rate": 1.0
+    },
+    {
+      "file": "1795248855445.json",
+      "blocks": 20,
+      "matched": 20,
+      "rate": 1.0
+    },
+    {
+      "file": "1795249053443.json",
+      "blocks": 20,
+      "matched": 20,
+      "rate": 1.0
+    },
+    {
+      "file": "1795249185825.json",
+      "blocks": 21,
+      "matched": 21,
+      "rate": 1.0
+    },
+    {
+      "file": "1795249807154.json",
+      "blocks": 22,
+      "matched": 22,
+      "rate": 1.0
+    },
+    {
+      "file": "1795254965253.json",
+      "blocks": 21,
+      "matched": 21,
+      "rate": 1.0
+    },
+    {
+      "file": "1795265278632.json",
+      "blocks": 22,
+      "matched": 22,
+      "rate": 1.0
+    },
+    {
+      "file": "1795269828812.json",
+      "blocks": 22,
+      "matched": 22,
+      "rate": 1.0
+    },
+    {
+      "file": "1795273750988.json",
+      "blocks": 22,
+      "matched": 21,
+      "rate": 0.9545454545454546
+    },
+    {
+      "file": "1795276610390.json",
+      "blocks": 28,
+      "matched": 23,
+      "rate": 0.8214285714285714
+    },
+    {
+      "file": "1795277598872.json",
+      "blocks": 28,
+      "matched": 26,
+      "rate": 0.9285714285714286
+    },
+    {
+      "file": "1795277917896.json",
+      "blocks": 30,
+      "matched": 29,
+      "rate": 0.9666666666666667
+    },
+    {
+      "file": "1795278519059.json",
+      "blocks": 30,
+      "matched": 29,
+      "rate": 0.9666666666666667
+    },
+    {
+      "file": "1795279171658.json",
+      "blocks": 30,
+      "matched": 29,
+      "rate": 0.9666666666666667
+    }
+  ]
+}
