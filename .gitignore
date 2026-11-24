@@ -1,5 +1,13 @@
 # 运行配置：用户本地生成，不入版本控制（示例见 config.example.toml）
 config.toml
+config.toml.bak*
+config_back/
+
+# 插件运行时状态：本地生成，不入版本控制
+data/
+
+# 发布工具与凭据：只在本机用，绝不能进仓库
+.publish/
 
 # Python
 __pycache__/
@@ -10,3 +18,6 @@ __pycache__/
 # 编辑器
 .idea/
 .vscode/
+
+# 工具产物
+.playwright-mcp/
