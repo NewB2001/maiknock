@@ -11,6 +11,21 @@
 _manifest.json 与 config.toml 无法引用 Python 常量，改由启动自检
 _check_version_consistency() 比对并告警。
 
+0.4.0（2026-11-24 已发布）：F5 消息分段管理 —— 回复字数配置 + 段落间空行。
+    ⚠️ 版本号只在发布时前进，开发期小修小改不涨号（PM 2026-11-23 拍板）。
+    0.4.0 由 PM 拍板定版（2026-11-24）：F5 是面向用户的新功能（新配置项 + 新行为），
+    按「体量/性质超补丁号 ⇒ 涨号」的既有判据（0.3.0 同判据）升 minor。
+    本版本含 F5 两条新行为：
+    - 功能 A 回复字数配置（新纯逻辑模块 reply_length.py + 配置节 [reply_length] 的
+      「回复篇幅」下拉）：简短（60-200字）/ 适中（100-400字）/ 详细（150-600字）/ 自由，
+      四档；字数下限恒为 60（用户铁律）；「自由」= 只放开字数，小说体格式、内心/动作
+      开关、段落空行全都照常遵守；软约束（请求前注入中文契约），无硬截断。
+    - 功能 B 段落间空行（style_guard.normalize_paragraph_breaks）：**插件被动技能**，
+      没有开关、不用配置、所有字数档位生效（含「自由」）；段起点按内心/动作开关组合
+      自动切换（【 开头 / （ 开头 / 句末标点），段间统一空一行，幂等。
+    ⚠️ 下面 0.3.1~0.3.4 是**开发期迭代号**，从未作为发布号出现过，
+       其内容一并收进 0.4.0 的 CHANGELOG 条目。
+
 0.3.0（2026-11-24 已发布）：0.2.2 之后的**所有**变更统一累积在本版本。
     ⚠️ 版本号只在发布时前进，开发期小修小改不涨号（PM 2026-11-23 拍板）。
     0.3.0 由 PM 测试收尾时拍板改定（2026-11-24：F2 命令面大改 + F4 开关真值
@@ -26,7 +41,8 @@ _check_version_consistency() 比对并告警。
     - 配置节 [timeline]「启用剧情时间线」曾短暂加入又删除（PM 2026-11-24 拍板）：
       四条命令默认开启，不设开关——插件只是把麦麦本来就有的剧情时间概念做成可控，不是创造。
 
-0.3.4 变更要点（2026-11-23，PM 五条拍板：纯文案与 UI 措辞，运行逻辑零变化）：
+0.3.4 变更要点（2026-11-23，PM 五条拍板：纯文案与 UI 措辞，运行逻辑零变化）
+    —— **开发期迭代号，内容已并入 0.4.0**：
     1) 主动私聊节描述去掉「防打扰的限制」尾巴；
     2) 冷场两字段改同名标题 + 最早/最晚后缀（前端大屏两列网格，相邻声明天然同行并排）；
     3) 「夜间免打扰时段」改名「免打扰时段（麦麦在这段时间内不会找你）」，描述不再提拖动；
@@ -210,7 +226,7 @@ _MK_BLOCK_START_RE = re.compile(r"(?m)^\[\d{2}:\d{2}:\d{2}\]")
 
 # 插件版本号唯一来源（审计 A-3）：Python 侧一律引用此常量；
 # _manifest.json / config.toml 无法引用，由 _check_version_consistency() 启动自检比对告警。
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # ---------------------------------------------------------------------------
 # F2 虚构时间线：纯逻辑模块 timeline.py
@@ -351,6 +367,15 @@ except Exception as _sg_exc:  # noqa: BLE001
     mk_style_guard = None
     logger.error("[MaiKnock] F4 风格守卫模块 style_guard.py 加载失败，F4 功能不可用：%r", _sg_exc)
 
+# F5 功能 A 字数配置：纯逻辑模块 reply_length.py（软约束，无硬截断）
+# ⚠️ 按文件路径加载（裸 import 会 ImportError，踩坑 66）；R6-29：加载失败必须可见
+mk_reply_length = None
+try:  # pragma: no cover - 加载失败只降级 F5，不阻断插件其余功能
+    mk_reply_length = _load_sibling("reply_length", "reply_length.py")
+except Exception as _rl_exc:  # noqa: BLE001
+    mk_reply_length = None
+    logger.error("[MaiKnock] F5 字数模块 reply_length.py 加载失败，F5 功能不可用：%r", _rl_exc)
+
 
 # ---------------------------------------------------------------------------
 # 纯逻辑模块：proactive_policy.py（F1 策略）+ commands.py（命令参数解析）
@@ -465,6 +490,27 @@ class StyleGuardConfig(PluginConfigBase):
         json_schema_extra={"label": "动作/环境（）"})
 
 
+class ReplyLengthConfig(PluginConfigBase):
+    """控制麦麦一条回复的篇幅"""
+
+    __ui_label__ = "回复字数"
+
+    # ⚠️ 配置窗口只有一个中文下拉档位——档位自带字数范围，从源头防呆：
+    #    用户选不到「最大 < 最小」，不需要任何数值输入校验（0.3.3 用户拍板）
+    #    「自由」= 不注入任何字数契约，麦麦完全自己决定篇幅
+    回复篇幅: Literal[
+        "简短（60-200字）",
+        "适中（100-400字）",
+        "详细（150-600字）",
+        "自由",
+    ] = Field(
+        default="简短（60-200字）",
+        description="选一个档位决定麦麦一条回复的大致篇幅。简短=60到200字，适中=100到400字，"
+        "详细=150到600字，自由=不限制、麦麦自己决定。这是大致范围、不是硬性截断，自然表达优先。"
+        "字数只算说出口的话，【】内心和（）动作不算",
+        json_schema_extra={"label": "回复篇幅（一句话选档位）"})
+
+
 class MaiknockConfig(PluginConfigBase):
     """麦麦敲门插件总配置。"""
 
@@ -474,6 +520,7 @@ class MaiknockConfig(PluginConfigBase):
     proactive: ProactiveConfig = Field(default_factory=ProactiveConfig, description="麦麦主动找你聊天")
 
     style_guard: StyleGuardConfig = Field(default_factory=StyleGuardConfig, description="小说体说话格式")
+    reply_length: ReplyLengthConfig = Field(default_factory=ReplyLengthConfig, description="回复字数")
 
 
 # ---------------------------------------------------------------------------
@@ -2439,6 +2486,11 @@ class MaiKnockPlugin(MaiBotPlugin):
                     "[MaiKnock][F4] 缺块（%s）但已达插件侧重生上限（retry_count=%s max=%s），放行当前回复",
                     result.matched_rule, retry_count, max_retries,
                 )
+                # 放行也要过第④步换行规整（被动技能：所有路径都生效）
+                settled = mk_style_guard.normalize_paragraph_breaks(
+                    response, inner_enabled=inner_enabled, action_enabled=action_enabled)
+                if settled != response:
+                    return {"action": "continue", "modified_kwargs": {"response": settled}}
                 return {"action": "continue"}
             logger.info(
                 "[MaiKnock][F4] 缺块打回重生：%s（session=%s retry_count=%s）",
@@ -2450,8 +2502,13 @@ class MaiKnockPlugin(MaiBotPlugin):
                 "matched_regex": result.matched_rule,
             }}
 
-        # ---- 格式问题 → 代码改写（免费、确定）----
-        if result.final_text is not None and result.final_text != response:
+        # ---- ①②③ 格式问题 → 代码改写（免费、确定）----
+        final = result.final_text if result.final_text is not None else response
+        # ---- ④ 段落间空行（被动技能，所有字数档位生效）----
+        settled = mk_style_guard.normalize_paragraph_breaks(
+            final, inner_enabled=inner_enabled, action_enabled=action_enabled)
+
+        if settled != response:
             parts = []
             if result.converted:
                 parts.append(f"内心标记转换 {result.converted} 处")
@@ -2461,9 +2518,68 @@ class MaiKnockPlugin(MaiBotPlugin):
                 parts.append(f"删动作块 {result.deleted_action} 处")
             if result.empty_body_protected:
                 parts.append("空正文保护生效（保留原文）")
+            if settled != final:
+                parts.append("段落空行规整")
             logger.info("[MaiKnock][F4] 已改写回复：%s", "；".join(parts) or "（微调）")
-            return {"action": "continue", "modified_kwargs": {"response": result.final_text}}
+            return {"action": "continue", "modified_kwargs": {"response": settled}}
         return {"action": "continue"}
+
+    # ------------------------------------------------------------------
+    # F5 功能 A 回复字数配置（软约束；无硬截断）
+    #
+    # 只挂一个 hook：before_model_request 注入字数契约到 items 末尾。
+    # 契约文案自带「约等于、自然表达优先」，没有代码层截断——用户拍板
+    # 「字数上限是尽量约等于，不是死规矩」，硬切会切碎小说体语义片段。
+    #
+    # ⚠️ 返回协议一律 {"action":"continue","modified_kwargs":{...}}；
+    #    before hook 必须复制**整份** kwargs 再改 items（只回 {"items":...} 会丢
+    #    item_schema_version 等字段，宿主整包丢弃）。
+    # ⚠️ F4/F5 两个契约的 item_id 不同（style-guard-contract / reply-length-contract），
+    #    各自幂等注入、互不覆盖。
+    # ------------------------------------------------------------------
+
+    @HookHandler(
+        "maisaka.replyer.before_model_request",
+        name="maiknock_reply_length",  # 字母序：r < s，排在 F4 的 maiknock_style_guard 之前；无依赖
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+    )
+    async def _hook_reply_length_contract(self, **kwargs):
+        """F5 请求前：注入字数范围契约（软约束），让模型第一遍就写在范围内。"""
+        if mk_reply_length is None:
+            return {"action": "continue"}
+        try:
+            cfg = await self._plugin_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock][F5] 配置读取失败，本轮字数约束不生效：%r", exc)
+            return {"action": "continue"}
+        rl = cfg.get("reply_length") if isinstance(cfg, dict) else None
+        if not isinstance(rl, dict):
+            rl = {}
+        # 手改 config.toml 可能留下旧版两个数字键（0.3.1）——兼容读取，但以档位为准
+        preset = str(rl.get("回复篇幅") or "")
+        items = kwargs.get("items")
+        if not isinstance(items, list) or not items:
+            return {"action": "continue"}
+
+        # 「自由」档：不注入任何字数契约，并清掉历史里可能残留的旧契约——
+        # 否则从别的档切过来时，旧字数要求还挂在上下文里，等于没切（F5 切档一致性）
+        if mk_reply_length.is_free(preset):
+            cleaned = mk_reply_length.strip_contract(items)
+            if len(cleaned) == len(items):
+                return {"action": "continue"}
+            new_kwargs = dict(kwargs)
+            new_kwargs["items"] = cleaned
+            logger.info("[MaiKnock][F5] 自由档：已清除 %s 条历史字数契约", len(items) - len(cleaned))
+            return {"action": "continue", "modified_kwargs": new_kwargs}
+
+        lo, hi = mk_reply_length.limits_from_preset(preset)
+        contract = mk_reply_length.build_contract(lo, hi)
+        new_items = mk_reply_length.inject_contract(items, contract, timestamp=self._f2_now_iso())
+        new_kwargs = dict(kwargs)
+        new_kwargs["items"] = new_items
+        logger.info("[MaiKnock][F5] 字数契约已注入：档位=%s，要求 %s-%s 字", preset, lo, hi)
+        return {"action": "continue", "modified_kwargs": new_kwargs}
 
 
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "maiknock.webui_companion",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "name": "麦麦敲门 MaiKnock",
   "description": "WebUI私聊体验增强！1、让麦麦主动来找你聊天；2、用旁白的方式掌控聊天剧情的时间线（就像时光机一样）；3、让麦麦用小说体的方式说话（比人格配置更稳定）；",
   "plugin_type": "chat",

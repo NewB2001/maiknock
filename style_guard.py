@@ -46,18 +46,21 @@ RULE_ACTION_MISSING = "style_guard.action_missing"
 CONTRACT_BOTH = (
     "每说一小段话，先用【】写她此刻没说出口的内心想法，再用（）写对应的环境/肢体动作，"
     "然后说出口。三者都要有，随对话自然重复出现，不要把同类内容全堆在开头或结尾。"
+    "每一小段（从【开始到下一段【之前）之间空一行，即连续两个换行。"
 )
 CONTRACT_INNER_ONLY = (
     "每说一小段话，都必须先用【】写她此刻没说出口的内心想法，然后说出口——"
     "【】块不可缺少，一段都不能少。同时严格禁止动作/环境描写：全文不要出现任何（），"
     "不要写肢体动作、表情、环境。这两条泾渭分明：禁写动作不影响【】必须写。"
+    "每一小段（从【开始到下一段【之前）之间空一行，即连续两个换行。"
 )
 CONTRACT_ACTION_ONLY = (
     "每说一小段话，都必须先用（）写对应的环境/肢体动作，然后说出口——"
     "（）块不可缺少，一段都不能少。同时严格禁止内心想法：全文不要出现任何【】，"
     "不要写「心想」「内心」这类描写。这两条泾渭分明：禁写内心不代表可以省略（）。"
+    "每一小段（从（开始到下一段（之前）之间空一行，即连续两个换行。"
 )
-CONTRACT_NONE = "只输出角色说出口的话，不要任何括号描写。"
+CONTRACT_NONE = "只输出角色说出口的话，不要任何括号描写。每句话之间空一行，即连续两个换行。"
 
 #: 全角括号块（判定「该块是否存在」用；【[^】]*】不跨块，与宿主清括号正则无冲突：
 #: 宿主只认 `(`/`[`/`（`（utils.py:451-456），中文【】不会被宿主清理）
@@ -121,6 +124,70 @@ def _cleanup(text: str) -> str:
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# F5 功能 B 段落间空行（插件被动技能，所有字数档位生效）
+# ---------------------------------------------------------------------------
+
+#: 句末标点（全关档的段起点锚点）；连续标点（……）算一个句尾
+SENTENCE_END_CHARS = "。！？…"
+
+
+def normalize_paragraph_breaks(
+    text: str,
+    *,
+    inner_enabled: bool = True,
+    action_enabled: bool = True,
+) -> str:
+    """把正文规整成「段间空一行」，幂等。纯字符串规则，不依赖语义理解。
+
+    段起点锚点按开关组合（规格 §2.3）：
+      - inner_enabled  → 每个 `【` 的开头
+      - action_enabled → 每个 `（` 的开头（仅当 inner 关闭）
+      - 两者都关       → 句末标点 `。！？…` 之后（连续标点算一个句尾）
+
+    处理：① 行尾空白去掉、连续换行压成单换行；② 按锚点切段；③ 段间用 `\\n\\n` 拼接。
+    已是整齐空行的文本处理结果不变（幂等）；空文本/纯括号块放行。
+    """
+    if not text or not text.strip():
+        return text
+    norm = re.sub(r"[ \t]+\n", "\n", text)
+    norm = re.sub(r"\n{2,}", "\n", norm)
+    norm = norm.strip()
+    if not norm:
+        return text
+
+    if inner_enabled:
+        parts = re.split(r"(?=【)", norm)
+    elif action_enabled:
+        parts = re.split(r"(?=（)", norm)
+    else:
+        raw: List[str] = []
+        for ch in norm:
+            raw.append(ch)
+            if ch in SENTENCE_END_CHARS:
+                raw.append("\x00")
+        chunks = "".join(raw).split("\x00")
+        parts = []
+        pending = ""
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+            # 连续标点（……）或纯空白 → 合到上一段，不单开
+            if pending and not chunk.strip(SENTENCE_END_CHARS + " \t\n"):
+                pending += chunk
+            else:
+                if pending:
+                    parts.append(pending)
+                pending = chunk
+        if pending:
+            parts.append(pending)
+
+    cleaned = [p.strip() for p in parts if p.strip()]
+    if not cleaned:
+        return text
+    return "\n\n".join(cleaned)
 
 
 # ---------------------------------------------------------------------------
