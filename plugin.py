@@ -717,6 +717,10 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         self._chatroom_workspace = None
         # maim 网关连接池（跨 Bot 递话的通道，chatroom/gateway.py）
         self._chatroom_gateway = None
+        # [chatroom] 配置段的缓存（★避免在 WebUI 查询里发嵌套 RPC，见 service._chatroom_cfg）
+        self._chatroom_cfg_cache: Optional[Dict[str, Any]] = None
+        # 组件调用进行中的计数（回读循环看到它就跳过 ⇒ 避免 IPC 通道互等死锁）
+        self._chatroom_api_busy: int = 0
         # 投递 worker（领单 → 递话 → 回填状态，chatroom/worker.py）
         self._chatroom_worker = None
         # 错误扫描器（把宿主的 429 等硬错误变成用户看得见的提示，chatroom/errorscan.py）
@@ -744,7 +748,8 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 这里只是让迁移 warning 在加载时就打出来，不等第一条消息
         self._detect_legacy_style_guard()
         self._ensure_scan_loop()
-        # 麦麦聊天室：定位工作区 → 认出自己的 bot_id → 打开共享账本
+        # 麦麦聊天室：读配置（缓存起来）→ 定位工作区 → 认出自己的 bot_id → 打开共享账本
+        await self._chatroom_refresh_cfg_cache()
         await self._chatroom_bootstrap()
 
     # ------------------------------------------------------------------
@@ -889,7 +894,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             return
         self._chatroom_error_watcher = watcher
         self._chatroom_error_task = asyncio.create_task(self._chatroom_error_loop())
-        self._chatroom_start_collector()
+        await self._chatroom_start_collector()
 
     async def _chatroom_start_collector(self) -> None:
         """起回读循环：把 Bot 的回复收进共享账本（S6）。
@@ -907,6 +912,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         )
         self._chatroom_collector = collector
         self._chatroom_collector_task = asyncio.create_task(self._chatroom_collector_loop())
+        logger.info("[MaiKnock][聊天室] 回读已启动（Bot %s）", self._chatroom_bot_id[:12])
 
     async def _chatroom_collector_loop(self) -> None:
         """定期回读自己群流里的新回复。"""
@@ -916,6 +922,12 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         while True:
             try:
                 await asyncio.sleep(5.0)
+                # ⚠️⚠️ **组件调用进行中 ⇒ 跳过这一轮回读**：
+                #    回读要发「插件→宿主」的 RPC（message.get_recent），
+                #    与宿主→插件的组件调用**抢同一条 IPC 通道** ⇒ 重叠就死锁
+                #    （实测：页面所有查询超时 + 宿主报「Runner 健康检查失败」）。
+                if getattr(self, "_chatroom_api_busy", 0) > 0:
+                    continue
                 sessions = self._chatroom_room_sessions()
                 if sessions:
                     collector.set_sessions(sessions)
@@ -984,6 +996,23 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 group_id = mk_chatroom.virtual_group_id(str(room.get("room_id") or ""))
             out.append(mk_chatroom.session_id_for_group(group_id))
         return out
+
+    async def _chatroom_refresh_cfg_cache(self) -> None:
+        """读一次 [chatroom] 配置段并缓存。
+
+        ⚠️ **必须在插件加载/配置变更时做，而不是在 WebUI 查询里做** ——
+        查询是「宿主→插件」的调用，里面再发「插件→宿主」的 RPC 是**嵌套 RPC**，
+        实测会把查询**直接卡到超时**（宿主上限 10 秒），页面整个起不来。
+        """
+        try:
+            raw = await self._plugin_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock][聊天室] 读取配置失败：%r", exc)
+            return
+        if not isinstance(raw, dict):
+            return
+        cfg = raw.get("chatroom")
+        self._chatroom_cfg_cache = cfg if isinstance(cfg, dict) else {}
 
     async def _chatroom_style_fixed(self) -> Optional[bool]:
         """本 Bot 的说话风格是否已按敲门侧固化。
@@ -1164,6 +1193,8 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         logger.info("[MaiKnock] 配置已更新：scope=%s version=%s", scope, version)
         # 配置缓存失效：下次读取重新拉宿主里的插件配置（否则改完不生效）
         self._config_cache = None
+        # 聊天室配置缓存也要刷新（否则 WebUI 查询里读到的是旧值）
+        self._chatroom_cfg_cache = None
         # C-2：配置变更后立刻用插件自己的模型校验一遍读到的值——
         # 宿主校验用的是「归一化后」的配置，插件读到的是「原始 TOML」，
         # 两边对同一文件的解读**可能不同**（宿主支持 normalize_plugin_config 钩子）。

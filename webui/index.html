@@ -1336,6 +1336,9 @@
 
   function switchRoom(roomId) {
     state.currentRoomId = roomId;
+    // ⚠️ **按房间懒加载时间线**：全部房间的完整正文一次塞进 bootstrap
+    //    会超过宿主的 API 上限（512 KiB，实测报「JSON 超过 512 KiB」）。
+    loadRoomTimeline(roomId);
     state.replaceTarget = null;
     state.editingName = null;
     $("rename-row").hidden = true;
@@ -2241,6 +2244,30 @@
   /* ── 段（segment）的基础操作 ──────────────────────────────
      一段 = 我方一次提交的多条台词 + 紧随其后的一轮 Bot 回复。
      时间线就是「一串段」，月光宝盒的截断就是在这串段上做。 */
+
+  async function loadPrivateThreads() {
+    // 拉私聊线程列表；失败时不影响群聊
+    try {
+      var data = await window.maibot.query("private_threads");
+      state.privateThreads = (data && data.private_threads) || [];
+      renderPrivatePeers();
+      renderPrivate();
+    } catch (error) {
+      /* 拉不到就先用已有的 */
+    }
+  }
+
+  async function loadRoomTimeline(roomId) {
+    // 拉某个房间的时间线；失败时保留旧内容，不打断界面
+    try {
+      var data = await window.maibot.query("timeline", { room_id: roomId });
+      var segments = (data && data.segments) || [];
+      state.timeline[roomId] = segments;
+      if (state.currentRoomId === roomId) { renderTimeline(); }
+    } catch (error) {
+      /* 拉不到就先用已有的，别把界面搞崩 */
+    }
+  }
 
   function segmentsOf(scope) {
     if (scope === "private") {
@@ -3423,6 +3450,8 @@
   function switchView(view) {
     state.currentView = view;
     var isPrivate = view === "private";
+    // ⚠️ **私聊线程懒加载**：bootstrap 一次带全部线程会超过宿主 API 上限（512 KiB）
+    if (isPrivate && !(state.privateThreads || []).length) { loadPrivateThreads(); }
     // 换视图时把还开着的确认气泡收掉（两个视图各有一份，别串场）
     state.truncateTarget = null;
     var tabs = document.querySelectorAll(".viewtab");
@@ -3531,6 +3560,10 @@
       renderStageBars();
       updateSubmitButtons();
       renderErrorNotice();
+      // 当前房间的时间线按需拉（bootstrap 只带第一个房间）
+      if (state.currentRoomId) { loadRoomTimeline(state.currentRoomId); }
+      // 私聊线程也懒加载（bootstrap 不带）
+      loadPrivateThreads();
       // 轮询上游错误：宿主报错时提示自己冒出来（每 8 秒一次）
       if (state.errorTimer) { clearInterval(state.errorTimer); }
       state.errorTimer = setInterval(pollErrors, 8000);

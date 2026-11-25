@@ -21,6 +21,19 @@
         "errors": {
           "api": "shell_errors"
         },
+        "timeline": {
+          "api": "shell_timeline",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            }
+          }
+        },
+        "private_threads": {
+          "api": "shell_private_threads"
+        },
         "rooms": {
           "api": "shell_rooms"
         },

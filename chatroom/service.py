@@ -127,9 +127,8 @@ class ChatroomService:
         ledger = self._ledger()
         if ledger is None:
             return False
-        try:
-            state = ledger.load_state()
-        except Exception:  # noqa: BLE001
+        state = await self._alread(ledger.load_state)
+        if not state:
             return False
         if state:
             self._rooms = list(state.get("rooms") or [])
@@ -137,29 +136,55 @@ class ChatroomService:
             self._my_role_order = list(state.get("my_role_order") or [])
             self._peer_order = list(state.get("peer_order") or [])
             return True
-        # ⚠️ 这里**不写账本**：第一次写账本必须由调用方在
-        #    「按真实名单清理完假 Bot」之后做 —— 否则账本里会存下
-        #    一份带假 Bot 的出厂数据（那次写入早于清理 ⇒ 假 Bot 永远留在账本里）。
+        # ⚠️ 第一次写账本（迁移）必须在「按真实名单清理完假 Bot」**之后**做
+        #    —— 否则账本里会存下一份带假 Bot 的出厂数据。
+        # ⚠️⚠️ **写账本必须挪到线程里**：SQLite 写是**同步**的，跨进程抢锁时
+        #    会**阻塞插件的事件循环** ⇒ 宿主调不动插件的组件接口 ⇒
+        #    页面的查询全部超时（实测：bootstrap / errors / timeline 全挂，
+        #    宿主日志同时出现「Runner 健康检查失败」）。
+        import asyncio as _asyncio
+        await _asyncio.to_thread(self.persist_state)
         return False
 
     async def persist_state(self) -> None:
-        """把当前房间/群员/名单写回账本。"""
+        """把当前房间/群员/名单写回账本。
+
+        ⚠️ **写操作挪到线程里**（同步 SQLite 写跨进程抢锁会阻塞事件循环）。
+        """
+        import asyncio as _asyncio
         ledger = self._ledger()
         if ledger is None:
             return
         try:
-            ledger.save_state(
+            await _asyncio.to_thread(
+                ledger.save_state,
                 {
                     "rooms": self._rooms,
                     "members": list(self._members.values()),
                     "my_role_order": self._my_role_order,
                     "peer_order": self._peer_order,
-                }
+                },
             )
         except Exception:  # noqa: BLE001
             return
 
     # ---- 真实名单（real 模式）-------------------------------------------
+
+    async def _alread(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        """**异步读账本**（把同步的 SQLite 读挪到线程里）。
+
+        ⚠️⚠️ **为什么连读也要挪**：WAL 模式下，读一个**正在被别的进程写**的库
+        要拿 shm 锁 ⇒ 同步读会**阻塞插件的事件循环** ⇒ 宿主调不动插件的组件接口
+        ⇒ 页面的查询全部超时（实测：bootstrap / errors / timeline 全挂，
+        宿主同时报「Runner 健康检查失败」）。
+        ⚠️ 只挪**读**不够，写同理（已在 persist_state / collector 里挪了）。
+        """
+        import asyncio as _asyncio
+        import functools as _functools
+        try:
+            return await _asyncio.to_thread(_functools.partial(func, *args, **kwargs))
+        except Exception:  # noqa: BLE001
+            return None
 
     def _workspace(self):
         """工作区根（从插件实例拿；拿不到就返回 None）。"""
@@ -169,11 +194,12 @@ class ChatroomService:
         """共享账本（从插件实例拿）。"""
         return getattr(self._plugin, "_chatroom_ledger", None)
 
-    def _real_roster(self) -> List[Dict[str, Any]]:
+    async def _real_roster(self) -> List[Dict[str, Any]]:
         """真实受管 Bot 名单 = registry（名单层）+ 账本里各实例自报的状态。
 
         ⚠️ 读不到工作区或账本就返回空列表 —— 调用方据此回落到 mock，
         **不抛异常**（聊天室的毛病不该把页面搞崩）。
+        ⚠️ 账本读走线程（同步读会阻塞事件循环 ⇒ 宿主调不动组件接口）。
         """
         workspace = self._workspace()
         ledger = self._ledger()
@@ -181,9 +207,9 @@ class ChatroomService:
             return []
         try:
             bots = read_bots(workspace)
-            statuses = ledger.list_bot_status()
         except Exception:  # noqa: BLE001
             return []
+        statuses = await self._alread(ledger.list_bot_status) or []
         return build_roster(bots, statuses)
 
     async def _real_managed_bot_list(self) -> List[Dict[str, Any]]:
@@ -194,7 +220,7 @@ class ChatroomService:
         """
         items: List[Dict[str, Any]] = []
         pool = self._member_map()
-        for entry in self._real_roster():
+        for entry in await self._real_roster():
             # ⚠️ **按 bot_id 找成员，不能按派生的 id 找** ——
             #    `_sync_real_members` 匹配到已有成员时**保留原来的 member_id**
             #    （比如壳阶段的 bot_hinata 就还是 bot_hinata），
@@ -268,7 +294,8 @@ class ChatroomService:
         workspace = self._workspace()
         if workspace is None:
             return None
-        entry = next((e for e in self._real_roster() if e["bot_id"] == bot_id), None)
+        _roster = await self._real_roster()
+        entry = next((e for e in _roster if e["bot_id"] == bot_id), None)
         if entry is None:
             return None
         try:
@@ -357,21 +384,39 @@ class ChatroomService:
 
     async def shell_bootstrap(self) -> Dict[str, Any]:
         """一次性拉取页面需要的全部初始数据。"""
+        import logging as _lg
+        import time as _tm
+        _lg.getLogger("plugin.maiknock.webui_companion").info(
+            "[聊天室] bootstrap 开始"
+        )
         source = await self._data_source()
         # ⚠️ **顺序要紧**（real 模式）：
         #    ① 先从账本恢复（重载不丢房间与群员）
         #    ② 再按真实名单同步 Bot 成员（清掉壳阶段的假 Bot、建真 Bot）
         #    ③ 最后写回账本（账本为空时，这一步就是「迁移」——
         #       写进去的是**清理后**的状态，不会把假 Bot 存进去）
+        import logging as _lg
+        import time as _tm
+        _log = _lg.getLogger("plugin.maiknock.webui_companion")
+        _t0 = _tm.time()
         await self.restore_state()
+        _t1 = _tm.time()
         await self._sync_real_members()
-        if source == "real":
-            await self.persist_state()
+        _t2 = _tm.time()
+        # ⚠️ **bootstrap 是「读」路径，不再写账本**：每读一次就写一次 ⇒
+        #    跨进程抢锁 ⇒ 阻塞插件事件循环 ⇒ 组件调用全超时（实测踩过）。
+        #    状态由「用户改了东西」那条路径存（api 层的 _MUTATING 钩子）。
+        _t3 = _tm.time()
         await self._refresh_peer_status()
+        _t4 = _tm.time()
+        _log.info(
+            "[聊天室] bootstrap 分步耗时：restore=%.2fs sync=%.2fs persist=%.2fs refresh=%.2fs",
+            _t1 - _t0, _t2 - _t1, _t3 - _t2, _t4 - _t3,
+        )
         pool = []
         for member in self._member_pool():
             pool.append(await self._resolve_member(member))
-        return {
+        payload = {
             "version": CHATROOM_VERSION,
             "stage": "shell" if source == "mock" else "real",
             "notice": self._notice(source, await self._chatroom_cfg()),
@@ -382,8 +427,12 @@ class ChatroomService:
             "narrator": NARRATOR,
             "errors": await self._chatroom_errors(),
             "rooms": self._rooms,
-            "timeline": await self._timeline_for_page(source),
-            "private_threads": self._seeded_private_threads(),
+            # ⚠️ **只带第一个房间的时间线** —— 全部房间的完整正文会撑爆宿主
+            #    API 的 512 KiB 上限（实测报「JSON 超过 512 KiB」）。
+            #    其余房间**切过去时再拉**（shell_timeline）。
+            "timeline": await self._timeline_for_page(source, first_only=True),
+            # ⚠️ **不带 private_threads**（私聊窗口的数据量大，改懒加载）
+            "private_threads": [],
             "timing": {
                 "named_seconds": DELAY_NAMED_SECONDS,
                 "spontaneous_seconds": DELAY_SPONTANEOUS_SECONDS,
@@ -392,6 +441,8 @@ class ChatroomService:
                 "note": "实测参考：@点名 23s、无点名自发接话 51s、沉默观察 150s 超时。",
             },
         }
+        self._log_payload_size(payload)
+        return self._fit_budget(payload)
 
     # ---- 配置读取（真实数据源接上后，这里是唯一的入口）--------------
 
@@ -400,9 +451,18 @@ class ChatroomService:
 
         ⚠️ 读插件自己的配置**必须**用 `config.get_plugin` 能力；
         `ctx.config.get()` 读的是宿主全局主配置（插件陷阱 1）。
-        ⚠️ 读不到就返回空 dict ⇒ 全部走默认值（mock / 关），**不抛异常**。
+
+        ⚠️⚠️ **优先读插件的缓存，绝不在这里发 RPC**：
+        bootstrap 是「宿主 → 插件」的调用，里面再发「插件 → 宿主」的
+        `config.get_plugin` 就是**嵌套 RPC** ⇒ 实测直接把 bootstrap **卡到超时**
+        （插件侧一行日志都没打出来，宿主报「插件调用超时」，超时上限 10 秒）。
+        ⇒ 配置由插件在**加载时**读好放进 `plugin._chatroom_cfg_cache`，这里只读缓存。
         """
         plugin = self._plugin
+        cached = getattr(plugin, "_chatroom_cfg_cache", None)
+        if isinstance(cached, dict):
+            return cached
+        # 缓存没有（理论上不会）⇒ 退而求其次读一次完整配置（此时不在 RPC 路径上）
         getter = getattr(plugin, "_plugin_config", None)
         if getter is None:
             return {}
@@ -530,7 +590,8 @@ class ChatroomService:
 
     async def _real_add_peer(self, bot_id: str) -> Dict[str, Any]:
         """real 模式：把真实名单里的某个 Bot 加进「私聊对象」（**按需建群员**）。"""
-        entry = next((e for e in self._real_roster() if e["bot_id"] == bot_id), None)
+        _roster = await self._real_roster()
+        entry = next((e for e in _roster if e["bot_id"] == bot_id), None)
         if entry is None:
             return {"ok": False, "error": f"这不是受管 Bot：{bot_id}"}
         if not entry["selectable"]:
@@ -573,7 +634,7 @@ class ChatroomService:
         if await self._data_source() != "real":
             return
         pool = self._member_map()
-        for entry in self._real_roster():
+        for entry in await self._real_roster():
             member = pool.get(f"bot_{entry['bot_id']}")
             if member is None:
                 continue
@@ -595,7 +656,7 @@ class ChatroomService:
         """
         if await self._data_source() != "real":
             return
-        roster = self._real_roster()
+        roster = await self._real_roster()
         if not roster:
             return
         pool = self._member_map()
@@ -1016,7 +1077,116 @@ class ChatroomService:
 
     # ---- 错误反馈（429 等硬错误，不许默默出错）------------------------
 
-    async def _timeline_for_page(self, source: str) -> Dict[str, Any]:
+    #: bootstrap 的体积上限（宿主 API 硬上限是 512 KiB，留点余量）
+    BOOTSTRAP_BUDGET = 380 * 1024
+
+    @staticmethod
+    def _log_payload_size(payload: Dict[str, Any]) -> None:
+        """**量一量 bootstrap 有多大**（别靠猜）。
+
+        ⚠️ 宿主 API 有 512 KiB 硬上限，超了直接「JSON 超过 512 KiB」，
+        页面整个起不来 ⇒ 必须知道到底是谁大。
+        """
+        import json as _json
+        import logging
+
+        log = logging.getLogger("plugin.maiknock.webui_companion")
+        try:
+            total = len(_json.dumps(payload, ensure_ascii=False))
+        except (TypeError, ValueError):
+            return
+        parts = []
+        for key, value in payload.items():
+            try:
+                parts.append(f"{key}={len(_json.dumps(value, ensure_ascii=False))}")
+            except (TypeError, ValueError):
+                parts.append(f"{key}=?")
+        log.info(
+            "[聊天室] bootstrap 体积 %d 字节（上限 524288）：%s",
+            total, " ".join(parts),
+        )
+
+    def _fit_budget(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """**bootstrap 体积兜底**——超过上限就逐级裁剪。
+
+        ⚠️ 宿主的 API 有 512 KiB 硬上限，超了直接报错
+        （实测：「ApiError: JSON 超过 512 KiB」）⇒ 页面整个起不来。
+        裁剪顺序（从"最不影响使用"到"最影响"）：
+        1. 时间线只留前 3 段、正文截到 500 字；
+        2. 群员头像（data URI）截到 8 KB；
+        3. 还超 ⇒ 房间只留第一个。
+
+        ⚠️ 这是**兜底**，正常路径已经做了懒加载（时间线/私聊按需拉），
+        正常情况下不该走到这里。
+        """
+        import json as _json
+
+        def size(obj: Any) -> int:
+            try:
+                return len(_json.dumps(obj, ensure_ascii=False))
+            except (TypeError, ValueError):
+                return 0
+
+        if size(payload) <= self.BOOTSTRAP_BUDGET:
+            return payload
+        # ① 时间线瘦身
+        for room_id, segments in list((payload.get("timeline") or {}).items()):
+            trimmed = []
+            for seg in (segments or [])[:3]:
+                seg = dict(seg)
+                seg["messages"] = [
+                    dict(m, content=str(m.get("content") or "")[:500])
+                    for m in (seg.get("messages") or [])
+                ]
+                trimmed.append(seg)
+            payload["timeline"][room_id] = trimmed
+        if size(payload) <= self.BOOTSTRAP_BUDGET:
+            return payload
+        # ② 头像截断（data URI 可能是几十 KB）
+        for member in payload.get("member_pool") or []:
+            avatar = str(member.get("avatar") or "")
+            if len(avatar) > 8192:
+                member["avatar"] = avatar[:8192]
+        if size(payload) <= self.BOOTSTRAP_BUDGET:
+            return payload
+        # ③ 房间只留第一个
+        rooms = payload.get("rooms") or []
+        if len(rooms) > 1:
+            payload["rooms"] = rooms[:1]
+        return payload
+
+    async def shell_private_threads(self) -> Dict[str, Any]:
+        """私聊窗口的线程列表（**懒加载**）。
+
+        ⚠️ bootstrap 一次带全部线程会撑爆宿主的 API 上限（512 KiB，实测踩过）。
+        """
+        return {"private_threads": self._seeded_private_threads()}
+
+    async def shell_timeline(self, room_id: str) -> Dict[str, Any]:
+        """一个房间的时间线（页面切房间时拉）。
+
+        ⚠️ **按房间懒加载**：一次把全部房间的完整正文塞进 bootstrap 会超过
+        宿主的 API 上限（512 KiB，实测踩过）。
+        """
+        ledger = self._ledger()
+        segments: List[Dict[str, Any]] = []
+        if ledger is not None:
+            segments = await self._alread(ledger.list_timeline, room_id) or []
+        if not segments:
+            # 账本里还没有 ⇒ 用出厂预置的（房间不至于空着）
+            for seg in (self._seeded_timeline() or {}).get(room_id, []) or []:
+                segments.append(
+                    {
+                        "seq": seg.get("seq"),
+                        "kind": seg.get("kind") or "normal",
+                        "voided": bool(seg.get("voided")),
+                        "created_at": "",
+                        "messages": seg.get("messages") or [],
+                    }
+                )
+        return {"room_id": room_id, "segments": segments}
+
+    async def _timeline_for_page(self, source: str, first_only: bool = False) -> Dict[str, Any]:
         """页面要的时间线。
 
         - **real 模式**：从**共享账本**读（含回读收进来的 Bot 回复）
@@ -1029,15 +1199,14 @@ class ChatroomService:
         if ledger is None:
             return self._seeded_timeline()
         timeline: Dict[str, Any] = {}
-        try:
-            rooms = ledger.list_rooms()
-        except Exception:  # noqa: BLE001
-            rooms = []
-        for room in rooms:
+        rooms = await self._alread(ledger.list_rooms) or []
+        for index, room in enumerate(rooms):
             room_id = str(room.get("room_id") or "")
             if not room_id:
                 continue
-            segments = ledger.list_timeline(room_id)
+            if first_only and index > 0:
+                continue          # ⚠️ 只带第一个房间（见 bootstrap 处的说明）
+            segments = await self._alread(ledger.list_timeline, room_id) or []
             if segments:
                 timeline[room_id] = segments
         # 账本里还没有段的房间 ⇒ 用出厂预置的（房间不至于空着）
@@ -1054,10 +1223,7 @@ class ChatroomService:
         ledger = self._ledger()
         if ledger is None:
             return []
-        try:
-            rows = ledger.list_errors(limit=limit, only_unacked=True)
-        except Exception:  # noqa: BLE001
-            return []
+        rows = await self._alread(ledger.list_errors, limit=limit, only_unacked=True) or []
         out: List[Dict[str, Any]] = []
         for row in rows:
             out.append(

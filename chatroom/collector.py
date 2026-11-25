@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +38,11 @@ USER_ACCOUNT_PREFIX = "user."
 
 #: Bot 的账号前缀（`bot.<bot_id>`）
 BOT_ACCOUNT_PREFIX = "bot."
+
+#: ⚠️ **宿主给「Bot 自己发的消息」用的账号是字面量 ``self``**（不是 ``bot.<id>``）
+#:    —— 实测（2026-11-26）：一号在群里的回复 ``user_id='self'``、``account_id='self'``、
+#:    ``user_nickname='日向雏田'``。只按 ``bot.`` 前缀判会把 Bot 的回复全当"其它"丢掉。
+HOST_SELF_ACCOUNT = "self"
 
 
 def classify_message(message: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -51,7 +57,7 @@ def classify_message(message: Dict[str, Any]) -> Tuple[str, str, str]:
     user = info.get("user_info") if isinstance(info.get("user_info"), dict) else {}
     account = str(user.get("user_id") or "")
     nickname = str(user.get("user_nickname") or user.get("user_cardname") or "")
-    if account.startswith(BOT_ACCOUNT_PREFIX):
+    if account == HOST_SELF_ACCOUNT or account.startswith(BOT_ACCOUNT_PREFIX):
         return "bot", account, nickname
     if account.startswith(USER_ACCOUNT_PREFIX):
         return "user", account, nickname
@@ -112,6 +118,9 @@ class ReplyCollector:
         self._log = log or _log
         self._seen: set = set()
         self._collected = 0
+        #: 「有没有插件→宿主的 RPC 正在飞」——组件调用要等它清零（见插件里的互斥）
+        self.rpc_idle = asyncio.Event()
+        self.rpc_idle.set()
 
     @property
     def collected_count(self) -> int:
@@ -124,6 +133,7 @@ class ReplyCollector:
 
     async def _fetch(self, session_id: str) -> List[Dict[str, Any]]:
         """读一条群流的最近消息（**直连能力**，绕开 SDK 那层不带 hours 的封装）。"""
+        self.rpc_idle.clear()
         try:
             result = await self._ctx.call_capability(
                 "message.get_recent",
@@ -135,10 +145,28 @@ class ReplyCollector:
         except Exception as exc:  # noqa: BLE001
             self._log.warning("[聊天室] 回读失败（session=%s）：%r", session_id[:12], exc)
             return []
+        finally:
+            self.rpc_idle.set()
         if isinstance(result, dict):
             messages = result.get("messages")
             return messages if isinstance(messages, list) else []
         return result if isinstance(result, list) else []
+
+    def _member_id_for(self, account: str) -> str:
+        """发言人的成员 id（要能与成员登记表对上，页面才能认出人）。
+
+        - ``self`` ⇒ 是**本 Bot** ⇒ 用它在登记表里的 member_id
+        - ``bot.<bot_id>`` ⇒ 按 bot_id 反查
+        - 查不到 ⇒ 退回 ``bot_<bot_id>`` 形式（不至于认不出人）
+        """
+        if account == HOST_SELF_ACCOUNT:
+            found = self._ledger.find_member_by_bot_id(self._bot_id)
+            return found or f"bot_{self._bot_id}"
+        if "." in account:
+            bot_id = account.split(".", 1)[-1]
+            found = self._ledger.find_member_by_bot_id(bot_id)
+            return found or f"bot_{bot_id}"
+        return account
 
     async def poll(self) -> int:
         """采一轮。返回新收进账本的条数。"""
@@ -146,7 +174,12 @@ class ReplyCollector:
             return 0
         collected = 0
         for session_id, room_id in list(self._sessions.items()):
-            for message in await self._fetch(session_id):
+            fetched = await self._fetch(session_id)
+            self._log.info(
+                "[聊天室] 回读 %s：取到 %d 条（room=%s）",
+                session_id[:12], len(fetched), room_id,
+            )
+            for message in fetched:
                 if not isinstance(message, dict):
                     continue
                 if message.get("is_command") or message.get("is_notify"):
@@ -155,21 +188,33 @@ class ReplyCollector:
                 if kind != "bot":
                     continue        # 只收 Bot 的回复（我方角色的话是"递出去"的，不回读）
                 message_id = str(message.get("message_id") or "")
-                if not message_id or message_id in self._seen:
+                if not message_id:
                     continue
+                # ⚠️ **不在这里跳过已见过的**：归属规则改过之后要能**自愈**
+                # （ledger.append_message 对已存在的行会更新归属段）。
+                # 靠 ledger 的 message_id 去重，不会重复写内容。
                 self._seen.add(message_id)
                 text = message_text(message)
                 if not text:
                     continue
                 # 归属段：这条回复回应的是**哪一段**的投递
-                segment_id = self._ledger.find_delivery_segment(
-                    target_bot_id=self._bot_id, room_id=room_id
+                segment_id = await asyncio.to_thread(
+                    self._ledger.find_delivery_segment,
+                    target_bot_id=self._bot_id,
+                    room_id=room_id,
+                    reply_at=message_time(message),
                 )
                 if not segment_id:
                     # 没有对应的投递（可能是历史消息）⇒ 挂到房间的"未归属"段
-                    segment_id = self._ledger.ensure_open_segment(room_id)
-                member_id = f"bot_{account.split('.', 1)[-1]}" if "." in account else account
-                if self._ledger.append_message(
+                    segment_id = await asyncio.to_thread(
+                        self._ledger.ensure_open_segment, room_id
+                    )
+                member_id = self._member_id_for(account)
+                # ⚠️ **写账本必须挪到线程里**：SQLite 写是**同步**的，
+                #    跨进程抢锁时会阻塞插件的**事件循环** ⇒ 宿主调不动组件接口
+                #    ⇒ 页面的查询全部超时（实测踩过：bootstrap / errors / timeline 全挂）。
+                written = await asyncio.to_thread(
+                    self._ledger.append_message,
                     {
                         "message_id": message_id,
                         "segment_id": segment_id,
@@ -179,13 +224,16 @@ class ReplyCollector:
                         "kind": "reply",
                         "content": text,
                         "created_at": message_time(message),
-                    }
-                ):
+                    },
+                )
+                if written:
                     collected += 1
                     self._collected += 1
                     self._log.info(
                         "[聊天室] 收到回复（Bot %s）：%s", self._bot_id[:12], text[:40]
                     )
         if collected:
-            await self._ledger.mark_deliveries_collected(self._bot_id)
+            await asyncio.to_thread(
+                self._ledger.mark_deliveries_collected, self._bot_id
+            )
         return collected

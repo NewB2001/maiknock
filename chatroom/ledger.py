@@ -319,7 +319,10 @@ class ChatroomLedger:
         """并发相关的 PRAGMA。**多进程同时设 WAL 可能报 locked ⇒ 忽略它**。"""
         for stmt in (
             "PRAGMA journal_mode=WAL",     # 写不阻塞读
-            "PRAGMA busy_timeout=5000",    # 撞锁等 5 秒而不是立刻报错
+            # ⚠️ **别等太久**：撞锁时这是**同步阻塞**，会卡住插件的事件循环
+            #    ⇒ 宿主调不动插件的组件接口 ⇒ 页面全部超时（实测踩过）。
+            #    等 1.5 秒拿不到锁就快速失败，让上层重试。
+            "PRAGMA busy_timeout=1500",
             "PRAGMA synchronous=NORMAL",   # WAL 下的常规取舍：崩溃不丢、掉电可能丢最后几笔
             "PRAGMA foreign_keys=ON",
         ):
@@ -936,21 +939,47 @@ class ChatroomLedger:
                 cur = conn.execute("UPDATE error_report SET acked = 1 WHERE acked = 0")
             return int(cur.rowcount or 0)
 
-    # ── 回读协作（S6）─────────────────────────────────────────────────
+    def find_member_by_bot_id(self, bot_id: str) -> str:
+        """按 bot_id 找成员 id（回读时认人用）。
 
-    def find_delivery_segment(self, target_bot_id: str, room_id: str) -> str:
-        """找「我回应的是哪一段」——取该 Bot 最近一条**还没收完**的投递。
-
-        ⚠️ 按 ``seq`` 倒序取（最近的投递优先），已 ``collected`` 的跳过
-        （那段已经收过了，别把新回复挂到旧段上）。
+        ⚠️ 成员的 member_id **不一定是** ``bot_<bot_id>`` ——
+        匹配到已有成员时会**保留原来的 member_id**（如壳阶段的 ``bot_hinata``），
+        所以必须反查，不能自己拼。
         """
+        if not bot_id:
+            return ""
         with self.read() as conn:
             row = conn.execute(
-                "SELECT segment_id FROM delivery"
-                " WHERE target_bot_id = ? AND room_id = ? AND state != ?"
-                " ORDER BY seq DESC LIMIT 1",
-                (target_bot_id, room_id, DELIVERY_COLLECTED),
+                "SELECT member_id FROM member WHERE bot_id = ? LIMIT 1", (bot_id,)
             ).fetchone()
+        return str(row[0]) if row else ""
+
+    # ── 回读协作（S6）─────────────────────────────────────────────────
+
+    def find_delivery_segment(
+        self, target_bot_id: str, room_id: str, reply_at: str = ""
+    ) -> str:
+        """找「这条回复回应的是哪一次投递」。
+
+        ⚠️ **按时间配对**，不能只取"最近一条"——
+        否则一轮里所有回复都会堆到最后一段（实测踩过）。
+        规则：取**投递时刻不晚于回复时刻**的那次投递里最近的一个
+        ⇒ 一句话对上一次递话，天然对齐。
+
+        ⚠️ 这里**不按 collected 过滤**：一个 Bot 可能对同一次投递回好几条
+        （文本 + 表情包），第二条也要挂到同一段。
+        """
+        sql = (
+            "SELECT segment_id FROM delivery"
+            " WHERE target_bot_id = ? AND room_id = ?"
+        )
+        params: List[Any] = [target_bot_id, room_id]
+        if reply_at:
+            sql += " AND created_at <= ?"
+            params.append(str(reply_at))
+        sql += " ORDER BY created_at DESC, seq DESC LIMIT 1"
+        with self.read() as conn:
+            row = conn.execute(sql, params).fetchone()
         return str(row[0]) if row else ""
 
     def ensure_open_segment(self, room_id: str) -> str:
@@ -991,11 +1020,17 @@ class ChatroomLedger:
     def append_message(self, message: Dict[str, Any]) -> bool:
         """追加一条消息行。**按 message_id 去重**（同一群消息只收一次）。
 
-        返回 True = 新增；False = 之前收过。
+        ⚠️ **已存在的行会更新归属段**（segment_id / room_id）——
+        回读的归属规则改过之后（比如从"取最近一条投递"改成"按时间配对"），
+        重新收一遍就能**自愈**，不用手工清库。
+
+        返回 True = 新增；False = 之前收过（已更新归属）。
         """
         message_id = str(message.get("message_id") or "")
         if not message_id:
             return False
+        segment_id = str(message.get("segment_id") or "")
+        room_id = str(message.get("room_id") or "")
         with self.write() as conn:
             cur = conn.execute(
                 "INSERT OR IGNORE INTO message(message_id, segment_id, room_id,"
@@ -1003,8 +1038,8 @@ class ChatroomLedger:
                 " VALUES (?,?,?,?,?,?,?,?,0)",
                 (
                     message_id,
-                    str(message.get("segment_id") or ""),
-                    str(message.get("room_id") or ""),
+                    segment_id,
+                    room_id,
                     str(message.get("speaker_member_id") or ""),
                     str(message.get("speaker_name") or ""),
                     str(message.get("kind") or "line"),
@@ -1012,7 +1047,14 @@ class ChatroomLedger:
                     str(message.get("created_at") or ""),
                 ),
             )
-            return bool(cur.rowcount)
+            if cur.rowcount:
+                return True
+            # 已收过 ⇒ 更新归属（自愈）
+            conn.execute(
+                "UPDATE message SET segment_id = ?, room_id = ? WHERE message_id = ?",
+                (segment_id, room_id, message_id),
+            )
+            return False
 
     def list_timeline(self, room_id: str) -> List[Dict[str, Any]]:
         """一个房间的时间线（页���要的形状）。

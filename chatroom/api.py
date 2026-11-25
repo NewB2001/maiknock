@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from maibot_sdk import API
@@ -40,10 +41,30 @@ class ChatroomApiMixin:
         逐个加 save 迟早漏一个 ⇒ 漏一个就是「这个操作重启后不见了」。
         这里统一兜住：**只要结果里 ok=True 就存**。
         """
-        result = await getattr(self._svc(), name)(*args, **kwargs)
-        if name in self._MUTATING and isinstance(result, dict) and result.get("ok"):
-            await self._svc().persist_state()
-        return result
+        # ⚠️⚠️ **组件调用期间置 busy 标志** ——
+        #    插件→宿主的 RPC（回读用的 message.get_recent）与宿主→插件的 RPC
+        #    **抢同一条 IPC 通道** ⇒ 两者重叠时互相等 ⇒ **死锁**，
+        #    表现为：页面所有查询超时 + 宿主日志「Runner 健康检查失败」。
+        #    ⇒ 回读循环看到 busy 就跳过这一轮，**绝不与组件调用重叠**。
+        # ⚠️⚠️ **等在飞的「插件→宿主 RPC」结束**（回读用的 message.get_recent）。
+        #    两条方向抢同一条 IPC 通道 ⇒ 重叠就互相等 ⇒ 死锁
+        #    （实测：页面所有查询超时 + 宿主报「Runner 健康检查失败」）。
+        #    busy 标志只能挡「新发起」，挡不住「已在飞」⇒ 这里补上互斥。
+        collector = getattr(self, "_chatroom_collector", None)
+        idle = getattr(collector, "rpc_idle", None)
+        if idle is not None:
+            try:
+                await asyncio.wait_for(idle.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        self._chatroom_api_busy = getattr(self, "_chatroom_api_busy", 0) + 1
+        try:
+            result = await getattr(self._svc(), name)(*args, **kwargs)
+            if name in self._MUTATING and isinstance(result, dict) and result.get("ok"):
+                await self._svc().persist_state()
+            return result
+        finally:
+            self._chatroom_api_busy = max(0, getattr(self, "_chatroom_api_busy", 1) - 1)
 
     def _svc(self):
         """拿中控服务实例。"""
@@ -75,6 +96,23 @@ class ChatroomApiMixin:
         不用等下一次刷新或下一次提交才发现「Bot 刚才没接上话」。
         """
         return {"errors": await self._svc_call("_chatroom_errors", limit=limit)}
+
+    @API("shell_private_threads", description="读取私聊线程列表（懒加载）", version="1")
+    async def shell_private_threads(self) -> Dict[str, Any]:
+        """私聊窗口的线程列表。
+
+        ⚠️ **懒加载**：bootstrap 一次带全部线程会超过宿主 API 上限（512 KiB）。
+        """
+        return await self._svc().shell_private_threads()
+
+    @API("shell_timeline", description="读取某个房间的时间线（按房间懒加载）", version="1")
+    async def shell_timeline(self, room_id: str) -> Dict[str, Any]:
+        """一个房间的时间线。
+
+        ⚠️ **按房间懒加载**：一次把全部房间的完整正文塞进 bootstrap
+        会超过宿主的 API 上限（512 KiB，实测报「JSON 超过 512 KiB」）。
+        """
+        return await self._svc().shell_timeline(room_id)
 
     @API("shell_rooms", description="读取房间列表（假数据）", version="1")
     async def shell_rooms(self) -> Dict[str, Any]:

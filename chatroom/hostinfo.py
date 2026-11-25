@@ -63,7 +63,14 @@ def read_bots(workspace_root: Path) -> List[Dict[str, Any]]:
     db = Path(workspace_root) / HOST_DIR_NAME / REGISTRY_FILE_NAME
     if not db.is_file():
         return []
-    uri = f"file:{db.as_posix()}?mode=ro"
+    # ⚠️⚠️ **必须用 `Path.as_uri()`**，不能手拼 `f"file:{path}"` ——
+    #    Windows 上 `file:E:/Softw/...` **少一个斜杠**，`file:` URI 会被当成
+    #    **相对路径** ⇒ 找不到文件 ⇒ 异常 ⇒ 名单读不出来。
+    #    （Linux 上 `file:/abs/path` 合法 ⇒ 这个 bug **只在真机暴露**，离线测不出来！）
+    try:
+        uri = db.resolve().as_uri() + "?mode=ro"
+    except (OSError, ValueError):
+        return []
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=3.0)
     except sqlite3.Error:
