@@ -12,6 +12,7 @@
 - ``api.py``       —— 18 个 WebUI 接口面（混入类；唯一依赖宿主的地方是 ``maibot_sdk.API``）
 - ``ledger.py``    —— 共享账本（跨 Bot 交换消息的载体，SQLite）
 - ``hostinfo.py``  —— 工作区定位 + 受管 Bot 名单 + 「我是哪个 Bot」
+- ``splitter_guard.py`` —— 按会话关掉宿主分段（纯逻辑，可离线单测）
 
 ⚠️ **加载约定**（踩坑 22 的延续）：宿主按文件路径加载插件主文件，
 ``sys.path`` **不含**插件目录 ⇒ 兄弟模块不能裸 ``import``。
@@ -29,7 +30,18 @@ from __future__ import annotations
 from typing import Any
 
 # 这几个子模块**只依赖标准库** ⇒ 直接导入，不走惰性
-from . import collector, errorscan, gateway, hostinfo, identity, ledger, mock_data, service, worker
+from . import (
+    collector,
+    errorscan,
+    gateway,
+    hostinfo,
+    identity,
+    ledger,
+    mock_data,
+    service,
+    splitter_guard,
+    worker,
+)
 from .gateway import GatewayPool, MaimConnection, build_envelope
 from .identity import session_id_for_group, virtual_group_id
 from .ledger import ChatroomLedger
@@ -54,6 +66,7 @@ __all__ = [
     "mock_data",
     "service",
     "session_id_for_group",
+    "splitter_guard",
     "virtual_group_id",
     "worker",
 ]

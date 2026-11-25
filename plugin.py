@@ -745,6 +745,10 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 回读器（把自己群流里的 Bot 回复收进共享账本，chatroom/collector.py）
         self._chatroom_collector = None
         self._chatroom_collector_task = None
+        # 房间虚拟群 session_id 的**快照**（{session_id: room_id}）
+        # ⚠️ 由后台回读循环刷新 ⇒ **分段守卫的 Hook 只读这个** ——
+        #    Hook 是同步的（宿主在等它返回）⇒ 不能在里面读账本（同步 SQLite 读会阻塞事件循环）
+        self._chatroom_sessions_cache: Dict[str, str] = {}
 
     # ---- 生命周期（B-2：宿主只调用 on_load/on_unload/on_config_update）----
 
@@ -932,6 +936,13 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         worker = mk_chatroom.DeliveryWorker(ledger, pool, self._chatroom_bot_id)
         worker.start()
         self._chatroom_worker = worker
+        # ⚠️ **先把 session_id 快照填上** —— 分段守卫的 Hook 靠它判别，
+        #    而后台回读循环要等 5 秒才跑第一轮 ⇒ 不预热的话
+        #    **插件重载后的第一条聊天消息不会被保护**（会被拆成多个气泡）。
+        try:
+            await self._chatroom_room_sessions_async()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock][聊天室] 预热房间会话快照失败：%r", exc)
         await self._chatroom_start_error_watcher()
 
     async def _chatroom_start_error_watcher(self) -> None:
@@ -952,6 +963,9 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             return
         self._chatroom_error_watcher = watcher
         self._chatroom_error_task = asyncio.create_task(self._chatroom_error_loop())
+        logger.info(
+            "[MaiKnock][聊天室] 错误扫描已启动（实例日志：%s）", watcher.root
+        )
         await self._chatroom_start_collector()
 
     async def _chatroom_start_collector(self) -> None:
@@ -990,7 +1004,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 #    （实测：页面所有查询超时 + 宿主报「Runner 健康检查失败」）。
                 if getattr(self, "_chatroom_api_busy", 0) > 0:
                     continue
-                sessions = self._chatroom_room_sessions()
+                sessions = await self._chatroom_room_sessions_async()
                 if sessions:
                     collector.set_sessions(sessions)
                     await collector.poll()
@@ -999,17 +1013,24 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[MaiKnock][聊天室] 回读循环异常：%r", exc)
 
-    def _chatroom_room_sessions(self) -> Dict[str, str]:
-        """房间里所有虚拟群的 {session_id: room_id}。
+    async def _chatroom_room_sessions_async(self) -> Dict[str, str]:
+        """房间里所有虚拟群的 {session_id: room_id}（**异步读账本**）。
 
-        ⚠️ 房间从**账本**读（real 模式下房间已持久化），读不到才用内存里的。
+        ⚠️ **为什么必须是异步**：``ledger.list_rooms()`` 是**同步 SQLite 读** ——
+        放在事件循环里跑会**阻塞整个插件** ⇒ 宿主调不动组件接口 ⇒ 页面全超时
+        （实测踩过：这就是「所有查询超时」的成因之一）。
+        ⇒ 账本读一律走 ``ledger.run()``（专属单线程池）。
+
+        ⚠️ 顺带**刷新缓存**：分段守卫的 Hook 要用 session_id 判别，
+        但 Hook 是**同步**的（宿主在等它返回）⇒ 不能在里面读账本
+        ⇒ 靠这个后台循环把快照刷进 ``_chatroom_sessions_cache``。
         """
         out: Dict[str, str] = {}
         ledger = self._chatroom_ledger
         rooms: List[Dict[str, Any]] = []
         if ledger is not None:
             try:
-                rooms = ledger.list_rooms()
+                rooms = await ledger.run(ledger.list_rooms)
             except Exception:  # noqa: BLE001
                 rooms = []
         if not rooms:
@@ -1021,10 +1042,20 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 continue
             group_id = str(room.get("group_id") or "") or mk_chatroom.virtual_group_id(room_id)
             out[mk_chatroom.session_id_for_group(group_id)] = room_id
+        # ⚠️ **刷新快照**（Hook 只能读这个，不能碰账本）
+        self._chatroom_sessions_cache = dict(out)
         return out
-        logger.info(
-            "[MaiKnock][聊天室] 错误扫描已启动（实例日志：%s）", watcher.root
-        )
+
+    def _chatroom_room_sessions(self) -> Dict[str, str]:
+        """房间里所有虚拟群的 {session_id: room_id}（**同步版，只读缓存**）。
+
+        ⚠️ **只给「不能 await」的地方用**（比如 Hook 回调）——
+        读的是后台循环刷好的缓存，**不碰账本** ⇒ 不会阻塞事件循环。
+        """
+        cached = getattr(self, "_chatroom_sessions_cache", None)
+        if cached:
+            return dict(cached)
+        return {}
 
     async def _chatroom_error_loop(self) -> None:
         """定期扫错误快照 → 写账本。"""
@@ -1043,21 +1074,13 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 logger.warning("[MaiKnock][聊天室] 错误扫描循环异常：%r", exc)
 
     def _chatroom_session_ids(self) -> List[str]:
-        """本聊天室所有虚拟群的 session_id（用于过滤错误快照）。"""
-        ledger = self._chatroom_ledger
-        if ledger is None:
-            return []
-        try:
-            rooms = ledger.list_rooms()
-        except Exception:  # noqa: BLE001
-            return []
-        out: List[str] = []
-        for room in rooms:
-            group_id = str(room.get("group_id") or "")
-            if not group_id:
-                group_id = mk_chatroom.virtual_group_id(str(room.get("room_id") or ""))
-            out.append(mk_chatroom.session_id_for_group(group_id))
-        return out
+        """本聊天室所有虚拟群的 session_id（用于过滤错误快照）。
+
+        ⚠️ **读缓存，不读账本** —— 账本读是**同步 SQLite**，
+        放在事件循环里会阻塞整个插件（实测踩过：所有查询超时）。
+        缓存由后台回读循环刷新（见 ``_chatroom_room_sessions_async``）。
+        """
+        return list(getattr(self, "_chatroom_sessions_cache", {}) or {})
 
     async def _chatroom_refresh_cfg_cache(self) -> None:
         """读一次 [chatroom] 配置段并缓存。
@@ -3152,6 +3175,68 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         new_kwargs["items"] = new_items
         logger.info("[MaiKnock][F5] 字数契约已注入：档位=%s，要求 %s-%s 字", preset, lo, hi)
         return {"action": "continue", "modified_kwargs": new_kwargs}
+
+    # ------------------------------------------------------------------
+    # 麦麦聊天室 · 分段守卫（S7）
+    #
+    # ⚠️ **这个 hook 跟上面几个不是一类**：
+    #    上面几个是「请求前注入契约」（replyer 侧），
+    #    这个是「回复后处理前改策略」（reply 侧）——
+    #    宿主专门留的口子，让插件能按**单次回复**关掉分段。
+    #
+    # ⚠️ **为什么要按会话关**：
+    #    聊天室的回复是小说体（内心+动作+台词挤一段），拆开就散了
+    #    ⇒ 聊天室要**整条一个气泡**；
+    #    但全局 `[response_splitter] enable` 是**一刀切**的
+    #    ⇒ 开着它，QQ/微信真群聊也会被拆 ⇒ 不能用它。
+    #
+    # ⚠️ **只关 enable_splitter，不用 skip_post_process** ——
+    #    后者会把错别字注入等**全部**后处理一起关掉。
+    # ------------------------------------------------------------------
+
+    @HookHandler(
+        "maisaka.reply.before_post_process",
+        name="maichat_splitter_guard",  # ⚠️ 全局唯一：宿主组件表按 full_name 索引，同名会互相覆盖
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+    )
+    async def _hook_chatroom_splitter_guard(self, **kwargs):
+        """聊天室会话 ⇒ 关掉本次回复的分段（整条一个气泡）。
+
+        ⚠️ **判据只能是 session_id**：载荷里既没有 platform 也没有 group_id，
+        而 session_id **恒为 md5** ⇒ 只能自己算 hash，不能靠字符串前缀找群聊。
+
+        ⚠️ **非聊天室的会话一律原样放行**（不带 modified_kwargs）
+        ⇒ **真群聊绝不会被误伤**。
+        """
+        if mk_chatroom is None:
+            return {"action": "continue"}
+        session_id = str(kwargs.get("session_id") or "")
+        if not session_id:
+            return {"action": "continue"}
+        # 开关：``[chatroom.splitter] enabled``（默认关 ⇒ 一个开关回退）
+        cfg = self._chatroom_cfg_cache
+        splitter_cfg = cfg.get("splitter") if isinstance(cfg, dict) else None
+        if not isinstance(splitter_cfg, dict) or not bool(splitter_cfg.get("enabled")):
+            return {"action": "continue"}
+        # 房间 → session_id 快照（账本里的房间；读不到就用内存里的）
+        sessions = self._chatroom_room_sessions()
+        if not sessions:
+            return {"action": "continue"}
+        # ⚠️ **整包复制** —— 只回 {"enable_splitter": False} 会让其余 required 字段全丢
+        #    ⇒ 宿主 ``reply.py:121`` 读到 None ⇒ ``_require_hook_bool`` 抛 TypeError
+        #    ⇒ **整条回复报错**。详见 chatroom/splitter_guard.py 的注释。
+        result = mk_chatroom.splitter_guard.build_hook_result(
+            kwargs, session_id, sessions.keys()
+        )
+        if result is None:
+            return {"action": "continue"}
+        if "modified_kwargs" in result:
+            logger.info(
+                "[MaiKnock][聊天室] 分段已关（session=%s）：本次回复整条一个气泡",
+                session_id[:12],
+            )
+        return result
 
 
 
