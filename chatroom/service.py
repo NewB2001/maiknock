@@ -34,7 +34,7 @@ from .errorscan import describe_report
 from .hostinfo import read_bot_config, read_bots
 from .identity import DEFAULT_PLATFORM, session_id_for_private, virtual_group_id
 from .roster import build_roster
-from . import formation, narrator
+from . import export as export_mod, formation, narrator
 
 # 聊天室子模块自己的版本号（插件总版本见 plugin.py 的 VERSION 常量）
 CHATROOM_VERSION = "0.1.0"
@@ -1227,6 +1227,51 @@ class ChatroomService:
             )
         return {"private_threads": threads}
 
+
+    async def shell_export_room(self, room_id: str, fmt: str = "markdown") -> Dict[str, Any]:
+        """导出某个房间的剧情（S12）。
+
+        ⚠️ **含已作废的段**（否则时间线对不上账）；⚠️ **绝不捎带 api_key**（只挑白名单字段）。
+        :param fmt: ``markdown`` 或 ``json``
+        """
+        room = self._room_by_id(room_id)
+        room_name = str((room or {}).get("name") or "")
+        segments: List[Dict[str, Any]] = []
+        source = await self._data_source()
+        if source == "real":
+            ledger = self._ledger()
+            if ledger is not None:
+                segments = await self._alread(ledger.list_timeline, room_id, True) or []
+        if not segments:
+            # mock / 账本没段 ⇒ 用出厂预置
+            for seg in (self._seeded_timeline() or {}).get(room_id, []) or []:
+                segments.append(
+                    {
+                        "seq": seg.get("seq"),
+                        "kind": seg.get("kind") or "normal",
+                        "voided": bool(seg.get("voided")),
+                        "created_at": seg.get("created_at") or "",
+                        "messages": seg.get("messages") or [],
+                    }
+                )
+        fmt = str(fmt or "markdown").lower()
+        if fmt == "json":
+            content = export_mod.build_json(segments, room_name, room_id)
+            filename = export_mod.safe_filename(room_name, room_id, "json")
+        else:
+            content = export_mod.build_markdown(segments, room_name, room_id)
+            filename = export_mod.safe_filename(room_name, room_id, "md")
+        msg_count = sum(len(s.get("messages") or []) for s in segments)
+        return {
+            "ok": True,
+            "room_id": room_id,
+            "room_name": room_name,
+            "format": fmt,
+            "filename": filename,
+            "content": content,
+            "segments": len(segments),
+            "messages": msg_count,
+        }
 
     async def shell_timeline(self, room_id: str) -> Dict[str, Any]:
         """一个房间的时间线（页面切房间时拉）。

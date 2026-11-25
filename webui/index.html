@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>麦麦聊天室（壳阶段）</title>
+<title>麦麦聊天室</title>
 <style>
   :root {
     --bg: var(--maibot-background, #0f1318);
@@ -675,6 +675,27 @@
   .truncate-confirm .tc-actions { display: flex; gap: 8px; }
   .truncate-confirm .maibot-button { padding: 3px 10px; font-size: 12px; }
 
+  /* ── 导出回退弹窗（下载被沙箱拦时给可复制全文）───────────────────── */
+  .export-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.45);
+    display: flex; align-items: center; justify-content: center; z-index: 50;
+  }
+  .export-panel {
+    background: var(--panel, #1e1f26); color: var(--text, #e6e6e6);
+    border-radius: 10px; padding: 14px; width: min(720px, 92vw);
+    max-height: 82vh; display: flex; flex-direction: column; gap: 10px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.5);
+  }
+  .export-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
+  .export-actions { display: flex; gap: 8px; }
+  .export-actions .maibot-button { padding: 4px 12px; font-size: 12px; }
+  .export-text {
+    flex: 1; min-height: 240px; width: 100%; resize: vertical;
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+    line-height: 1.5; padding: 10px; border-radius: 8px;
+    background: var(--bg, #15161c); color: inherit; border: 1px solid rgba(255,255,255,.12);
+  }
+
   /* ── 危险操作的通用确认层（删除房间 / 角色 / 群员 / 私聊对象）───────── */
   .confirm-overlay {
     position: fixed;
@@ -1303,14 +1324,83 @@
     });
   }
 
-  // 导出入口（UI 先立住）：真正的导出要等下一阶段把剧本存档落成 SQLite，
-  // 那时才有「一份可导出的记录」可导；壳阶段内存态导不出有意义的文件。
-  function exportRoom(room) {
-    var count = (state.timeline[room.room_id] || []).length;
-    showInfo(
-      "导出「" + room.name + "」（当前 " + count + " 条记录）：入口先立在这了。" +
-      "真正导出要等剧本存档落成 SQLite —— 现在房间记录只在内存里（插件重载就没），导不出有意义的文件。"
-    );
+  // 导出：从账本拉 Markdown + JSON（含已作废段），在可复制弹窗里展示。
+  // ⚠️ **不走浏览器下载**：宿主把插件页放在 `<iframe sandbox="allow-scripts allow-forms">`
+  //    （**没有 allow-downloads**）⇒ blob 下载会被静默拦掉、还弹「成功」误导人。
+  //    ⇒ 直接用可复制的弹窗，保证用户一定拿得到内容。
+  async function exportRoom(room) {
+    try {
+      var md = await window.maibot.query("export_room", { room_id: room.room_id, fmt: "markdown" });
+      var js = await window.maibot.query("export_room", { room_id: room.room_id, fmt: "json" });
+      showExportModal(room, (md && md.content) || "", (js && js.content) || "", (md && md.messages) || 0);
+    } catch (error) {
+      showError("导出失败：" + (error && error.message ? error.message : error));
+    }
+  }
+
+  function downloadText(filename, text) {
+    try {
+      var blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); if (a.parentNode) { a.parentNode.removeChild(a); } }, 1000);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // 导出弹窗：给可复制的全文（Markdown / JSON 切换）。
+  function showExportModal(room, markdownText, jsonText, count) {
+    var overlay = document.createElement("div");
+    overlay.className = "export-overlay";
+    var panel = document.createElement("div");
+    panel.className = "export-panel";
+    var head = document.createElement("div");
+    head.className = "export-head";
+    var title = document.createElement("span");
+    title.textContent = "导出「" + room.name + "」（" + (count || 0) + " 条消息，可复制）";
+    var closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "icon-btn";
+    closeBtn.textContent = "✕";
+    closeBtn.onclick = function () { if (overlay.parentNode) { overlay.parentNode.removeChild(overlay); } };
+    head.appendChild(title);
+    head.appendChild(closeBtn);
+    var area = document.createElement("textarea");
+    area.className = "export-text";
+    area.value = markdownText;
+    area.readOnly = true;
+    var row = document.createElement("div");
+    row.className = "export-actions";
+    var mdBtn = document.createElement("button");
+    mdBtn.type = "button"; mdBtn.className = "maibot-button"; mdBtn.textContent = "复制 Markdown";
+    mdBtn.onclick = function () { copyTo(area, mdBtn); };
+    var jsBtn = document.createElement("button");
+    jsBtn.type = "button"; jsBtn.className = "maibot-button"; jsBtn.textContent = "看 JSON";
+    jsBtn.onclick = function () {
+      var showingJson = area.dataset.mode === "json";
+      area.value = showingJson ? markdownText : jsonText;
+      area.dataset.mode = showingJson ? "md" : "json";
+      jsBtn.textContent = showingJson ? "看 JSON" : "看 Markdown";
+    };
+    row.appendChild(mdBtn); row.appendChild(jsBtn);
+    panel.appendChild(head); panel.appendChild(row); panel.appendChild(area);
+    overlay.appendChild(panel);
+    overlay.onclick = function (event) { if (event.target === overlay && overlay.parentNode) { overlay.parentNode.removeChild(overlay); } };
+    document.body.appendChild(overlay);
+  }
+
+  function copyTo(area, btn) {
+    try {
+      area.select();
+      document.execCommand("copy");
+      var old = btn.textContent; btn.textContent = "已复制"; setTimeout(function () { btn.textContent = old; }, 1500);
+    } catch (error) { /* 复制失败就留着让用户手动选 */ }
   }
 
   async function deleteRoom(room) {

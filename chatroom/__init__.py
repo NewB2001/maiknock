@@ -33,6 +33,7 @@ from typing import Any
 from . import (
     collector,
     errorscan,
+    export,
     gateway,
     hostinfo,
     identity,
@@ -59,6 +60,7 @@ __all__ = [
     "build_envelope",
     "collector",
     "errorscan",
+    "export",
     "gateway",
     "hostinfo",
     "identity",

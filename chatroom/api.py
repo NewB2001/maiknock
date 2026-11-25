@@ -121,6 +121,14 @@ class ChatroomApiMixin:
         """
         return await self._svc().shell_timeline(room_id)
 
+    @API("shell_export_room", description="导出房间剧情（Markdown / JSON，含已作废段）", version="1")
+    async def shell_export_room(self, room_id: str, fmt: str = "markdown") -> Dict[str, Any]:
+        """导出房间剧情。
+
+        ⚠️ 含已作废段（否则对不上账）；⚠️ 绝不捎带 api_key。
+        """
+        return await self._svc().shell_export_room(room_id, fmt)
+
     @API("shell_rooms", description="读取房间列表（假数据）", version="1")
     async def shell_rooms(self) -> Dict[str, Any]:
         """单独刷新房间列表用。"""

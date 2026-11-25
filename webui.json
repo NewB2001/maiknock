@@ -39,6 +39,21 @@
         },
         "my_roles": {
           "api": "shell_my_roles"
+        },
+        "export_room": {
+          "api": "shell_export_room",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "fmt": {
+              "type": "string",
+              "required": false,
+              "max_length": 16
+            }
+          }
         }
       },
       "actions": {
