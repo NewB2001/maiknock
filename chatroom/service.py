@@ -34,7 +34,7 @@ from .errorscan import describe_report
 from .hostinfo import read_bot_config, read_bots
 from .identity import DEFAULT_PLATFORM, virtual_group_id
 from .roster import build_roster
-from . import formation
+from . import formation, narrator
 
 # 聊天室子模块自己的版本号（插件总版本见 plugin.py 的 VERSION 常量）
 CHATROOM_VERSION = "0.1.0"
@@ -1416,6 +1416,109 @@ class ChatroomService:
             "formation": plan.formation,
             "formation_label": plan.label,
             "waves": [list(w) for w in plan.waves],
+        }
+
+    async def shell_submit_narrator(
+        self,
+        room_id: str,
+        lines: Optional[List[str]] = None,
+        number: int = 0,
+        unit: str = "",
+    ) -> Dict[str, Any]:
+        """时光机「生成剧情」：把逐条剧情事件做成**旁白**投进虚拟群（S10）。
+
+        旁白 = 一个**固定身份**（``platform=webui`` / ``account=g1_narrator``，
+        **永久固定**，改了会裂成两张名片）。文本拼装见 ``narrator.build_narrator_texts``：
+        时间单位只变成「三天后」这类**相对表述**，**绝不写绝对日期**；
+        用户写什么旁白就说什么（不生成精妙叙事）。
+
+        mock 模式：返回 ok，由前端本地插剧情段（壳阶段一直这么演）。
+        real 模式：写一段（kind=plot）+ 每行 × 每个在场 Bot 一条投递（sender=旁白）。
+        """
+        if await self._data_source() != "real":
+            return {"ok": True, "mode": "mock"}
+        return await self._real_submit_narrator(room_id, lines, number, unit)
+
+    async def _real_submit_narrator(
+        self,
+        room_id: str,
+        lines: Optional[List[str]] = None,
+        number: int = 0,
+        unit: str = "",
+    ) -> Dict[str, Any]:
+        ledger = self._ledger()
+        if ledger is None:
+            return {"ok": False, "error": "共享账本没开，聊天室暂时不能生成剧情"}
+        await self._sync_real_members()
+        room = self._room_by_id(room_id)
+        if room is None:
+            return {"ok": False, "error": f"房间不存在：{room_id}"}
+        bots = await self._room_bot_members(room)
+        if not bots:
+            return {"ok": False, "error": "这个房间里还没有麦麦 Bot，先加一个"}
+        texts = narrator.build_narrator_texts(lines, number, unit)
+        if not texts:
+            return {"ok": False, "error": "至少写一条剧情事件"}
+
+        narrator_member = dict(NARRATOR)
+        group_id = virtual_group_id(room_id)
+        group_name = str(room.get("name") or "")
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        segment_id = f"seg_{int(time.time() * 1000)}"
+        messages = [
+            {
+                "message_id": f"{segment_id}_n{index}",
+                "speaker_member_id": str(narrator_member["member_id"]),
+                "speaker_name": str(narrator_member["display_name"]),
+                "kind": "narrator",
+                "content": text,
+                "created_at": stamp,
+            }
+            for index, text in enumerate(texts)
+        ]
+
+        def _do() -> int:
+            """所有账本写操作**集中在一个同步函数里**，由 ledger.run 挪到线程执行。
+
+            ⚠️ 同步 SQLite 写放在事件循环上会阻塞插件（实测踩过：查询全超时）。
+            """
+            ledger.append_segment(room_id, segment_id, "plot", messages)
+            seq = ledger.next_delivery_seq()
+            queued = 0
+            for text in texts:
+                for bot in bots:
+                    ledger.enqueue_delivery(
+                        delivery_id=f"{segment_id}_d{seq}",
+                        target_bot_id=str(bot.get("bot_id") or ""),
+                        content=text,
+                        room_id=room_id,
+                        segment_id=segment_id,
+                        sender_member_id=str(narrator_member["member_id"]),
+                        sender_platform=str(narrator_member.get("platform") or "webui"),
+                        sender_account=str(narrator_member.get("account") or "g1_narrator"),
+                        sender_nickname=str(narrator_member["display_name"]),
+                        group_id=group_id,
+                        group_name=group_name,
+                        seq=seq,
+                        # 旁白不是「接话」⇒ 不建 turn、不分波（wave 0，无门控）
+                        turn_id="",
+                        wave=0,
+                    )
+                    seq += 1
+                    queued += 1
+            return queued
+
+        try:
+            queued = await ledger.run(_do)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"写旁白投递失败：{exc}"}
+        return {
+            "ok": True,
+            "stage": "real",
+            "room_id": room_id,
+            "segment_id": segment_id,
+            "queued": queued,
+            "texts": texts,
         }
 
     async def shell_submit_beat(

@@ -237,6 +237,17 @@ class ChatroomApiMixin:
         """
         return await self._svc_call("shell_truncate_from", room_id, cutoff_seq)
 
+    @API("shell_submit_narrator", description="时光机「生成剧情」：把剧情事件做成旁白投进虚拟群", version="1")
+    async def shell_submit_narrator(
+        self, room_id: str, lines: Optional[List[str]] = None, number: int = 0, unit: str = ""
+    ) -> Dict[str, Any]:
+        """生成一段旁白（固定身份「剧情旁白」）并投进虚拟群。
+
+        ⚠️ 时间单位只变成「三天后」这类**相对表述**，**绝不写绝对日期**（R6-18）。
+        ⚠️ 旁白**占一个普通段位**，可被「回到此处」截断（FR-17）。
+        """
+        return await self._svc_call("shell_submit_narrator", room_id, lines or [], number, unit)
+
     @API(
         "shell_update_member",
         description="改群员的名字 / 头像（只限我方角色，假数据）",

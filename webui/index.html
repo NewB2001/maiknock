@@ -2483,7 +2483,7 @@
     return panel;
   }
 
-  function generatePlot(scope, numberText, unit, plotText) {
+  async function generatePlot(scope, numberText, unit, plotText) {
     var amount = parseInt(numberText, 10);
     if (!amount || amount <= 0) {
       showError("先填一个大于 0 的数字");
@@ -2493,6 +2493,28 @@
       .filter(function (line) { return line.length > 0; });
     if (!lines.length) {
       showError("至少写一条剧情事件");
+      return;
+    }
+    // ⚠️ **真模式**：旁白要真的投进虚拟群（固定身份「剧情旁白」），
+    //    写进账本后各 Bot 才感知得到「时间过去了/发生了什么」。时间单位只变成
+    //    「三天后」这类相对表述，绝不写绝对日期。假模式维持本地插段。
+    if (scope === "group" && state.stage === "real" && state.currentRoomId) {
+      var result;
+      try {
+        result = await window.maibot.action("submit_narrator", {
+          room_id: state.currentRoomId,
+          lines: lines,
+          number: amount,
+          unit: unit
+        });
+      } catch (error) {
+        showError("生成剧情失败：" + (error && error.message ? error.message : error));
+        return;
+      }
+      var failure = businessError(result);
+      if (failure) { showError(failure); return; }
+      clearError();
+      await loadRoomTimeline(state.currentRoomId);
       return;
     }
     var narrator = state.narrator || { member_id: "narrator", display_name: "剧情旁白", kind: "narrator", avatar: "📖" };

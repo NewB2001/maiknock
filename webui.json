@@ -372,6 +372,34 @@
               "required": true
             }
           }
+        },
+        "submit_narrator": {
+          "api": "shell_submit_narrator",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "lines": {
+              "type": "array",
+              "required": false,
+              "max_items": 200,
+              "items": {
+                "type": "string",
+                "max_length": 4000
+              }
+            },
+            "number": {
+              "type": "integer",
+              "required": false
+            },
+            "unit": {
+              "type": "string",
+              "required": false,
+              "max_length": 8
+            }
+          }
         }
       }
     }
