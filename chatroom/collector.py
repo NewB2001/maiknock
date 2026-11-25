@@ -216,12 +216,15 @@ class ReplyCollector:
                 if not text:
                     continue
                 # 归属段：这条回复回应的是**哪一段**的投递
-                segment_id = await self._ledger.run(
-                    self._ledger.find_delivery_segment,
+                # ⚠️ 用 find_delivery_for_reply（多返回 turn_id / wave）⇒
+                #    S8 的接力要用「这条回复属于哪一轮、哪个波次」
+                reply_delivery = await self._ledger.run(
+                    self._ledger.find_delivery_for_reply,
                     target_bot_id=self._bot_id,
                     room_id=room_id,
                     reply_at=message_time(message),
                 )
+                segment_id = str((reply_delivery or {}).get("segment_id") or "")
                 if not segment_id:
                     # 没有对应的投递（可能是历史消息）⇒ 挂到房间的"未归属"段
                     segment_id = await self._ledger.run(
@@ -250,8 +253,42 @@ class ReplyCollector:
                     self._log.info(
                         "[聊天室] 收到回复（Bot %s）：%s", self._bot_id[:12], text[:40]
                     )
-        if collected:
+                    # ── 接力（S8）：串行/复合阵型下，把这句回复带给后续波次 ──
+                    # ⚠️ 只有**新写进去**的才接力（append_message 已按 message_id 去重
+                    #    ⇒ 重复 poll 时 written=False ⇒ 不会重复接力）。
+                    reply_delivery_id = str((reply_delivery or {}).get("delivery_id") or "")
+                    turn_id = str((reply_delivery or {}).get("turn_id") or "")
+                    if turn_id:
+                        wave = int((reply_delivery or {}).get("wave") or 0)
+                        relayed = await self._ledger.run(
+                            self._ledger.relay_reply_to_later_waves,
+                            turn_id,
+                            wave,
+                            text,
+                            nickname or member_id,
+                        )
+                        if relayed:
+                            self._log.info(
+                                "[聊天室] 已接力给后续波次（轮=%s，本波=%d，影响 %d 条）：%s",
+                                turn_id[:16], wave, relayed, text[:30],
+                            )
+                    # ── 精确标记这一条投递为已收回 ──
+                    # ⚠️⚠️ **原来是「本 Bot 收到任何回复就把所有 delivered 都标 collected」
+                    #    ⇒ 会在 Bot 还没真回复时**提前推进波次门控**（实测踩过：
+                    #    小樱没回，她的投递却被标 collected，雏田的下一波被提前放行）。
+                    #    ⇒ 改成**只标这一条**（回复实际归属到哪条投递就标哪条）；
+                    #    没回复的投递留在 delivered，由超时兜底。
+                    if reply_delivery_id:
+                        await self._ledger.run(
+                            self._ledger.mark_collected, reply_delivery_id
+                        )
+        # ⚠️ **超时兜底**：递出去一直不回的投递要标超时，否则波次门控会卡死整轮。
+        try:
             await self._ledger.run(
-                self._ledger.mark_deliveries_collected, self._bot_id
+                self._ledger.timeout_stale_deliveries,
+                self._bot_id,
+                150.0,
             )
+        except Exception:  # noqa: BLE001
+            pass
         return collected

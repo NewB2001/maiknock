@@ -157,7 +157,9 @@ SCHEMA: Tuple[str, ...] = (
         sender_account   TEXT NOT NULL DEFAULT '',
         sender_nickname  TEXT NOT NULL DEFAULT '',
         attempts         INTEGER NOT NULL DEFAULT 0,
-        seq              INTEGER NOT NULL DEFAULT 0
+        seq              INTEGER NOT NULL DEFAULT 0,
+        turn_id          TEXT NOT NULL DEFAULT '',      -- 属于哪一轮（调度用）
+        wave             INTEGER NOT NULL DEFAULT 0     -- 第几波（0 = 第一波）
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_delivery_target ON delivery(target_bot_id, state)",
@@ -197,6 +199,21 @@ SCHEMA: Tuple[str, ...] = (
         updated_at   TEXT NOT NULL DEFAULT ''
     )
     """,
+    # ── 轮次（turn）—— 调度计划与 seed 的存档 ─────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS turn (
+        turn_id      TEXT PRIMARY KEY,
+        room_id      TEXT NOT NULL DEFAULT '',
+        segment_id   TEXT NOT NULL DEFAULT '',
+        seed         INTEGER NOT NULL DEFAULT 0,
+        strategy     TEXT NOT NULL DEFAULT 'random',   -- explicit | random
+        formation    TEXT NOT NULL DEFAULT 'serial',   -- serial | parallel | composite
+        plan_json    TEXT NOT NULL DEFAULT '{}',       -- 波次表（可复现）
+        state        TEXT NOT NULL DEFAULT 'open',     -- open | done | timeout
+        created_at   TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_turn_room ON turn(room_id, created_at)",
 )
 
 #: 需要在**已存在的表**上补的列（`CREATE TABLE IF NOT EXISTS` 不会加列）。
@@ -211,6 +228,8 @@ MIGRATIONS: Dict[str, Dict[str, str]] = {
         "sender_nickname": "TEXT NOT NULL DEFAULT ''",
         "attempts": "INTEGER NOT NULL DEFAULT 0",
         "seq": "INTEGER NOT NULL DEFAULT 0",
+        "turn_id": "TEXT NOT NULL DEFAULT ''",
+        "wave": "INTEGER NOT NULL DEFAULT 0",
     },
 }
 
@@ -971,6 +990,8 @@ class ChatroomLedger:
         sender_account: str = "",
         sender_nickname: str = "",
         seq: int = 0,
+        turn_id: str = "",
+        wave: int = 0,
     ) -> Dict[str, Any]:
         """登记一条投递任务（跨 Bot 的工作单）。
 
@@ -987,6 +1008,7 @@ class ChatroomLedger:
             "delivered_at", "collected_at", "baseline_ts",
             "group_id", "group_name", "sender_platform", "sender_account",
             "sender_nickname", "attempts", "seq",
+            "turn_id", "wave",
         )
         values = (
             delivery_id, segment_id, room_id, target_bot_id,
@@ -995,6 +1017,7 @@ class ChatroomLedger:
             float(baseline_ts if baseline_ts is not None else time.time()),
             group_id, group_name, sender_platform, sender_account,
             sender_nickname, 0, int(seq),
+            str(turn_id or ""), int(wave),
         )
         placeholders = ",".join("?" for _ in columns)
         with self.write() as conn:
@@ -1022,14 +1045,64 @@ class ChatroomLedger:
         return dict(row) if row else None
 
     def pending_deliveries(self, target_bot_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """取属于某个 Bot 的待办任务（按创建顺序）。"""
+        """取属于某个 Bot 的待办任务（按创建顺序）。
+
+        ⚠️⚠️ **按波次门控**：只返回「所在的波次已经轮到」的单。
+        波次门控 = 同一轮里，**当前波之前的所有波都已经递出**才算轮到。
+        这样：
+        - 串行阵型（每波只有 1 个 Bot）⇒ 天然逐个递；
+        - 并行阵型（全在同一波）⇒ 全部一次放行；
+        - 复合阵型 ⇒ 波内并行、波间串行。
+        光靠 SQL 不好表达，所以**取出来再在 Python 里过滤**
+        （一轮的任务量很小：几个 Bot 而已）。
+        """
         with self.read() as conn:
             rows = conn.execute(
                 "SELECT * FROM delivery WHERE target_bot_id = ? AND state = ?"
                 " ORDER BY seq, created_at, delivery_id LIMIT ?",
                 (target_bot_id, DELIVERY_PENDING, int(limit)),
             ).fetchall()
-        return [dict(row) for row in rows]
+            pending = [dict(row) for row in rows]
+            if not pending:
+                return []
+            # 收集这些任务涉及的轮次 ⇒ 查每轮「已进行到第几波」
+            turn_ids = {str(r.get("turn_id") or "") for r in pending if r.get("turn_id")}
+            wave_frontier: Dict[str, int] = {}
+            for turn_id in turn_ids:
+                wave_frontier[turn_id] = self._turn_wave_frontier(conn, turn_id)
+        out = []
+        for row in pending:
+            turn_id = str(row.get("turn_id") or "")
+            if not turn_id:
+                out.append(row)             # 无轮次（历史/单条递话）⇒ 不门控
+                continue
+            if int(row.get("wave") or 0) <= wave_frontier.get(turn_id, 0):
+                out.append(row)
+        return out
+
+    @staticmethod
+    def _turn_wave_frontier(conn: sqlite3.Connection, turn_id: str) -> int:
+        """某一轮**当前放行到第几波**。
+
+        ⚠️ 语义：返回「下一个未完成的波号」。
+        若第 0 波还有未递完的（pending/delivered），就只放行第 0 波（返回 0）；
+        第 0 波全部进入 collected/timeout/cancelled ⇒ 放行到第 1 波（返回 1）……
+        """
+        rows = conn.execute(
+            "SELECT wave, state FROM delivery WHERE turn_id = ?", (turn_id,)
+        ).fetchall()
+        if not rows:
+            return 0
+        # 未完成的 = 还会产生后续动作的波
+        inflight = {int(r["wave"]) for r in rows if str(r["state"]) in (DELIVERY_PENDING, DELIVERY_DELIVERED)}
+        done_max = -1
+        for r in rows:
+            if str(r["state"]) in (DELIVERY_COLLECTED, DELIVERY_TIMEOUT, DELIVERY_CANCELLED):
+                done_max = max(done_max, int(r["wave"]))
+        # 最小未完成的波号；没有未完成的 ⇒ 全部放行
+        if not inflight:
+            return 10 ** 6
+        return min(inflight)
 
     def claim_delivery(self, delivery_id: str, target_bot_id: str) -> bool:
         """**原子**地把任务从 pending 领走（防两个实例抢同一条）。
@@ -1226,6 +1299,85 @@ class ChatroomLedger:
             row = conn.execute(sql, params).fetchone()
         return str(row[0]) if row else ""
 
+    def find_delivery_for_reply(
+        self, target_bot_id: str, room_id: str, reply_at: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """找「这条回复回应的是哪一次投递」的**完整任务**（含 turn_id / wave）。
+
+        ⚠️ 规则与 :meth:`find_delivery_segment` **完全一致**（按时间配对），
+        只是多返回 turn_id / wave —— S8 的接力与波次门控要用。
+        """
+        sql = (
+            "SELECT * FROM delivery"
+            " WHERE target_bot_id = ? AND room_id = ?"
+        )
+        params: List[Any] = [target_bot_id, room_id]
+        if reply_at:
+            sql += " AND created_at <= ?"
+            params.append(str(reply_at))
+        sql += " ORDER BY created_at DESC, seq DESC LIMIT 1"
+        with self.read() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return dict(row) if row else None
+
+    def relay_reply_to_later_waves(
+        self, turn_id: str, from_wave: int, reply_text: str, reply_by: str
+    ) -> int:
+        """把这个 Bot 的回复**接力**到同一轮里**后续波次**的待办任务。
+
+        ⚠️ **为什么需要**（08 §3.3 串行/复合阵型）：后答的 Bot **要看得见**
+        先答的回复。可各 Bot 的群流是**各自独立的副本** ⇒ 先答 Bot 的回复
+        只存在**它自己**的群里，后答 Bot 看不见 ⇒ 必须由中控把这段话
+        **塞进后答 Bot 的投递正文**。
+
+        :param from_wave: 说话的这个 Bot 在第几波
+        :param reply_text: 它到底回了什么
+        :param reply_by: 它的显示名（拼进接力前缀）
+        :returns: 改了几条后续任务
+        """
+        text = str(reply_text or "").strip()
+        if not turn_id or not text:
+            return 0
+        prefix = f"（这期间 {reply_by} 说：{text}）\n"
+        changed = 0
+        with self.write() as conn:
+            rows = conn.execute(
+                "SELECT delivery_id, content FROM delivery"
+                " WHERE turn_id = ? AND wave > ? AND state = ?",
+                (turn_id, int(from_wave), DELIVERY_PENDING),
+            ).fetchall()
+            for row in rows:
+                content = str(row["content"] or "")
+                conn.execute(
+                    "UPDATE delivery SET content = ? WHERE delivery_id = ?",
+                    (prefix + content, str(row["delivery_id"])),
+                )
+                changed += 1
+        return changed
+
+    def timeout_stale_deliveries(
+        self, target_bot_id: str, older_than_seconds: float = 150.0
+    ) -> int:
+        """把本 Bot「递出去了但迟迟没回」的投递标记为超时。
+
+        ⚠️ **为什么必须超时**（FR-09）：串行/复合阵型靠波次门控推进，
+        某一波里的 Bot 一直不回 ⇒ 后面的波永远不放行 ⇒ 整轮卡死。
+        ⇒ 递出超过 ``older_than_seconds`` 还没变成 collected 的，标 timeout
+        （**只记状态，不产消息行**——沉默绝不进时间线）。
+
+        ⚠️ 只动本 Bot 自己的单（别的 Bot 由它们各自的实例管）。
+        """
+        cutoff = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - float(older_than_seconds))
+        )
+        with self.write() as conn:
+            cur = conn.execute(
+                "UPDATE delivery SET state = ?"
+                " WHERE target_bot_id = ? AND state = ? AND delivered_at <= ?",
+                (DELIVERY_TIMEOUT, target_bot_id, DELIVERY_DELIVERED, cutoff),
+            )
+            return int(cur.rowcount or 0)
+
     def ensure_open_segment(self, room_id: str) -> str:
         """给「没有对应投递的回复」开一个兜底段（历史消息、旁白等）。
 
@@ -1274,6 +1426,93 @@ class ChatroomLedger:
                 (DELIVERY_COLLECTED, _now(), target_bot_id, DELIVERY_DELIVERED),
             )
             return int(cur.rowcount or 0)
+
+    # ── 轮次（turn）—— 调度计划与 seed 的存档（S8）────────────────────
+    # ⚠️ **为什么要存 seed**：随机轮次的阵型是掷骰子定的，
+    #    不存的话「这一轮为什么是串行」事后无法复现、无法重演（FR-05/FR-14）。
+
+    def save_turn(self, turn: Dict[str, Any]) -> Dict[str, Any]:
+        """登记一轮（含 seed 与阵型计划）。覆盖式写入（同 turn_id 重存）。"""
+        turn_id = str(turn.get("turn_id") or "")
+        if not turn_id:
+            raise LedgerError("save_turn 需要 turn_id")
+        plan = turn.get("plan") or {}
+        plan_json = plan if isinstance(plan, str) else json.dumps(plan, ensure_ascii=False)
+        with self.write() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO turn(turn_id, room_id, segment_id, seed,"
+                " strategy, formation, plan_json, state, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    turn_id,
+                    str(turn.get("room_id") or ""),
+                    str(turn.get("segment_id") or ""),
+                    int(turn.get("seed") or 0),
+                    str(turn.get("strategy") or "random"),
+                    str(turn.get("formation") or "serial"),
+                    plan_json,
+                    str(turn.get("state") or "open"),
+                    str(turn.get("created_at") or _now()),
+                ),
+            )
+        row = self.get_turn(turn_id)
+        assert row is not None
+        return row
+
+    def get_turn(self, turn_id: str) -> Optional[Dict[str, Any]]:
+        """读一轮（把 plan_json 解析回 dict —— **存/取必须对称**）。"""
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM turn WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        # ⚠️ 存的时候 dumps、读的时候必须 loads —— 否则每轮往返多裹一层
+        #    （账本 config_json 就是栽在这上面，见 _decode_config_json 的注释）
+        data["plan"] = _decode_config_json(data.get("plan_json"))
+        return data
+
+    def update_turn_state(self, turn_id: str, state: str) -> None:
+        """更新一轮的状态（open / done / timeout）。"""
+        with self.write() as conn:
+            conn.execute(
+                "UPDATE turn SET state = ? WHERE turn_id = ?", (str(state), turn_id)
+            )
+
+    def list_turns(self, room_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """某个房间最近的轮次（调试面板 / 重演用）。"""
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM turn WHERE room_id = ? ORDER BY created_at DESC LIMIT ?",
+                (room_id, int(limit)),
+            ).fetchall()
+        out = []
+        for row in rows:
+            data = dict(row)
+            data["plan"] = _decode_config_json(data.get("plan_json"))
+            out.append(data)
+        return out
+
+    def turn_deliveries(self, turn_id: str) -> List[Dict[str, Any]]:
+        """某一轮的全部投递任务（按波次、序号排）。"""
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM delivery WHERE turn_id = ? ORDER BY wave, seq",
+                (turn_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def turn_wave_state(self, turn_id: str) -> Dict[int, List[str]]:
+        """某一轮**每一波**各任务的状态 ⇒ ``{波号: [state, ...]}``。
+
+        ⚠️ 中控靠它判断「这一波说完了没」（串行/复合阵型靠它决定何时放下一波）：
+        一波里的任务**全部**进入 collected/timeout/cancelled ⇒ 这一波结束。
+        """
+        out: Dict[int, List[str]] = {}
+        for row in self.turn_deliveries(turn_id):
+            out.setdefault(int(row.get("wave") or 0), []).append(str(row.get("state") or ""))
+        return out
 
     # ── 消息（S6 回读落库）───────────────────────────────────────────
 

@@ -2942,6 +2942,15 @@
     var token = ++state.turnToken;
     var box = $("timeline");
 
+    // ⚠️ **真模式**（real data_source）：台词已写进共享账本，
+    //    回复由各 Bot **异步**产生（不像假数据那样能提前算好节奏）
+    //    ⇒ 不做本地假动画，改为**轮询账本时间线**，回复到了就停。
+    //    （旧逻辑拿不到 plan.plan 会误报「没有能接话的 Bot」且界面不刷新）
+    if (plan && plan.stage === "real") {
+      await pollRealBeat(room, plan, token);
+      return;
+    }
+
     // 这一段 = 我方这次提交的多条台词 + 紧随其后的一轮 Bot 回复
     var segments = segmentsOf("group");
     var segment = {
@@ -3031,6 +3040,46 @@
     }
 
     finishTurn(token, null);
+  }
+
+  // ⚠️ 真模式：轮询账本时间线，直到本轮这段出现 Bot 回复（或超时）。
+  //    台词已经在账本里（后端 append_segment 写过），所以这里不再本地插入，
+  //    直接以账本为准刷新 —— 避免「本地一份 + 账本一份」重复显示。
+  async function pollRealBeat(room, plan, token) {
+    var targetRoom = room.room_id;
+    state.turn = {
+      room_id: targetRoom,
+      beat_seq: 0,
+      strategy: plan.strategy,
+      strategy_label: plan.formation_label ? ("调度：" + plan.formation_label) : "等待接话",
+      seed: plan.seed,
+      silenced: [],
+      ordered: [],
+      started_at: Date.now(),
+      index: 0,
+      real: true
+    };
+    $("stop-turn").hidden = false;
+    renderTurnState("已递话，等麦麦接话……");
+    state.elapsedTimer = setInterval(updateElapsed, 250);
+    await loadRoomTimeline(targetRoom);
+    var speed = Math.max(state.speed || 1, 0.1);
+    var deadline = Date.now() + 160000 / speed;
+    while (token === state.turnToken && Date.now() < deadline) {
+      await new Promise(function (resolve) { setTimeout(resolve, 3000); });
+      if (token !== state.turnToken) { return; }
+      await loadRoomTimeline(targetRoom);
+      var segs = state.timeline[targetRoom] || [];
+      var last = null;
+      for (var i = segs.length - 1; i >= 0; i -= 1) {
+        if (!segs[i].voided) { last = segs[i]; break; }
+      }
+      if (last) {
+        var hasReply = (last.messages || []).some(function (m) { return m.kind === "reply"; });
+        if (hasReply) { break; }
+      }
+    }
+    finishTurn(token, token === state.turnToken ? "本轮结束。" : null);
   }
 
   /* ── 提交（私聊）──────────────────────────────────────── */

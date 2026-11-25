@@ -34,6 +34,7 @@ from .errorscan import describe_report
 from .hostinfo import read_bot_config, read_bots
 from .identity import DEFAULT_PLATFORM, virtual_group_id
 from .roster import build_roster
+from . import formation
 
 # 聊天室子模块自己的版本号（插件总版本见 plugin.py 的 VERSION 常量）
 CHATROOM_VERSION = "0.1.0"
@@ -1300,6 +1301,20 @@ class ChatroomService:
         pool = self._member_map()
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         segment_id = f"seg_{int(time.time() * 1000)}"
+
+        # ── 排阵型（S8）：谁接话、按什么次序/分波 ─────────────────────
+        # ⚠️ **seed 必须存档**：随机轮次的阵型是掷骰子定的；不存就无法复现/重演
+        self._turn_counter += 1
+        seed = formation.next_seed(self._turn_counter, len(self._rooms))
+        bot_member_ids = [str(bot.get("member_id") or "") for bot in bots]
+        named_in_room = [m for m in named if m in bot_member_ids]
+        plan = formation.plan_formation(seed, bot_member_ids, named_in_room)
+        # member_id → 波号（同一个人可能只在一波里）
+        member_wave = {}
+        for wave_index, wave_members in enumerate(plan.waves):
+            for member_id in wave_members:
+                member_wave.setdefault(member_id, wave_index)
+
         messages = [
             {
                 "message_id": f"{segment_id}_m{index}",
@@ -1311,12 +1326,31 @@ class ChatroomService:
             }
             for index, line in enumerate(resolved)
         ]
+        turn_id = f"turn_{segment_id}"
         try:
             ledger.append_segment(room_id, segment_id, "normal", messages)
+            # 存这一轮（seed + 阵型 + 分波计划）—— 重演与调试都靠它
+            ledger.save_turn(
+                {
+                    "turn_id": turn_id,
+                    "room_id": room_id,
+                    "segment_id": segment_id,
+                    "seed": plan.seed,
+                    "strategy": plan.strategy,
+                    "formation": plan.formation,
+                    "plan": plan.to_dict(),
+                    "state": "open",
+                    "created_at": stamp,
+                }
+            )
             seq = ledger.next_delivery_seq()
             queued = 0
             for line in resolved:
                 for bot in bots:
+                    bot_member_id = str(bot.get("member_id") or "")
+                    # 只给「本轮接话名单」里的 Bot 排任务；不在阵型里的不打扰
+                    if bot_member_id not in member_wave:
+                        continue
                     content = line["text"]
                     if bot["member_id"] in named:
                         # 02 文档 8.6：@点名 是开口保证（正文里带 @显示名）
@@ -1335,6 +1369,8 @@ class ChatroomService:
                         group_id=group_id,
                         group_name=str(room.get("name") or ""),
                         seq=seq,
+                        turn_id=turn_id,
+                        wave=int(member_wave.get(bot_member_id, 0)),
                     )
                     seq += 1
                     queued += 1
@@ -1342,12 +1378,19 @@ class ChatroomService:
             return {"ok": False, "error": f"写投递任务失败：{exc}"}
         return {
             "ok": True,
+            "stage": "real",          # 前端据此走「轮询账本」而不是本地假动画
             "room_id": room_id,
             "segment_id": segment_id,
             "queued": queued,
             "bots": [str(bot.get("display_name") or "") for bot in bots],
             "named": sorted(named),
             "lines": resolved,
+            # 调度信息（调试面板/日志用；**界面不显示阵型选项**）
+            "seed": plan.seed,
+            "strategy": plan.strategy,
+            "formation": plan.formation,
+            "formation_label": plan.label,
+            "waves": [list(w) for w in plan.waves],
         }
 
     async def shell_submit_beat(
