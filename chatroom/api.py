@@ -50,6 +50,13 @@ class ChatroomApiMixin:
         #    两条方向抢同一条 IPC 通道 ⇒ 重叠就互相等 ⇒ 死锁
         #    （实测：页面所有查询超时 + 宿主报「Runner 健康检查失败」）。
         #    busy 标志只能挡「新发起」，挡不住「已在飞」⇒ 这里补上互斥。
+        #
+        #    ⚠️ **这个 Event 与组件调用在同一个 Runner loop 上**（都是
+        #    ``asyncio.run()`` 里的协程）⇒ 等得到，不是跨 loop 的坑。
+        #    ⚠️ 正常情况下**立即返回**（回读绝大多数时候没在飞）；
+        #    2 秒只是**上限**，防止回读卡死时把组件调用一起拖死。
+        #    ⇒ 「页面查询慢」不要往这里找：真正的原因是账本里的数据本身坏了
+        #    （见 ledger._decode_config_json 的注释：存/取不对称 ⇒ 单行涨到 512 MiB）。
         collector = getattr(self, "_chatroom_collector", None)
         idle = getattr(collector, "rpc_idle", None)
         if idle is not None:

@@ -236,9 +236,15 @@ class MaimConnection:
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def _keepalive_loop(self) -> None:
+        # ⚠️⚠️ **没连上时要「快一点重试」** ——
+        #    插件的 on_load 比宿主的消息服务启动早 ⇒ 第一次握手通常失败。
+        #    若一律等 60 秒才重试，Bot 会有整整一分钟「在但不能用」
+        #    （实测：二号重启后一直 403，而网关其实几秒后就绪了）。
+        #    ⇒ 连不上时用 3 秒起步的退避，连上后回到正常心跳间隔。
+        retry_delay = 3.0
         while not self._closing:
             try:
-                await asyncio.sleep(self._keepalive_interval)
+                await asyncio.sleep(self._keepalive_interval if self._connected else retry_delay)
             except asyncio.CancelledError:
                 return
             if self._closing:
@@ -247,7 +253,11 @@ class MaimConnection:
                 if self._connected:
                     await self.ping_once()
                 else:
-                    await self.connect()
+                    if await self.connect():
+                        retry_delay = 3.0
+                    else:
+                        # 指数退避（封顶 30 秒）⇒ 别把日志刷爆
+                        retry_delay = min(retry_delay * 2, 30.0)
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # noqa: BLE001
@@ -342,6 +352,16 @@ class GatewayPool:
             self._conns[bot_id] = conn
         else:
             conn.api_key = str(api_key)
+
+    def connection(self, bot_id: str) -> Optional[MaimConnection]:
+        """拿连接对象（**不尝试连接**）。
+
+        ⚠️ **为什么要有这个**：`get()` 建连失败时返回 ``None``，
+        调用方就拿不到连接对象 ⇒ **保活循环起不来** ⇒ 永远连不上。
+        插件的 on_load 比宿主的消息服务启动早，第一次握手**大概率失败**，
+        必须能「先拿到对象、让保活循环去重连」。
+        """
+        return self._conns.get(bot_id)
 
     async def get(self, bot_id: str) -> Optional[MaimConnection]:
         """拿到（或建）到某个 Bot 的连接。建不成功返回 None。"""

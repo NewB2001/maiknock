@@ -882,15 +882,34 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         pool.set_api_key(self._chatroom_bot_id, api_key)
         self._chatroom_gateway = pool
         conn = await pool.get(self._chatroom_bot_id)
+        # ⚠️⚠️ **握手失败也要把「后台活儿」全起起来** ——
+        #    插件的 on_load 比宿主的消息服务启动**早**（宿主要先把
+        #    `/_maim/api` 路由挂到内部 FastAPI 上），所以**第一次握手大概率失败**。
+        #    ⇒ 以前这里 `return` 掉 ⇒ 保活不起、**投递循环也不起**、错误扫描也不起
+        #    ⇒ Bot 看起来「已就绪」但其实啥都不干（实测：二号重启后一直 403，
+        #      网关几秒后就绪了，可它永远没去重连，也没递话）。
+        #    ⇒ 改成：**保活负责重连，投递/回读/错误扫描一律照常起**。
         if conn is None or not conn.connected:
             reason = (conn.last_error if conn else "未知原因") or "未知原因"
-            logger.warning("[MaiKnock][聊天室] 握手层未通过（Bot %s）：%s", self._chatroom_bot_id[:12], reason)
-            return
-        await conn.start_keepalive()
-        logger.info(
-            "[MaiKnock][聊天室] 握手层通过：已连上 %s 的消息网关（%s）",
-            self._chatroom_bot_id[:12], conn.endpoint(),
-        )
+            logger.warning(
+                "[MaiKnock][聊天室] 握手层未通过（Bot %s）：%s ⇒ 已交给保活循环重连",
+                self._chatroom_bot_id[:12], reason,
+            )
+            # ⚠️ pool.get() 失败时会返回 None ⇒ 拿不到连接对象 ⇒ 起不了保活。
+            #    ⇒ 这里直接用 pool 里的连接对象（set_api_key 时已经建好）。
+            conn = pool.connection(self._chatroom_bot_id)
+            if conn is None:
+                logger.error("[MaiKnock][聊天室] 拿不到自己的网关连接对象，无法保活")
+                return
+            await conn.start_keepalive()
+        else:
+            await conn.start_keepalive()
+            logger.info(
+                "[MaiKnock][聊天室] 握手层通过：已连上 %s 的消息网关（%s）",
+                self._chatroom_bot_id[:12], conn.endpoint(),
+            )
+        # ⚠️ **不论握手成没成，投递/回读/错误扫描都要起** ——
+        #    它们各自会等连接可用（投递走 pool.send_text ⇒ 内部会重连）。
         await self._chatroom_start_worker()
         await self._chatroom_report_status()
 

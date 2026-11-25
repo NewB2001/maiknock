@@ -118,7 +118,12 @@ class ReplyCollector:
         self._log = log or _log
         self._seen: set = set()
         self._collected = 0
-        #: 「有没有插件→宿主的 RPC 正在飞」——组件调用要等它清零（见插件里的互斥）
+        #: 「有没有插件→宿主的 RPC 正在飞」——
+        #: 组件调用（宿主→插件）要等它清零，避免**两个方向抢同一条 IPC 通道**。
+        #:
+        #: ⚠️ **组件调用与本回读器跑在同一个 Runner loop 上**（都是
+        #:    ``asyncio.run()`` 里的协程），所以这个 Event 是**可以**跨协程等待的
+        #:    —— 不是「跨 loop 等不到」那种坑。
         self.rpc_idle = asyncio.Event()
         self.rpc_idle.set()
 

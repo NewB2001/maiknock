@@ -244,6 +244,68 @@ def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+#: 单个房间 config_json 的**合理上限**（字节）。
+#: 房间配置只有几 KB；超过这个数就说明存/取不对称又发生了（转义膨胀）。
+#: ⛔ **硬闸**：宁可丢配置也不能让一行膨胀到几百 MB —— 一行 512 MiB 就能把
+#:    共享账本撑到 1.6 GB，页面读账本直接超时（实测踩过）。
+_CONFIG_JSON_MAX_BYTES = 64 * 1024
+
+#: 解包时最多剥几层转义（正常的 config_json 只有 1 层）。
+_CONFIG_JSON_MAX_UNWRAP = 64
+
+
+def _decode_config_json(raw: Any) -> Dict[str, Any]:
+    """把房间的 ``config_json`` 还原成 dict（**存/取对称**）。
+
+    **为什么必须对称**：``save_state`` 写的是 ``json.dumps(dict)``，
+    若 ``load_state`` 不做 ``json.loads`` 就把 TEXT 原样交出去，
+    下次存的时候又 dumps 一次 ⇒ **每轮存/取长度翻倍**
+    （实测：``"{}"`` 经过 28 轮往返变成 **512 MiB** 的转义串）。
+
+    **自愈**：已经被写坏的行（存了 N 层转义）会被**逐层剥回**原值。
+    剥到不再是 JSON 字符串就停；剥不动（超上限 / 不是 JSON）就退化成 ``{}``。
+
+    **硬闸**：正常读路径上，超过 :data:`_CONFIG_JSON_MAX_BYTES` 的行一律丢弃
+    （退化成 ``{}``）—— 宁可丢房间配置，也不能让一行膨胀成几百 MB。
+
+    """
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}
+    # ⚠️ **先把超长的行挡掉再解析** —— 解析 512 MiB 的字符串本身就费内存。
+    if len(raw) > _CONFIG_JSON_MAX_BYTES:
+        import logging as _logging
+
+        _logging.getLogger("plugin.maiknock.webui_companion").error(
+            "[聊天室] 房间 config_json 异常膨胀（%d 字节 > %d）⇒ 已丢弃并置空",
+            len(raw), _CONFIG_JSON_MAX_BYTES,
+        )
+        return {}
+    value: Any = raw
+    for _ in range(_CONFIG_JSON_MAX_UNWRAP):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        # 解出来不是字符串 ⇒ 已经是最终值了
+        if not isinstance(decoded, str):
+            return decoded if isinstance(decoded, dict) else {}
+        # 解出来还是字符串 ⇒ 说明外面又裹了一层 ⇒ 继续剥
+        value = decoded
+        # 剥到正常大小了 ⇒ 直接解出来收工（不用再走一圈）
+        if len(value) <= _CONFIG_JSON_MAX_BYTES:
+            try:
+                final = json.loads(value)
+            except (TypeError, ValueError):
+                return {}
+            return final if isinstance(final, dict) else {}
+    # 剥了这么多层还没剥完 ⇒ 不正常，丢掉
+    return {}
+
+
 class ChatroomLedger:
     """共享账本。
 
@@ -285,9 +347,18 @@ class ChatroomLedger:
         """
         import asyncio as _asyncio
         import functools as _functools
-        return await _asyncio.get_running_loop().run_in_executor(
+        import logging as _lg
+        import time as _tm
+        _t0 = _tm.time()
+        result = await _asyncio.get_running_loop().run_in_executor(
             self._executor, _functools.partial(func, *args, **kwargs)
         )
+        _elapsed = _tm.time() - _t0
+        if _elapsed > 0.5:
+            _lg.getLogger("plugin.maiknock.webui_companion").warning(
+                "[聊天室] 账本操作慢：%s 用了 %.2fs", getattr(func, "__name__", func), _elapsed
+            )
+        return result
 
     @property
     def path(self) -> str:
@@ -327,6 +398,156 @@ class ChatroomLedger:
             if added:
                 self._log_migration(table, added)
         self._conn = conn
+        # ⚠️⚠️ **自愈：修掉历史上被写坏的 config_json**（存/取不对称的遗留）。
+        #    坏掉的行可能有几百 MB ⇒ 库文件涨到 GB 级 ⇒ 页面读账本直接超时。
+        #    这里是**唯一**该做清理的地方：进程启动时跑一次，不在热路径上。
+        self._repair_config_json()
+        # ⚠️ **修完行还要把空间还回去**（VACUUM）——
+        #    修好的行只占几 KB，但**文件不会自己缩**（释放的页还在 freelist 里）
+        #    ⇒ 1.6 GB 的库文件会一直占着磁盘。
+        #    ⚠️ VACUUM 需要**独占**这个库 ⇒ 另一个 Bot 进程开着就会失败
+        #    ⇒ 失败就失败，不影响功能（每个进程启动时都会再试一次）。
+        self._vacuum_if_wasted()
+
+    def _repair_config_json(self) -> None:
+        """把异常膨胀（或多层转义）的 ``config_json`` 修回正常值。
+
+        ⚠️ **为什么需要**：早期版本的 ``load_state`` 没把 ``config_json`` 解析回 dict，
+        ``save_state`` 又 dumps 一次 ⇒ 每轮存/取**长度翻倍**
+        （实测：``"{}"`` 经过 28 轮往返变成 **512 MiB**，3 个房间把库撑到 **1.6 GB**）。
+
+        修法：把每行的值**剥回**原样再写回；剥不动（超上限）就置空
+        （房间配置不是核心数据，丢了不影响剧情）。
+        """
+        import logging
+
+        log = logging.getLogger("plugin.maiknock.webui_companion")
+        try:
+            # ⚠️⚠️ **绝对不要 SELECT 整列** ——
+            #    坏行可能有几百 MB ⇒ 一次性读进 Python 就是几个 GB 的内存 ⇒ OOM。
+            #    只取**长度**和**首字符**（让 SQL 侧算，不进 Python）。
+            with self.read() as conn:
+                rows = conn.execute(
+                    "SELECT room_id, LENGTH(config_json) AS n,"
+                    " SUBSTR(config_json, 1, 1) AS head FROM room"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            log.warning("[聊天室] 检查房间 config_json 失败：%r", exc)
+            return
+        broken = []
+        for row in rows:
+            room_id = str(row["room_id"])
+            size = int(row["n"] or 0)
+            head = str(row["head"] or "")
+            # ⚠️⚠️ **判据是「结构」不是「大小」** ——
+            #    好的 config_json 是 **JSON 对象**（以 ``{`` 开头）；
+            #    被裹了转义的坏行是 **JSON 字符串**（以 ``"`` 开头）。
+            #    只按大小判断会漏掉「只裹了几层、但还没到 64 KiB」的行
+            #    （那行照样会让每一轮存/取继续翻倍 ⇒ 迟早又膨胀回去）。
+            if head == "{" and size <= _CONFIG_JSON_MAX_BYTES:
+                continue        # 形状对 ⇒ 大概率没问题
+            broken.append((room_id, size, head))
+        if not broken:
+            return
+        log.error(
+            "[聊天室] ⚠️ 发现 %d 个房间的 config_json 异常（%s）⇒ 正在修复",
+            len(broken),
+            "、".join(f"{rid}:{size}字节/首字符{head!r}" for rid, size, head in broken),
+        )
+        fixed = 0
+        try:
+            with self.write() as conn:
+                for room_id, size, _head in broken:
+                    if size > _CONFIG_JSON_MAX_BYTES:
+                        # ⚠️ **太大的行：直接用 SQL 覆写，不进 Python**
+                        #    （读进 Python 就是几百 MB 的内存 ⇒ OOM）
+                        conn.execute(
+                            "UPDATE room SET config_json = '{}' WHERE room_id = ?",
+                            (room_id,),
+                        )
+                    else:
+                        # 小行才值得剥：多层转义能被还原成原值
+                        row = conn.execute(
+                            "SELECT config_json FROM room WHERE room_id = ?",
+                            (room_id,),
+                        ).fetchone()
+                        value = _decode_config_json(row["config_json"] if row else None)
+                        conn.execute(
+                            "UPDATE room SET config_json = ? WHERE room_id = ?",
+                            (json.dumps(value, ensure_ascii=False), room_id),
+                        )
+                    fixed += 1
+        except sqlite3.Error as exc:
+            log.error("[聊天室] 修复房间 config_json 失败：%r", exc)
+            return
+        log.info("[聊天室] 已修复 %d 个房间的 config_json", fixed)
+
+    def _vacuum_if_wasted(self) -> None:
+        """库文件「虚胖」时做一次 VACUUM + checkpoint，把它缩回实际大小。
+
+        ⚠️ **两种「虚胖」要分清**（踩过）：
+
+        ① **freelist 里的空页** —— 数据被删/改小了，页还在文件里。
+           ⇒ 靠 ``PRAGMA freelist_count`` 判断，``VACUUM`` 能解决。
+
+        ② **主文件没被截断** —— WAL 模式下 ``VACUUM`` 只把新内容写进 WAL，
+           **主库文件的大小不变**（实测：日志说「1538 MB → 0 MB」，
+           磁盘上还是 1.6 GB！）。
+           ⇒ 靠**磁盘实际大小 vs 逻辑大小**判断，``wal_checkpoint(TRUNCATE)`` 才能解决。
+
+        两种都做：先按需 VACUUM，再无条件 checkpoint（把 WAL 写回主文件并截断）。
+        """
+        import logging
+        import os
+
+        log = logging.getLogger("plugin.maiknock.webui_companion")
+        try:
+            conn = self._require_conn()
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            free_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        except sqlite3.Error as exc:
+            log.warning("[聊天室] 读账本页数失败：%r", exc)
+            return
+        # ⚠️⚠️ **「实际用掉」的字节数 = (总页数 - freelist 页数) × 页大小** ——
+        #    `page_count` **包含** freelist 里的空页！直接拿它算「逻辑大小」
+        #    会得到和磁盘大小差不多的数 ⇒ 永远判定不出「虚胖」（我自己踩过）。
+        used_bytes = max(0, page_count - free_count) * page_size
+        try:
+            disk_bytes = os.path.getsize(self._path)
+        except OSError:
+            disk_bytes = used_bytes
+        # 磁盘上比实际用掉的大 1.5 倍以上 ⇒ 虚胖（freelist 空页 或 主文件没截断）
+        wasted = disk_bytes > used_bytes * 3 // 2
+        if not wasted:
+            return
+        before_mb = disk_bytes / (1024 * 1024)
+        # ① freelist 里堆了空页 ⇒ 先 VACUUM（把空页扔掉）
+        if free_count >= 1000:
+            log.warning(
+                "[聊天室] 账本有大量空页（%d/%d 页，实际只用 %.0f MB，磁盘占 %.0f MB）"
+                "⇒ 正在 VACUUM 瘦身",
+                free_count, page_count, used_bytes / (1024 * 1024), before_mb,
+            )
+            try:
+                conn.execute("VACUUM")
+            except sqlite3.Error as exc:
+                # ⚠️ 另一个 Bot 进程开着这个库时会失败 ⇒ 不当回事
+                log.warning("[聊天室] VACUUM 未能执行（可能有别的进程在用）：%r", exc)
+        # ② ⚠️ **checkpoint(TRUNCATE) 才是真正让磁盘文件缩小的那一步** ——
+        #    WAL 模式下 VACUUM 只写 WAL，主库文件大小不变。
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as exc:
+            log.warning("[聊天室] WAL checkpoint 未完成：%r", exc)
+        try:
+            disk_after = os.path.getsize(self._path)
+        except OSError:
+            disk_after = logical_bytes
+        log.info(
+            "[聊天室] 账本瘦身：%.0f MB → %.0f MB",
+            before_mb, disk_after / (1024 * 1024),
+        )
 
     @staticmethod
     def _log_migration(table: str, added: List[str]) -> None:
@@ -1096,7 +1317,7 @@ class ChatroomLedger:
             return False
 
     def list_timeline(self, room_id: str) -> List[Dict[str, Any]]:
-        """一个房间的时间线（页���要的形状）。
+        """一个房间的时间线（页面要的形状）。
 
         ⚠️ **只收没作废的段与消息**（软作废，见 truncate_from）。
         ⚠️ 消息按段归组；段内按落库顺序（= 群里的发言顺序）。
@@ -1157,7 +1378,10 @@ class ChatroomLedger:
                         str(room.get("mode") or "stage"),
                         str(room.get("group_id") or ""),
                         str(room.get("created_at") or ""),
-                        json.dumps(room.get("config_json") or {}, ensure_ascii=False),
+                        json.dumps(
+                            _decode_config_json(room.get("config_json")),
+                            ensure_ascii=False,
+                        ),
                     ),
                 )
             for member in members:
@@ -1220,6 +1444,14 @@ class ChatroomLedger:
             grouped.setdefault(str(row["room_id"]), []).append(str(row["member_id"]))
         for room in rooms:
             room["member_ids"] = grouped.get(str(room["room_id"]), [])
+            # ⚠️⚠️⚠️ **必须把 config_json 解析回 dict** ——
+            #    不解析 ⇒ 拿到的是**未解码的 TEXT 字符串**，
+            #    下次 save_state 又对它 json.dumps 一次 ⇒ **每轮存/取长度翻倍**。
+            #    实测：原始 "{}" 经过 28 轮往返变成 **512 MiB** 的转义串，
+            #    3 个房间把共享账本撑到 **1.6 GB** ⇒ bootstrap 读账本直接超时
+            #    （实测：timeline 30ms / errors 4.8s / bootstrap 10s ERR）。
+            #    根因是**存/取不对称**：存的时候 dumps，读的时候不 loads。
+            room["config_json"] = _decode_config_json(room.get("config_json"))
         return {
             "rooms": rooms,
             "members": members,
