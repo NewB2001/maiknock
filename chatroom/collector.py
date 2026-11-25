@@ -172,6 +172,19 @@ class ReplyCollector:
         """采一轮。返回新收进账本的条数。"""
         if self._ledger is None or not self._sessions:
             return 0
+        # ⚠️⚠️ **没有待收的投递 ⇒ 不去读群流**。
+        #    没有投递就不可能有新回复 ⇒ 这一轮根本不用发「插件→宿主」的 RPC。
+        #    这把 RPC 量降了约九成 ⇒ 组件调用与回读撞同一条 IPC 通道的概率大幅下降
+        #    （实测：回读每 5 秒一次时，宿主调插件经常 10 秒超时）。
+        try:
+            pending = await self._ledger.run(
+                self._ledger.pending_collect_targets, self._bot_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("[聊天室] 查待收投递失败：%r", exc)
+            return 0
+        if not pending:
+            return 0
         collected = 0
         for session_id, room_id in list(self._sessions.items()):
             fetched = await self._fetch(session_id)
@@ -198,7 +211,7 @@ class ReplyCollector:
                 if not text:
                     continue
                 # 归属段：这条回复回应的是**哪一段**的投递
-                segment_id = await asyncio.to_thread(
+                segment_id = await self._ledger.run(
                     self._ledger.find_delivery_segment,
                     target_bot_id=self._bot_id,
                     room_id=room_id,
@@ -206,14 +219,14 @@ class ReplyCollector:
                 )
                 if not segment_id:
                     # 没有对应的投递（可能是历史消息）⇒ 挂到房间的"未归属"段
-                    segment_id = await asyncio.to_thread(
+                    segment_id = await self._ledger.run(
                         self._ledger.ensure_open_segment, room_id
                     )
                 member_id = self._member_id_for(account)
                 # ⚠️ **写账本必须挪到线程里**：SQLite 写是**同步**的，
                 #    跨进程抢锁时会阻塞插件的**事件循环** ⇒ 宿主调不动组件接口
                 #    ⇒ 页面的查询全部超时（实测踩过：bootstrap / errors / timeline 全挂）。
-                written = await asyncio.to_thread(
+                written = await self._ledger.run(
                     self._ledger.append_message,
                     {
                         "message_id": message_id,
@@ -233,7 +246,7 @@ class ReplyCollector:
                         "[聊天室] 收到回复（Bot %s）：%s", self._bot_id[:12], text[:40]
                     )
         if collected:
-            await asyncio.to_thread(
+            await self._ledger.run(
                 self._ledger.mark_deliveries_collected, self._bot_id
             )
         return collected

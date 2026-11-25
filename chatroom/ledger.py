@@ -29,6 +29,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -263,8 +264,30 @@ class ChatroomLedger:
         self._bot_id = str(bot_id or "")
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = threading.RLock()
+        # ⚠️⚠️ **专属单线程 executor** —— 账本的所有读写都在这**一个**线程里串行做。
+        #    为什么不直接用 asyncio.to_thread：那是**默认线程池**
+        #    （max_workers = min(32, cpu+4)）⇒ 回读一轮 14 条消息 × 2 次账本操作
+        #    = 28 个任务，两个 Bot 的进程各一份 ⇒ **把默认池占满**
+        #    ⇒ 宿主的组件调用（也要线程）排在后面 ⇒ **10 秒超时**（实测）。
+        #    专属单线程 ⇒ 账本访问串行、不占默认池、跨进程写锁争用也最小。
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="chatroom-ledger"
+        )
 
     # ── 身份 ────────────────────────────────────────────────────────────
+
+    async def run(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        """把一个同步的账本操作丢到**专属单线程**上跑（不占默认线程池）。
+
+        ⚠️ 组件调用（宿主→插件）走的是 ``runner_main._invoke_plugin_callable``：
+        **同步函数丢默认线程池、异步函数直接 await** ⇒ 我们的账本操作
+        如果用 ``asyncio.to_thread``，会和组件调用抢同一个池 ⇒ 超时。
+        """
+        import asyncio as _asyncio
+        import functools as _functools
+        return await _asyncio.get_running_loop().run_in_executor(
+            self._executor, _functools.partial(func, *args, **kwargs)
+        )
 
     @property
     def path(self) -> str:
@@ -1004,6 +1027,22 @@ class ChatroomLedger:
                 (segment_id, room_id, seq, _now()),
             )
         return segment_id
+
+    def pending_collect_targets(self, target_bot_id: str) -> List[Dict[str, Any]]:
+        """我这边「已递出但还没收完」的投递任务。
+
+        ⚠️ **回读只在有这些任务时才做** ——
+        没有投递就不可能有新回复 ⇒ 不必去读群流。
+        这把「插件→宿主」的 RPC 量降了约九成 ⇒ 组件调用与回读撞同一条 IPC 通道
+        的概率大幅下降（实测：回读每 5 秒一次 ⇒ 宿主调插件时经常超时）。
+        """
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM delivery WHERE target_bot_id = ? AND state = ?"
+                " ORDER BY seq",
+                (target_bot_id, DELIVERY_DELIVERED),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def mark_deliveries_collected(self, target_bot_id: str) -> int:
         """把该 Bot 已投递完的投递标记为 collected。"""

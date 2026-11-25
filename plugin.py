@@ -571,6 +571,18 @@ class ReplyLengthConfig(PluginConfigBase):
         json_schema_extra={"label": "回复篇幅（一句话选档位）"})
 
 
+class ChatroomCollectConfig(PluginConfigBase):
+    """把 Bot 的回复收进共享账本（聊天室时间线的数据来源）。"""
+
+    __ui_label__ = "回复回收"
+
+    enabled: bool = Field(
+        default=True,
+        description="打开后，聊天室会读各 Bot 虚拟群里的新消息并显示到时间线上。"
+        "关掉 = 只递话不回收（麦麦照样回话，只是聊天室的页面看不到）。",
+        json_schema_extra={"label": "把 Bot 的回复收回来"})
+
+
 class ChatroomSplitterConfig(PluginConfigBase):
     """聊天室里的回复不要被拆成好几个气泡。"""
 
@@ -635,6 +647,8 @@ class ChatroomConfig(PluginConfigBase):
         "每个 Bot 填自己的，不要互相复制。",
         json_schema_extra={"label": "本 Bot 的消息服务 Key"})
 
+    collect: ChatroomCollectConfig = Field(
+        default_factory=ChatroomCollectConfig, description="回复回收")
     splitter: ChatroomSplitterConfig = Field(
         default_factory=ChatroomSplitterConfig, description="回复气泡")
     delivery: ChatroomDeliveryConfig = Field(
@@ -721,6 +735,8 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         self._chatroom_cfg_cache: Optional[Dict[str, Any]] = None
         # 组件调用进行中的计数（回读循环看到它就跳过 ⇒ 避免 IPC 通道互等死锁）
         self._chatroom_api_busy: int = 0
+        # 聊天室后台初始化任务（on_load 不等它 ⇒ Runner 立刻 ready）
+        self._chatroom_boot_task: Optional[asyncio.Task] = None
         # 投递 worker（领单 → 递话 → 回填状态，chatroom/worker.py）
         self._chatroom_worker = None
         # 错误扫描器（把宿主的 429 等硬错误变成用户看得见的提示，chatroom/errorscan.py）
@@ -748,9 +764,19 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 这里只是让迁移 warning 在加载时就打出来，不等第一条消息
         self._detect_legacy_style_guard()
         self._ensure_scan_loop()
-        # 麦麦聊天室：读配置（缓存起来）→ 定位工作区 → 认出自己的 bot_id → 打开共享账本
-        await self._chatroom_refresh_cfg_cache()
-        await self._chatroom_bootstrap()
+        # ⚠️⚠️⚠️ **聊天室的初始化必须放后台，on_load 立刻返回！**
+        #
+        # 宿主的「注册自定义页」阶段会**同步等**插件回一个
+        # `plugin.webui.reload_documents` 的 RPC（宿主 src/webui/routers/plugin/
+        # webui_extensions.py:165 → supervisor.reload_webui_documents）。
+        # 而插件的 recv_loop 要等 Runner 初始化完成才启动
+        # （rpc_client.py:141 在握手之后才 create_task(_recv_loop)）⇒
+        # **插件 on_load 里 await 慢操作 ⇒ 两边互等 ⇒ Runner 永远不 ready**
+        # ⇒ 表现为：health check 一直超时、宿主反复重启 Runner、
+        #            页面的组件调用全部超时（而宿主自己的 API 一切正常）。
+        #
+        # ⇒ 实证：把 webui.json 挪走（没有那个调用）⇒ health check 立刻恢复正常。
+        self._chatroom_boot_task = asyncio.create_task(self._chatroom_bootstrap_bg())
 
     # ------------------------------------------------------------------
     # 麦麦聊天室 · 启动准备
@@ -771,6 +797,19 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             return {}
         cfg = raw.get("chatroom")
         return cfg if isinstance(cfg, dict) else {}
+
+    async def _chatroom_bootstrap_bg(self) -> None:
+        """后台初始化聊天室（读配置 → 定位工作区 → 开账本 → 连网关 → 起循环）。
+
+        ⚠️ **整个过程放在后台 task 里跑**，on_load 不等它 —— 理由见 on_load 处的注释。
+        """
+        try:
+            await self._chatroom_refresh_cfg_cache()
+            await self._chatroom_bootstrap()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock][聊天室] 后台初始化失败：%r", exc)
 
     async def _chatroom_bootstrap(self) -> None:
         """定位工作区 → 认出我是哪个 Bot → 打开共享账本。"""
@@ -906,6 +945,10 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         if self._chatroom_collector is not None:
             return
         if self._chatroom_ledger is None:
+            return
+        cfg = await self._chatroom_config()
+        if not bool((cfg.get("collect") or {}).get("enabled", True)):
+            logger.info("[MaiKnock][聊天室] 回收开关未开，不起回读循环")
             return
         collector = mk_chatroom.collector.ReplyCollector(
             self.ctx, self._chatroom_ledger, self._chatroom_bot_id

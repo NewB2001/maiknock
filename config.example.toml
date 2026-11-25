@@ -42,7 +42,7 @@ enabled = false               # 聊天室的回复整条一个气泡（只影响
 enabled = false               # 把台词递进虚拟群（关掉=界面照常但麦麦不接话）
 
 [chatroom.collect]
-enabled = false               # 把 Bot 的回复收回来显示到时间线
+enabled = true                # 把 Bot 的回复收回来显示到时间线
 
 # 说明：扫描间隔、回读参数、重生上限等内部机制项不出现在 WebUI 配置页，
 # 代码内置同值默认；旧 config.toml 里残留的键会被忽略、不报错。

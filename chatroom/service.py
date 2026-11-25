@@ -142,8 +142,7 @@ class ChatroomService:
         #    会**阻塞插件的事件循环** ⇒ 宿主调不动插件的组件接口 ⇒
         #    页面的查询全部超时（实测：bootstrap / errors / timeline 全挂，
         #    宿主日志同时出现「Runner 健康检查失败」）。
-        import asyncio as _asyncio
-        await _asyncio.to_thread(self.persist_state)
+        await self.persist_state()
         return False
 
     async def persist_state(self) -> None:
@@ -156,7 +155,7 @@ class ChatroomService:
         if ledger is None:
             return
         try:
-            await _asyncio.to_thread(
+            await ledger.run(
                 ledger.save_state,
                 {
                     "rooms": self._rooms,
@@ -179,9 +178,12 @@ class ChatroomService:
         宿主同时报「Runner 健康检查失败」）。
         ⚠️ 只挪**读**不够，写同理（已在 persist_state / collector 里挪了）。
         """
-        import asyncio as _asyncio
-        import functools as _functools
+        ledger = self._ledger()
         try:
+            if ledger is not None and hasattr(ledger, "run"):
+                return await ledger.run(func, *args, **kwargs)
+            import asyncio as _asyncio
+            import functools as _functools
             return await _asyncio.to_thread(_functools.partial(func, *args, **kwargs))
         except Exception:  # noqa: BLE001
             return None
