@@ -30,6 +30,9 @@ from .mock_data import (
     STICKER_POOL,
     _build_segment,
 )
+from .hostinfo import read_bot_config, read_bots
+from .identity import DEFAULT_PLATFORM
+from .roster import build_roster
 
 # 聊天室子模块自己的版本号（插件总版本见 plugin.py 的 VERSION 常量）
 CHATROOM_VERSION = "0.1.0"
@@ -84,8 +87,15 @@ class ChatroomService:
                 peers.append(member)
         return peers
 
-    def _managed_bot_list(self) -> List[Dict[str, Any]]:
-        """宿主受管 Bot 列表（私聊对象的可选范围）。"""
+    async def _managed_bot_list(self) -> List[Dict[str, Any]]:
+        """宿主受管 Bot 列表（私聊对象的可选范围）。
+
+        - **real 模式**：真名单（registry 的名单层 + 账本里各实例自报的握手/风格层），
+          附**四态**；
+        - **mock 模式**：壳阶段的假名单（写死 5 个）。
+        """
+        if await self._data_source() == "real":
+            return await self._real_managed_bot_list()
         pool = self._member_map()
         items = []
         for bot in MANAGED_BOTS:
@@ -97,6 +107,59 @@ class ChatroomService:
                     "peer_member_id": bot["peer_member_id"],
                     "peer_name": peer["display_name"] if peer else bot["bot_name"],
                     "added": bot["peer_member_id"] in self._peer_order,
+                }
+            )
+        return items
+
+    # ---- 真实名单（real 模式）-------------------------------------------
+
+    def _workspace(self):
+        """工作区根（从插件实例拿；拿不到就返回 None）。"""
+        return getattr(self._plugin, "_chatroom_workspace", None)
+
+    def _ledger(self):
+        """共享账本（从插件实例拿）。"""
+        return getattr(self._plugin, "_chatroom_ledger", None)
+
+    def _real_roster(self) -> List[Dict[str, Any]]:
+        """真实受管 Bot 名单 = registry（名单层）+ 账本里各实例自报的状态。
+
+        ⚠️ 读不到工作区或账本就返回空列表 —— 调用方据此回落到 mock，
+        **不抛异常**（聊天室的毛病不该把页面搞崩）。
+        """
+        workspace = self._workspace()
+        ledger = self._ledger()
+        if workspace is None or ledger is None:
+            return []
+        try:
+            bots = read_bots(workspace)
+            statuses = ledger.list_bot_status()
+        except Exception:  # noqa: BLE001
+            return []
+        return build_roster(bots, statuses)
+
+    async def _real_managed_bot_list(self) -> List[Dict[str, Any]]:
+        """真实模式下的「受管 Bot 列表」。
+
+        每一项都带**四态**（ready / gateway_off / stopped / style_unfixed）——
+        页面把状态放在**头像悬停提示**里（不占列）。
+        """
+        items: List[Dict[str, Any]] = []
+        pool = self._member_map()
+        for entry in self._real_roster():
+            member_id = f"bot_{entry['bot_id']}"
+            peer = pool.get(member_id)
+            items.append(
+                {
+                    "bot_id": entry["bot_id"],
+                    "bot_name": entry["bot_name"],
+                    "peer_member_id": member_id,
+                    "peer_name": peer["display_name"] if peer else entry["bot_name"],
+                    "status": entry["status"],
+                    "status_label": entry["status_label"],
+                    "selectable": entry["selectable"],
+                    "detail": entry["detail"],
+                    "added": member_id in self._peer_order,
                 }
             )
         return items
@@ -125,21 +188,42 @@ class ChatroomService:
         return ordered
 
     async def _load_bot_profile(self, bot_id: str) -> Optional[Dict[str, Any]]:
-        """【下一阶段的接口占位】从 Bot 自己的配置里读显示名 / 头像 / 人格标签。
+        """从 Bot 自己的配置里读显示名 / 人格标签。
 
-        壳阶段**故意不实现**：按交接提示词的铁律，壳里不得出现真实调用宿主接口、
-        不得读写 Bot 的数据目录。这里返回 None，调用方就回落到候选池里的假数据。
+        - **real 模式**：读该 Bot 自己的 ``config/bot_config.toml`` ——
+          ``[bot].nickname`` 是它自称的名字（麦麦一号那边是「日向雏田」，
+          这才是聊天室该显示的**角色名**，不是实例名「麦麦一号」），
+          ``[personality].personality`` 是人格描述。
+        - **mock 模式**：**不读**（壳阶段铁律：演示阶段不碰 Bot 的配置），返回 None，
+          调用方回落到候选池里的假数据。
 
-        下一阶段接真数据时，这里应该读：
-          * 显示名 / 人格标签 → 该 Bot 的 ``config/bot_config.toml``
-            （``[bot.personality]`` 一类的字段）
-          * 头像 → 同一份配置里的头像路径，或 ``data/avatar/`` 下的缓存文件
+        ⚠️ 02 文档 8.1 的边界表把「各 Bot 的人格 / 显示名 / 头像」列在**只读**里 ⇒
+        读它没问题，**写**才是越界。
 
         返回值形状（约定）：``{"display_name": str, "avatar": str, "persona_label": str}``，
         字段可以缺；返回 None 表示「读不到，用兜底值」。
         """
-        del bot_id
-        return None
+        if await self._data_source() != "real":
+            return None
+        workspace = self._workspace()
+        if workspace is None:
+            return None
+        entry = next((e for e in self._real_roster() if e["bot_id"] == bot_id), None)
+        if entry is None:
+            return None
+        try:
+            cfg = read_bot_config(workspace, entry["directory"])
+        except Exception:  # noqa: BLE001
+            return None
+        if not cfg:
+            return None
+        profile: Dict[str, Any] = {}
+        if cfg.get("nickname"):
+            profile["display_name"] = str(cfg["nickname"])
+        persona = str(cfg.get("personality") or "")
+        if persona:
+            profile["persona_label"] = persona[:24]
+        return profile or None
 
     async def _resolve_member(self, member: Dict[str, Any]) -> Dict[str, Any]:
         """Bot 群员的显示名 / 头像 / 人格标签优先从它自己的配置里读。
@@ -212,19 +296,23 @@ class ChatroomService:
         return lines
 
     async def shell_bootstrap(self) -> Dict[str, Any]:
-        """一次性拉取页面需要的全部初始假数据。"""
+        """一次性拉取页面需要的全部初始数据。"""
+        source = await self._data_source()
+        # ⚠️ **顺序要紧**：先按数据源同步群员，再组装 member_pool ——
+        #    否则返回的还是同步**之前**的旧名单（假 Bot 还在、真 Bot 没建）。
+        await self._sync_real_members()
+        await self._refresh_peer_status()
         pool = []
         for member in self._member_pool():
             pool.append(await self._resolve_member(member))
-        source = await self._data_source()
         return {
             "version": CHATROOM_VERSION,
             "stage": "shell" if source == "mock" else "real",
-            "notice": self._notice(source),
+            "notice": self._notice(source, await self._chatroom_cfg()),
             "member_pool": pool,
             "my_roles": self._my_role_list(),
             "peers": self._peer_list(),
-            "managed_bots": self._managed_bot_list(),
+            "managed_bots": await self._managed_bot_list(),
             "narrator": NARRATOR,
             "rooms": self._rooms,
             "timeline": self._seeded_timeline(),
@@ -267,14 +355,30 @@ class ChatroomService:
         return source if source in ("mock", "real") else "mock"
 
     @staticmethod
-    def _notice(source: str) -> str:
-        """页面顶部那句提示 —— 必须跟当前数据源一致，不能说假话。"""
-        if source == "real":
-            return "正式模式：台词会真的递进各 Bot 的虚拟群，回复是麦麦真说的。"
-        return (
-            "演示模式：本页所有内容都是假数据（Mock）。"
-            "不连接 maim 网关、不读写任何 Bot 数据、不做任何消息处理。"
-        )
+    def _notice(source: str, cfg: Optional[Dict[str, Any]] = None) -> str:
+        """页面顶部那句提示 —— **必须跟当前实际状态一致，不能说假话**。
+
+        ⚠️ 正式模式也不是"全都真了"：递送（delivery）与回收（collect）各有各的开关，
+        提示语要照着**实际开着哪些**来说，别一律喊"正式模式"。
+        """
+        if source != "real":
+            return (
+                "演示模式：本页所有内容都是假数据（Mock）。"
+                "不连接 maim 网关、不读写任何 Bot 数据、不做任何消息处理。"
+            )
+        cfg = cfg or {}
+        delivery = bool((cfg.get("delivery") or {}).get("enabled"))
+        collect = bool((cfg.get("collect") or {}).get("enabled"))
+        parts = ["正式模式：受管 Bot 名单与接入状态是真的"]
+        if delivery and collect:
+            parts.append("台词会真的递进各 Bot 的虚拟群，回复是麦麦真说的")
+        elif delivery:
+            parts.append("台词会真的递进各 Bot 的虚拟群（回复回收还没接上）")
+        elif collect:
+            parts.append("回复回收已接上（台词递送还没接上）")
+        else:
+            parts.append("台词递送与回复回收都还没接上")
+        return "；".join(parts) + "。"
 
     async def shell_rooms(self) -> Dict[str, Any]:
         """单独刷新房间列表用。"""
@@ -328,9 +432,15 @@ class ChatroomService:
     async def shell_add_peer(self, bot_id: str) -> Dict[str, Any]:
         """把宿主**受管 Bot**加进上游「私聊对象」。
 
-        可选范围只有受管 Bot（麦麦一号 / 麦麦二号）—— 不能凭空造一个没有的 Bot。
+        可选范围只有受管 Bot —— 不能凭空造一个没有的 Bot。
         已经加过的会明确告诉你。
+
+        - **real 模式**：从真实名单里挑，并**按需建群员**（显示名取它自己的
+          ``[bot].nickname``，即角色名而不是实例名）；
+        - **mock 模式**：壳阶段的假名单。
         """
+        if await self._data_source() == "real":
+            return await self._real_add_peer(bot_id)
         target = next((item for item in MANAGED_BOTS if item["bot_id"] == bot_id), None)
         if target is None:
             return {"ok": False, "error": f"这不是受管 Bot：{bot_id}"}
@@ -346,10 +456,132 @@ class ChatroomService:
         return {
             "ok": True,
             "peers": self._peer_list(),
-            "managed_bots": self._managed_bot_list(),
+            "managed_bots": await self._managed_bot_list(),
             "member_pool": [await self._resolve_member(item) for item in self._member_pool()],
             "created": member,
         }
+
+    async def _real_add_peer(self, bot_id: str) -> Dict[str, Any]:
+        """real 模式：把真实名单里的某个 Bot 加进「私聊对象」（**按需建群员**）。"""
+        entry = next((e for e in self._real_roster() if e["bot_id"] == bot_id), None)
+        if entry is None:
+            return {"ok": False, "error": f"这不是受管 Bot：{bot_id}"}
+        if not entry["selectable"]:
+            return {
+                "ok": False,
+                "error": f"{entry['bot_name']} 现在不可接入（{entry['status_label']}）",
+            }
+        member_id = f"bot_{bot_id}"
+        if member_id in self._peer_order:
+            return {"ok": False, "error": f"{entry['bot_name']} 已经在私聊对象里了"}
+        profile = await self._load_bot_profile(bot_id) or {}
+        member = {
+            "member_id": member_id,
+            "kind": "bot",
+            "display_name": profile.get("display_name") or entry["bot_name"],
+            "persona_label": profile.get("persona_label") or entry["bot_name"],
+            "sort_order": 100 + len(self._peer_order),
+            "status": entry["status"],
+            "status_label": entry["status_label"],
+            "bot_id": bot_id,
+            "bot_name": entry["bot_name"],
+            "platform": DEFAULT_PLATFORM,
+            "account": f"bot.{bot_id}",
+            "avatar": "🤖",
+            "editable": False,
+            "custom": True,
+        }
+        self._members[member_id] = member
+        self._peer_order.append(member_id)
+        return {
+            "ok": True,
+            "peers": self._peer_list(),
+            "managed_bots": await self._managed_bot_list(),
+            "member_pool": [await self._resolve_member(item) for item in self._member_pool()],
+            "created": member,
+        }
+
+    async def _refresh_peer_status(self) -> None:
+        """按真实名单刷新各 Bot 群员的状态（页面拿的是群员上的 status）。"""
+        if await self._data_source() != "real":
+            return
+        pool = self._member_map()
+        for entry in self._real_roster():
+            member = pool.get(f"bot_{entry['bot_id']}")
+            if member is None:
+                continue
+            member["status"] = entry["status"]
+            member["status_label"] = entry["status_label"]
+
+    async def _sync_real_members(self) -> None:
+        """real 模式：**Bot 群员以真实名单为准**重建。
+
+        三件事：
+        1. **同一个 bot_id 的**就地更新（保持 member_id 不变 ⇒ 房间里已有的引用不失效）；
+        2. **名单里没有的**（壳阶段那些指向假 bot_id / 已不存在的 bot_id 的 Bot）
+           从登记表、上游名单、房间成员里**摘掉** —— 留着就是拿一个不存在的 Bot 充数，
+           界面上会出现同名角色出现两次；
+        3. **名单里新增的**建一个新成员（显示名取它自己的 ``[bot].nickname``，
+           也就是角色名而不是实例名）。
+
+        ⚠️ 「我的角色」（我自建的）不受影响 —— 那是用户自己的角色，不归宿主管。
+        """
+        if await self._data_source() != "real":
+            return
+        roster = self._real_roster()
+        if not roster:
+            return
+        pool = self._member_map()
+        real_by_bot_id = {str(entry["bot_id"]): entry for entry in roster}
+
+        # ① 摘掉名单里没有的 Bot 成员
+        stale = [
+            member_id
+            for member_id, member in pool.items()
+            if member.get("kind") == "bot"
+            and str(member.get("bot_id") or "") not in real_by_bot_id
+        ]
+        for member_id in stale:
+            pool.pop(member_id, None)
+            self._peer_order = [item for item in self._peer_order if item != member_id]
+            for room in self._rooms:
+                if member_id in room.get("member_ids", []):
+                    room["member_ids"].remove(member_id)
+
+        # ② 名单里的 Bot：能对上就更新，对不上就新建
+        for entry in roster:
+            bot_id = str(entry["bot_id"])
+            profile = await self._load_bot_profile(bot_id) or {}
+            existing = next(
+                (
+                    member
+                    for member in pool.values()
+                    if member.get("kind") == "bot" and str(member.get("bot_id") or "") == bot_id
+                ),
+                None,
+            )
+            member_id = existing["member_id"] if existing else f"bot_{bot_id}"
+            member = existing or {
+                "member_id": member_id,
+                "kind": "bot",
+                "sort_order": 100 + len(self._peer_order),
+                "avatar": "🤖",
+                "editable": False,
+                "custom": True,
+            }
+            member.update(
+                {
+                    "display_name": profile.get("display_name") or entry["bot_name"],
+                    "persona_label": profile.get("persona_label") or entry["bot_name"],
+                    "bot_id": bot_id,
+                    "bot_name": entry["bot_name"],
+                    "platform": DEFAULT_PLATFORM,
+                    "account": f"bot.{bot_id}",
+                    "status": entry["status"],
+                    "status_label": entry["status_label"],
+                }
+            )
+            pool[member_id] = member
 
     async def shell_delete_peer(self, member_id: str) -> Dict[str, Any]:
         """从「私聊对象」里删掉一个 Bot（也会从各房间的成员名单里移除）。"""
@@ -370,7 +602,7 @@ class ChatroomService:
         return {
             "ok": True,
             "peers": self._peer_list(),
-            "managed_bots": self._managed_bot_list(),
+            "managed_bots": await self._managed_bot_list(),
             "rooms": self._rooms,
             "member_pool": [await self._resolve_member(item) for item in self._member_pool()],
         }

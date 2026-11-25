@@ -28,8 +28,10 @@ from __future__ import annotations
 
 from typing import Any
 
-# 这三个子模块**只依赖标准库** ⇒ 直接导入，不走惰性
-from . import hostinfo, ledger, mock_data, service
+# 这几个子模块**只依赖标准库** ⇒ 直接导入，不走惰性
+from . import gateway, hostinfo, identity, ledger, mock_data, service
+from .gateway import GatewayPool, MaimConnection, build_envelope
+from .identity import session_id_for_group, virtual_group_id
 from .ledger import ChatroomLedger
 from .service import ChatroomService
 
@@ -37,11 +39,18 @@ __all__ = [
     "ChatroomApiMixin",
     "ChatroomLedger",
     "ChatroomService",
+    "GatewayPool",
+    "MaimConnection",
     "api_mixin",
+    "build_envelope",
+    "gateway",
     "hostinfo",
+    "identity",
     "ledger",
     "mock_data",
     "service",
+    "session_id_for_group",
+    "virtual_group_id",
 ]
 
 

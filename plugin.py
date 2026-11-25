@@ -715,6 +715,8 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         self._chatroom_bot_name: str = ""
         # 工作区根（Path 或 None）
         self._chatroom_workspace = None
+        # maim 网关连接池（跨 Bot 递话的通道，chatroom/gateway.py）
+        self._chatroom_gateway = None
 
     # ---- 生命周期（B-2：宿主只调用 on_load/on_unload/on_config_update）----
 
@@ -799,6 +801,94 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             self._chatroom_bot_name or "（未命名）", self._chatroom_bot_id[:12] or "（空）",
             ledger_path, workspace,
         )
+        await self._chatroom_gateway_bootstrap(cfg)
+
+    async def _chatroom_gateway_bootstrap(self, cfg: Dict[str, Any]) -> None:
+        """连上**本 Bot 自己**的 maim 网关（接入校验的**握手层**）。
+
+        ⚠️ **只连自己**：方案 B（各 Bot 的代理实例各递各的）下，每个实例只需要
+        知道自己那个 Bot 的 key —— 别的 Bot 的 key 根本不该出现在本进程里
+        （凭据隔离）。别的 Bot 的状态由它们各自的实例写进共享账本。
+
+        ⚠️ 聊天室总开关关着时**不连**（保持出厂状态什么都不碰）。
+        """
+        if not bool(cfg.get("enabled")):
+            logger.info("[MaiKnock][聊天室] 总开关未开，不连消息网关（出厂状态）")
+            return
+        api_key = str(cfg.get("api_key") or "").strip()
+        if not api_key:
+            logger.warning("[MaiKnock][聊天室] 没配 api_key，跳过握手（接入校验的握手层会判为未就绪）")
+            return
+        port = mk_chatroom.hostinfo.read_webui_port(self._chatroom_workspace)
+        pool = mk_chatroom.GatewayPool(host="127.0.0.1", port=port)
+        pool.set_api_key(self._chatroom_bot_id, api_key)
+        self._chatroom_gateway = pool
+        conn = await pool.get(self._chatroom_bot_id)
+        if conn is None or not conn.connected:
+            reason = (conn.last_error if conn else "未知原因") or "未知原因"
+            logger.warning("[MaiKnock][聊天室] 握手层未通过（Bot %s）：%s", self._chatroom_bot_id[:12], reason)
+            return
+        await conn.start_keepalive()
+        logger.info(
+            "[MaiKnock][聊天室] 握手层通过：已连上 %s 的消息网关（%s）",
+            self._chatroom_bot_id[:12], conn.endpoint(),
+        )
+        await self._chatroom_report_status()
+
+    async def _chatroom_style_fixed(self) -> Optional[bool]:
+        """本 Bot 的说话风格是否已按敲门侧固化。
+
+        **判定口径**：F4 小说体格式守卫在生效（``style_guard.enabled = true``）
+        ⇒ 风格已固化；关掉 ⇒ 未固化；读不到 ⇒ 不知道（返回 None）。
+
+        02 文档 8.4 第 3 条：「具体怎么判定由**敲门侧**提供结果，聊天室只认这个结果、
+        不关心实现」—— 这里就是敲门侧，判定口径由本插件自己给。
+        """
+        try:
+            raw = await self._plugin_config()
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(raw, dict):
+            return None
+        cfg = raw.get("style_guard")
+        if not isinstance(cfg, dict):
+            return None
+        try:
+            effective = self._effective_style_guard(cfg)
+        except Exception:  # noqa: BLE001
+            return None
+        return bool(effective.get("enabled", True))
+
+    async def _chatroom_report_status(self) -> None:
+        """把**本实例**的接入状态写进共享账本（各 Bot 自报，中控汇总）。"""
+        ledger = self._chatroom_ledger
+        if ledger is None or not self._chatroom_bot_id:
+            return
+        pool = self._chatroom_gateway
+        handshake_ok: Optional[bool] = None
+        detail = ""
+        if pool is not None:
+            rows = [row for row in pool.status() if row.get("bot_id") == self._chatroom_bot_id]
+            if rows:
+                handshake_ok = bool(rows[0].get("connected"))
+                detail = str(rows[0].get("error") or "")
+        style_fixed = await self._chatroom_style_fixed()
+        status = "ready"
+        if handshake_ok is False:
+            status = "gateway_off"
+        elif style_fixed is False:
+            status = "style_unfixed"
+        try:
+            ledger.set_bot_status(
+                self._chatroom_bot_id,
+                status,
+                name=self._chatroom_bot_name,
+                detail=detail,
+                handshake_ok=handshake_ok,
+                style_fixed=style_fixed,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock][聊天室] 写接入状态失败：%r", exc)
 
     def _check_version_consistency(self) -> None:
         """版本号一致性自检（审计 A-3）。
@@ -899,6 +989,12 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[MaiKnock][聊天室] 关闭共享账本时出错：%r", exc)
             self._chatroom_ledger = None
+        if self._chatroom_gateway is not None:
+            try:
+                await self._chatroom_gateway.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[MaiKnock][聊天室] 关闭消息网关连接时出错：%r", exc)
+            self._chatroom_gateway = None
         logger.info("[MaiKnock] 已卸载")
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:

@@ -1157,7 +1157,8 @@
   var STATUS_TEXT = {
     ready: "可接入",
     gateway_off: "未启用网关",
-    stopped: "未运行"
+    stopped: "未运行",
+    style_unfixed: "风格未固化"
   };
 
   function memberById(id) {
@@ -1633,6 +1634,10 @@
     }
     if (member.status === "gateway_off") {
       return "名单层：Bot 在册；握手层：maim 网关未启用或 key 不对 → 去 bot_config.toml 的 [maim_message] 打开";
+    }
+    if (member.status === "style_unfixed") {
+      return "名单层：Bot 运行中；握手层：maim 网关已连通 → 可以接入。\n"
+        + "风格层：说话风格还没按麦麦敲门的要求固化 → 建议先在敲门侧固化风格再接入（不拦你）";
     }
     return "名单层：Bot 已停止 → 先在机器人管理里启动它";
   }

@@ -153,6 +153,20 @@ SCHEMA: Tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_delivery_target ON delivery(target_bot_id, state)",
+    # ── 各 Bot 自报的接入状态（接入校验的握手层 / 风格层）──────────────
+    # ⚠️ **每个实例只写自己那一行** —— 别的 Bot 的 api_key 不在本进程里，
+    #    也就没法替别人测握手；中控把各行合起来算四态。
+    """
+    CREATE TABLE IF NOT EXISTS bot_status (
+        bot_id       TEXT PRIMARY KEY,
+        name         TEXT NOT NULL DEFAULT '',
+        status       TEXT NOT NULL DEFAULT '',
+        detail       TEXT NOT NULL DEFAULT '',
+        handshake_ok INTEGER,                 -- 1/0/NULL（NULL = 还没上报）
+        style_fixed  INTEGER,                 -- 1/0/NULL
+        updated_at   TEXT NOT NULL DEFAULT ''
+    )
+    """,
 )
 
 
@@ -694,6 +708,61 @@ class ChatroomLedger:
                 (DELIVERY_CANCELLED, room_id, DELIVERY_PENDING),
             )
             return int(cur.rowcount or 0)
+
+
+# ── 各 Bot 的接入状态（自报）───────────────────────────────────────
+
+    def set_bot_status(
+        self,
+        bot_id: str,
+        status: str,
+        *,
+        name: str = "",
+        detail: str = "",
+        handshake_ok: Optional[bool] = None,
+        style_fixed: Optional[bool] = None,
+    ) -> None:
+        """登记**本实例**的接入状态。
+
+        ⚠️ 只写自己那一行 —— 别的 Bot 的握手要在它们自己的进程里测
+        （api_key 不该跨 Bot 流通）。
+        """
+        with self.write() as conn:
+            conn.execute(
+                "INSERT INTO bot_status(bot_id, name, status, detail, handshake_ok,"
+                " style_fixed, updated_at) VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(bot_id) DO UPDATE SET name=excluded.name, status=excluded.status,"
+                " detail=excluded.detail, handshake_ok=excluded.handshake_ok,"
+                " style_fixed=excluded.style_fixed, updated_at=excluded.updated_at",
+                (
+                    str(bot_id), str(name), str(status), str(detail),
+                    None if handshake_ok is None else int(bool(handshake_ok)),
+                    None if style_fixed is None else int(bool(style_fixed)),
+                    _now(),
+                ),
+            )
+
+    def get_bot_status(self, bot_id: str) -> Optional[Dict[str, Any]]:
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM bot_status WHERE bot_id = ?", (bot_id,)
+            ).fetchone()
+        return _status_row_to_dict(row) if row else None
+
+    def list_bot_status(self) -> List[Dict[str, Any]]:
+        """所有 Bot 自报的状态（没上报过的不会出现在这里）。"""
+        with self.read() as conn:
+            rows = conn.execute("SELECT * FROM bot_status ORDER BY bot_id").fetchall()
+        return [_status_row_to_dict(row) for row in rows]
+
+
+def _status_row_to_dict(row: Any) -> Dict[str, Any]:
+    """``bot_status`` 行 → dict（把 1/0 还原成 True/False/None）。"""
+    data = dict(row)
+    for field in ("handshake_ok", "style_fixed"):
+        value = data.get(field)
+        data[field] = None if value is None else bool(value)
+    return data
 
 
 def _is_locked(exc: Exception) -> bool:

@@ -153,8 +153,80 @@ def default_ledger_path(workspace_root: Path) -> str:
     return str(Path(workspace_root) / "maichat" / "chatroom.db")
 
 
+def read_webui_port(workspace_root: Path, default: int = 8001) -> int:
+    """读宿主 WebUI 的端口（maim 网关挂在同一个端口上）。
+
+    端口在 ``<工作区>/host/config.toml`` 的 ``[webui].port``
+    （默认 8001）—— **不要写死**，用户改过端口就会连错。
+    读不到就退回默认值。
+    """
+    path = Path(workspace_root) / HOST_DIR_NAME / "config.toml"
+    if not path.is_file():
+        return default
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return default
+    in_webui = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("["):
+            in_webui = line.split("#", 1)[0].strip() == "[webui]"
+            continue
+        if not in_webui or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() != "port":
+            continue
+        try:
+            return int(value.split("#", 1)[0].strip())
+        except ValueError:
+            continue
+    return default
+
+
 def ensure_parent_dir(db_path: str) -> None:
     """确保账本文件的父目录存在（不存在就建）。"""
     parent = os.path.dirname(os.path.abspath(str(db_path)))
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
+
+
+def bot_config_path(workspace_root: Path, directory: str) -> Path:
+    """某个 Bot 的 ``config/bot_config.toml`` 路径。"""
+    return bot_working_dir(workspace_root, directory) / "config" / "bot_config.toml"
+
+
+def read_bot_config(workspace_root: Path, directory: str) -> Dict[str, Any]:
+    """读某个 Bot 的 ``bot_config.toml``（**只读**，读不到返回空 dict）。
+
+    ⚠️ 02 文档 8.1 的边界表把「各 Bot 的人格 / 显示名 / 头像」列在**只读**里 ⇒
+    读它没问题，**写**才是越界。
+    """
+    path = bot_config_path(workspace_root, directory)
+    if not path.is_file():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    data: Dict[str, Any] = {}
+    try:
+        import tomllib
+
+        data = tomllib.loads(text)
+    except Exception:  # noqa: BLE001
+        try:
+            import tomli
+
+            data = tomli.loads(text)
+        except Exception:  # noqa: BLE001
+            return {}
+    bot = data.get("bot") if isinstance(data.get("bot"), dict) else {}
+    personality = data.get("personality") if isinstance(data.get("personality"), dict) else {}
+    return {
+        "nickname": str(bot.get("nickname") or ""),
+        "alias_names": list(bot.get("alias_names") or []),
+        "personality": str(personality.get("personality") or ""),
+        "reply_style": str(personality.get("reply_style") or ""),
+    }
