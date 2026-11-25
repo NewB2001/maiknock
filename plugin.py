@@ -707,6 +707,14 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         self._f4_raw_cache: Optional[Tuple[float, Dict[str, Any]]] = None
         # 旧格式 [style_guard.blocks] 接管的 warning 去重指纹（值组合变了才再打）
         self._f4_legacy_warn_key: Optional[Tuple[Optional[bool], Optional[bool]]] = None
+        # ── 麦麦聊天室（S1 起的合并部分）────────────────────────────────
+        # 共享账本（跨 Bot 交换消息的唯一载体，chatroom/ledger.py）
+        self._chatroom_ledger = None
+        # 我是哪个 Bot（从工作区 registry 反查，chatroom/hostinfo.py）
+        self._chatroom_bot_id: str = ""
+        self._chatroom_bot_name: str = ""
+        # 工作区根（Path 或 None）
+        self._chatroom_workspace = None
 
     # ---- 生命周期（B-2：宿主只调用 on_load/on_unload/on_config_update）----
 
@@ -726,6 +734,71 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 这里只是让迁移 warning 在加载时就打出来，不等第一条消息
         self._detect_legacy_style_guard()
         self._ensure_scan_loop()
+        # 麦麦聊天室：定位工作区 → 认出自己的 bot_id → 打开共享账本
+        await self._chatroom_bootstrap()
+
+    # ------------------------------------------------------------------
+    # 麦麦聊天室 · 启动准备
+    #
+    # ⚠️ **任何一步失败都只记日志、不抛异常** —— 聊天室不可用不该把敲门带下水。
+    # ⚠️ 账本在**加载时就打开并建表**：路径不对、权限不够、目录不存在这类问题
+    #    应当在日志里当场暴露，而不是等到 S5 递话时才发现。
+    # ------------------------------------------------------------------
+
+    async def _chatroom_config(self) -> Dict[str, Any]:
+        """读插件配置的 [chatroom] 段（读不到就返回空 dict ⇒ 全走默认）。"""
+        try:
+            raw = await self._plugin_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock][聊天室] 读取配置失败，走默认值：%r", exc)
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        cfg = raw.get("chatroom")
+        return cfg if isinstance(cfg, dict) else {}
+
+    async def _chatroom_bootstrap(self) -> None:
+        """定位工作区 → 认出我是哪个 Bot → 打开共享账本。"""
+        if mk_chatroom is None:
+            logger.warning("[MaiKnock][聊天室] 子包未加载，聊天室不可用")
+            return
+        data_dir = getattr(getattr(self.ctx, "paths", None), "data_dir", None)
+        if data_dir is None:
+            logger.warning("[MaiKnock][聊天室] 拿不到插件数据目录，聊天室不可用")
+            return
+        workspace = mk_chatroom.hostinfo.find_workspace_root(Path(data_dir))
+        if workspace is None:
+            logger.warning(
+                "[MaiKnock][聊天室] 找不到工作区根（从 %s 向上找 %s/%s 失败），聊天室不可用",
+                data_dir, mk_chatroom.hostinfo.HOST_DIR_NAME, mk_chatroom.hostinfo.REGISTRY_FILE_NAME,
+            )
+            return
+        self._chatroom_workspace = workspace
+        me = mk_chatroom.hostinfo.resolve_self_bot(workspace, Path(data_dir))
+        if me is None:
+            logger.warning("[MaiKnock][聊天室] 认不出自己是哪个 Bot（registry 里没有匹配的工作目录），聊天室不可用")
+            return
+        self._chatroom_bot_id = str(me.get("bot_id") or "")
+        self._chatroom_bot_name = str(me.get("name") or "")
+
+        cfg = await self._chatroom_config()
+        ledger_path = str(cfg.get("ledger_path") or "").strip()
+        if not ledger_path:
+            # ⚠️ 默认路径由**工作区根**推导 ⇒ 一号二号拿到的是**同一个路径**
+            #    （`<工作区>/maichat/chatroom.db`），不用人工对齐。
+            ledger_path = mk_chatroom.hostinfo.default_ledger_path(workspace)
+        try:
+            ledger = mk_chatroom.ChatroomLedger(ledger_path, bot_id=self._chatroom_bot_id)
+            ledger.open()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[MaiKnock][聊天室] 打开共享账本失败（%s）：%r", ledger_path, exc)
+            return
+        self._chatroom_ledger = ledger
+        logger.info(
+            "[MaiKnock][聊天室] 已就绪：我是 %s（bot_id=%s），账本=%s，工作区=%s",
+            self._chatroom_bot_name or "（未命名）", self._chatroom_bot_id[:12] or "（空）",
+            ledger_path, workspace,
+        )
 
     def _check_version_consistency(self) -> None:
         """版本号一致性自检（审计 A-3）。
@@ -820,6 +893,12 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         if self._scan_task is not None and not self._scan_task.done():
             self._scan_task.cancel()
             logger.info("[MaiKnock] 卸载时取消了扫描循环任务")
+        if self._chatroom_ledger is not None:
+            try:
+                self._chatroom_ledger.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[MaiKnock][聊天室] 关闭共享账本时出错：%r", exc)
+            self._chatroom_ledger = None
         logger.info("[MaiKnock] 已卸载")
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
