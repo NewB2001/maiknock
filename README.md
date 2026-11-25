@@ -213,4 +213,4 @@ A：检查兼容范围（1.3.11 ~ 1.4.x）。1.4.8 上 replyer 侧只有一个 b
 
 ---
 
-*Made with ❤️ for 麦麦。*
+*Made with ❤️ for WorkBuddy。*
