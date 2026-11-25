@@ -137,8 +137,9 @@ class ChatroomService:
             self._my_role_order = list(state.get("my_role_order") or [])
             self._peer_order = list(state.get("peer_order") or [])
             return True
-        # 第一次：把出厂假数据写进账本（此后以账本为准）
-        await self.persist_state()
+        # ⚠️ 这里**不写账本**：第一次写账本必须由调用方在
+        #    「按真实名单清理完假 Bot」之后做 —— 否则账本里会存下
+        #    一份带假 Bot 的出厂数据（那次写入早于清理 ⇒ 假 Bot 永远留在账本里）。
         return False
 
     async def persist_state(self) -> None:
@@ -357,11 +358,15 @@ class ChatroomService:
     async def shell_bootstrap(self) -> Dict[str, Any]:
         """一次性拉取页面需要的全部初始数据。"""
         source = await self._data_source()
-        # ⚠️ 先恢复持久化状态（重载不丢房间与群员），再按真实名单同步 Bot 成员
+        # ⚠️ **顺序要紧**（real 模式）：
+        #    ① 先从账本恢复（重载不丢房间与群员）
+        #    ② 再按真实名单同步 Bot 成员（清掉壳阶段的假 Bot、建真 Bot）
+        #    ③ 最后写回账本（账本为空时，这一步就是「迁移」——
+        #       写进去的是**清理后**的状态，不会把假 Bot 存进去）
         await self.restore_state()
-        # ⚠️ **顺序要紧**：先按数据源同步群员，再组装 member_pool ——
-        #    否则返回的还是同步**之前**的旧名单（假 Bot 还在、真 Bot 没建）。
         await self._sync_real_members()
+        if source == "real":
+            await self.persist_state()
         await self._refresh_peer_status()
         pool = []
         for member in self._member_pool():
