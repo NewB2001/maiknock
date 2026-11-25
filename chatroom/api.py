@@ -226,6 +226,17 @@ class ChatroomApiMixin:
         """
         return await self._svc_call("shell_delete_room", room_id)
 
+    @API("shell_truncate_from", description="「回到此处」：软作废某段及之后的全部内容", version="1")
+    async def shell_truncate_from(self, room_id: str, cutoff_seq: int) -> Dict[str, Any]:
+        """把段序号 ≥ ``cutoff_seq`` 的段（连同消息行）**软作废**。
+
+        ⚠️ **不物理删**（FR-12）：只是 ``voided=1``，查询时过滤掉。
+        ⚠️ 粒度 = **段**，明确拒绝按单条消息回滚（段内半截状态会让账目混乱）。
+        ⚠️ mock 模式下账本里的房间可能不存在 ⇒ 服务端返回 ok 但不做事，
+        由前端做本地作废（壳阶段一直是这么演的）。
+        """
+        return await self._svc_call("shell_truncate_from", room_id, cutoff_seq)
+
     @API(
         "shell_update_member",
         description="改群员的名字 / 头像（只限我方角色，假数据）",

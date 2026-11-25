@@ -1555,14 +1555,16 @@ class ChatroomLedger:
             )
             return False
 
-    def list_timeline(self, room_id: str) -> List[Dict[str, Any]]:
+    def list_timeline(self, room_id: str, include_voided: bool = True) -> List[Dict[str, Any]]:
         """一个房间的时间线（页面要的形状）。
 
-        ⚠️ **只收没作废的段与消息**（软作废，见 truncate_from）。
-        ⚠️ 消息按段归组；段内按落库顺序（= 群里的发言顺序）。
+        ⚠️ **默认把作废段也带上**（带 ``voided`` 标记）——「回到此处」之后，
+        作废的内容要**灰显**在舞台上（D9.3），而不是凭空消失
+        （壳阶段一直是这么演的：作废旧段保留、不重排、只是灰掉）。
+        内容类逻辑（递话/接力/回读）不看这条时间线，所以带上无副作用。
         """
-        segments = self.list_segments(room_id, include_voided=False)
-        messages = self.list_messages(room_id, include_voided=False)
+        segments = self.list_segments(room_id, include_voided=include_voided)
+        messages = self.list_messages(room_id, include_voided=include_voided)
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for msg in messages:
             grouped.setdefault(str(msg.get("segment_id") or ""), []).append(msg)

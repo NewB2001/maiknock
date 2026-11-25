@@ -358,6 +358,20 @@
               }
             }
           }
+        },
+        "truncate_from": {
+          "api": "shell_truncate_from",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "cutoff_seq": {
+              "type": "integer",
+              "required": true
+            }
+          }
         }
       }
     }

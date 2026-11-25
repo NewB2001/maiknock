@@ -896,6 +896,31 @@ class ChatroomService:
             "member_pool": [await self._resolve_member(item) for item in self._member_pool()],
         }
 
+    async def shell_truncate_from(self, room_id: str, cutoff_seq: int) -> Dict[str, Any]:
+        """「回到此处」L1：把段序号 ≥ ``cutoff_seq`` 的段（连同消息行）**软作废**。
+
+        ⚠️ **不物理删**（FR-12）：只 `voided=1`，查询时过滤。
+        ⚠️ 粒度 = 段；截断点之前的段全保留，之后的全作废。
+        ⚠️ mock 模式：账本里没有真实数据 ⇒ 返回 ok 但不做事，由前端本地作废
+        （壳阶段一直是纯前端演的）。
+        """
+        try:
+            cutoff = int(cutoff_seq)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "cutoff_seq 必须是整数"}
+        source = await self._data_source()
+        if source != "real":
+            return {"ok": True, "voided": 0, "mode": "mock"}
+        ledger = self._ledger()
+        if ledger is None:
+            return {"ok": False, "error": "共享账本没开，无法作废"}
+        try:
+            # ⚠️ 写账本**必须挪到线程里**（同步 SQLite 写会阻塞事件循环）
+            count = await ledger.run(ledger.truncate_from, room_id, cutoff)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"作废失败：{exc}"}
+        return {"ok": True, "voided": int(count or 0), "mode": "real"}
+
     async def shell_update_member(
         self,
         member_id: str,

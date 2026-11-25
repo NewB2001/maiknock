@@ -1028,7 +1028,7 @@
         <div class="timeline" id="timeline"></div>
         <div class="turnstate" id="turnstate" hidden></div>
         <div class="notice-pop" id="memory-notice" hidden>
-          <span>注意：正式版会同步处理 Bot 记忆中的旧剧情，当前为界面演示</span>
+          <span>这一段之后的内容在舞台上作废了，但<strong>她还记得</strong>——重演时她可能会接旧茬。正式版暂不清理 Bot 记忆。</span>
           <button class="icon-btn" type="button" id="memory-notice-close">✕</button>
         </div>
       </section>
@@ -1123,6 +1123,7 @@
     privateTimeline: {},
     currentPeerId: null,
     truncateTarget: null,
+    stage: "shell",
     stageNote: null,
     memoryNoticeShown: false,
     tmGroup: null,
@@ -2354,11 +2355,39 @@
     return { text: text, count: count, first: first, last: last, keep: keep };
   }
 
-  function confirmTruncate(scope, index) {
+  async function confirmTruncate(scope, index) {
     var segments = segmentsOf(scope);
-    for (var i = index; i < segments.length; i += 1) { segments[i].voided = true; }
-    var seq = segments[index] ? segments[index].seq : 0;
-    state.truncateTarget = null;
+    var target = segments[index];
+    var seq = target ? target.seq : 0;
+    // ⚠️ **真模式**：必须真的写账本（软作废），否则刷新后作废就丢了。
+    //    假模式：只有前端内存，照旧本地作废即可（壳阶段一直这么演）。
+    if (scope === "group" && state.stage === "real" && state.currentRoomId) {
+      var result;
+      try {
+        result = await window.maibot.action("truncate_from", {
+          room_id: state.currentRoomId,
+          cutoff_seq: seq
+        });
+      } catch (error) {
+        showError("「回到此处」失败：" + (error && error.message ? error.message : error));
+        state.truncateTarget = null;
+        renderScope(scope, true);
+        return;
+      }
+      var failure = businessError(result);
+      if (failure) {
+        showError(failure);
+        state.truncateTarget = null;
+        renderScope(scope, true);
+        return;
+      }
+      state.truncateTarget = null;
+      // 从账本重新拉时间线（作废段由后端置 voided，前端按 voided 灰显）
+      await loadRoomTimeline(state.currentRoomId);
+    } else {
+      for (var i = index; i < segments.length; i += 1) { segments[i].voided = true; }
+      state.truncateTarget = null;
+    }
     state.stageNote = { scope: scope, seq: seq };
     if (!state.memoryNoticeShown) {
       state.memoryNoticeShown = true;
@@ -3572,6 +3601,8 @@
       var data = await window.maibot.query("bootstrap");
       state.version = data.version || "";
       state.notice = data.notice || "";
+      // 真/假模式：real ⇒ 「回到此处」要真的写账本；shell ⇒ 纯前端本地作废
+      state.stage = data.stage || "shell";
       state.timing = data.timing || {};
       state.memberPool = data.member_pool || [];
       state.myRoles = data.my_roles || [];
