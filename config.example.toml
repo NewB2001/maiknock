@@ -27,5 +27,22 @@ enabled = true        # 小说体格式：【】内心 →（动作/环境）→
 # 「自由」= 不限制字数、麦麦自己决定。档位自带范围、选不到「最大<最小」，下限恒 >= 60
 # 大致范围不是硬截断，字数只算说出口的话，【】（）不算
 
+# ── 麦麦聊天室（多 Bot 同台一个虚拟群）────────────────────────────────────
+# ⚠️ 出厂状态全部关闭 ⇒ 装上这个插件但不动这几项，行为跟没装聊天室一模一样。
+[chatroom]
+enabled = false               # 聊天室的开关
+data_source = "mock"          # mock=演示假数据（出厂）；real=真递话真回复。出问题切回 mock 就是总后门
+ledger_path = ""              # 共享账本(SQLite)的绝对路径。★所有参与的 Bot 必须配成同一个★
+api_key = ""                  # 本 Bot 自己的消息服务 Key（bot_config.toml 的 [maim_message] 那一条）。每个 Bot 填自己的
+
+[chatroom.splitter]
+enabled = false               # 聊天室的回复整条一个气泡（只影响聊天室，不动 QQ/微信真群聊的分段）
+
+[chatroom.delivery]
+enabled = false               # 把台词递进虚拟群（关掉=界面照常但麦麦不接话）
+
+[chatroom.collect]
+enabled = false               # 把 Bot 的回复收回来显示到时间线
+
 # 说明：扫描间隔、回读参数、重生上限等内部机制项不出现在 WebUI 配置页，
 # 代码内置同值默认；旧 config.toml 里残留的键会被忽略、不报错。

@@ -511,6 +511,78 @@ class ReplyLengthConfig(PluginConfigBase):
         json_schema_extra={"label": "回复篇幅（一句话选档位）"})
 
 
+class ChatroomSplitterConfig(PluginConfigBase):
+    """聊天室里的回复不要被拆成好几个气泡。"""
+
+    __ui_label__ = "回复气泡"
+
+    enabled: bool = Field(
+        default=False,
+        description="打开后，聊天室里的麦麦回复会**整条显示为一个气泡**（内部用段间空行分段，"
+        "而不是拆成多个气泡）。只影响聊天室，不影响 QQ/微信等真群聊的分段行为。"
+        "关掉就退回宿主默认分段。",
+        json_schema_extra={"label": "一条回复只显示为一个气泡"})
+
+
+class ChatroomDeliveryConfig(PluginConfigBase):
+    """把你写的台词递进各 Bot 的虚拟群。"""
+
+    __ui_label__ = "台词递送"
+
+    enabled: bool = Field(
+        default=False,
+        description="打开后，聊天室里的台词会通过宿主的消息网关递进虚拟群，麦麦才会接话。"
+        "关掉 = 界面照常，但不递话（麦麦不会开口）。",
+        json_schema_extra={"label": "把台词递进虚拟群"})
+
+
+class ChatroomCollectConfig(PluginConfigBase):
+    """把 Bot 在虚拟群里的回复收回来，显示到时间线上。"""
+
+    __ui_label__ = "回复回收"
+
+    enabled: bool = Field(
+        default=False,
+        description="打开后，聊天室会读取各 Bot 虚拟群里的新消息并显示到时间线上。"
+        "关掉 = 只递话不收话（时间线上只有你方台词）。",
+        json_schema_extra={"label": "把 Bot 的回复收回来"})
+
+
+class ChatroomConfig(PluginConfigBase):
+    """麦麦聊天室：多个 Bot 与你同台一个虚拟群，你写台词、她们接话。"""
+
+    __ui_label__ = "麦麦聊天室"
+
+    enabled: bool = Field(
+        default=False,
+        description="打开后聊天室功能才启用。关掉 = 插件只剩「麦麦敲门」那部分，行为跟没装聊天室一样。",
+        json_schema_extra={"label": "启用麦麦聊天室"})
+    data_source: Literal["mock", "real"] = Field(
+        default="mock",
+        description="mock = 演示模式，全部是假数据、不连接任何 Bot（出厂状态）；"
+        "real = 正式模式，真的递话、真的收回复。出问题时把它切回 mock 就是一个总后门。",
+        json_schema_extra={"label": "数据来源"})
+    ledger_path: str = Field(
+        default="",
+        description="共享账本（SQLite）的绝对路径。**所有参与的 Bot 必须配成同一个路径**——"
+        "它们靠这一个文件互相传递消息。留空 = 不启用共享账本，聊天室只能单机单 Bot 用。"
+        "建议放在所有 Bot 的 data 目录之外，例如 E:\\Softw\\MaiBot\\maichat\\chatroom.db",
+        json_schema_extra={"label": "共享账本路径"})
+    api_key: str = Field(
+        default="",
+        description="**本 Bot 自己**的消息服务 Key（就是该 Bot 的 bot_config.toml 里 "
+        "[maim_message].api_server_allowed_api_keys 中的一条）。插件用它把台词递进本 Bot 的虚拟群。"
+        "每个 Bot 填自己的，不要互相复制。",
+        json_schema_extra={"label": "本 Bot 的消息服务 Key"})
+
+    splitter: ChatroomSplitterConfig = Field(
+        default_factory=ChatroomSplitterConfig, description="回复气泡")
+    delivery: ChatroomDeliveryConfig = Field(
+        default_factory=ChatroomDeliveryConfig, description="台词递送")
+    collect: ChatroomCollectConfig = Field(
+        default_factory=ChatroomCollectConfig, description="回复回收")
+
+
 class MaiknockConfig(PluginConfigBase):
     """麦麦敲门插件总配置。"""
 
@@ -521,6 +593,8 @@ class MaiknockConfig(PluginConfigBase):
 
     style_guard: StyleGuardConfig = Field(default_factory=StyleGuardConfig, description="小说体说话格式")
     reply_length: ReplyLengthConfig = Field(default_factory=ReplyLengthConfig, description="回复字数")
+
+    chatroom: ChatroomConfig = Field(default_factory=ChatroomConfig, description="麦麦聊天室")
 
 
 # ---------------------------------------------------------------------------

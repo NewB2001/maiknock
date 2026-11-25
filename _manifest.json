@@ -3,7 +3,7 @@
   "id": "maiknock.webui_companion",
   "version": "0.4.0",
   "name": "麦麦敲门 MaiKnock",
-  "description": "WebUI私聊体验增强！1、让麦麦主动来找你聊天；2、用旁白的方式掌控聊天剧情的时间线（就像时光机一样）；3、让麦麦用小说体的方式说话（比人格配置更稳定）；",
+  "description": "WebUI私聊体验增强！1、让麦麦主动来找你聊天；2、用旁白的方式掌控聊天剧情的时间线（就像时光机一样）；3、让麦麦用小说体的方式说话（比人格配置更稳定）；4、麦麦聊天室——多个 Bot 与你同台一个虚拟群，你写台词、她们接话（与麦麦敲门合二为一）。",
   "plugin_type": "chat",
   "display": {
     "icon": {
@@ -36,6 +36,8 @@
     "message.get_recent",
     "send.text",
     "chat.get_private_streams",
+    "chat.get_group_streams",
+    "chat.open_session",
     "config.get_plugin"
   ],
   "i18n": {
