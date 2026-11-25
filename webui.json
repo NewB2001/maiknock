@@ -18,6 +18,9 @@
         "bootstrap": {
           "api": "shell_bootstrap"
         },
+        "errors": {
+          "api": "shell_errors"
+        },
         "rooms": {
           "api": "shell_rooms"
         },
@@ -326,6 +329,20 @@
               "type": "string",
               "required": true,
               "max_length": 64
+            }
+          }
+        },
+        "shell_ack_errors": {
+          "api": "shell_ack_errors",
+          "parameters": {
+            "report_ids": {
+              "type": "array",
+              "required": false,
+              "max_items": 50,
+              "items": {
+                "type": "string",
+                "max_length": 200
+              }
             }
           }
         }

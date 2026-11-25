@@ -719,6 +719,9 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         self._chatroom_gateway = None
         # 投递 worker（领单 → 递话 → 回填状态，chatroom/worker.py）
         self._chatroom_worker = None
+        # 错误扫描器（把宿主的 429 等硬错误变成用户看得见的提示，chatroom/errorscan.py）
+        self._chatroom_error_watcher = None
+        self._chatroom_error_task = None
 
     # ---- 生命周期（B-2：宿主只调用 on_load/on_unload/on_config_update）----
 
@@ -863,6 +866,62 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         worker = mk_chatroom.DeliveryWorker(ledger, pool, self._chatroom_bot_id)
         worker.start()
         self._chatroom_worker = worker
+        self._chatroom_start_error_watcher()
+
+    async def _chatroom_start_error_watcher(self) -> None:
+        """起错误扫描循环：把宿主的 429 等硬错误捡起来，写进共享账本。
+
+        ⚠️ **每个 Bot 只扫自己实例的日志目录**（一号在 ``<ws>/logs/``，
+        二号在 ``<ws>/bots/<id>/logs/``）—— 不越界读别人的。
+        扫到的写进**共享账本** ⇒ 中控（一号）汇总时二号的错也看得见。
+        """
+        if self._chatroom_error_watcher is not None:
+            return
+        data_dir = getattr(getattr(self.ctx, "paths", None), "data_dir", None)
+        watcher = mk_chatroom.errorscan.ErrorWatcher(
+            data_dir, self._chatroom_bot_id, self._chatroom_bot_name
+        )
+        if watcher.root is None:
+            logger.info("[MaiKnock][聊天室] 定位不到本 Bot 的实例日志目录，错误提示功能不可用")
+            return
+        self._chatroom_error_watcher = watcher
+        self._chatroom_error_task = asyncio.create_task(self._chatroom_error_loop())
+        logger.info(
+            "[MaiKnock][聊天室] 错误扫描已启动（实例日志：%s）", watcher.root
+        )
+
+    async def _chatroom_error_loop(self) -> None:
+        """定期扫错误快照 → 写账本。"""
+        watcher = self._chatroom_error_watcher
+        ledger = self._chatroom_ledger
+        if watcher is None or ledger is None:
+            return
+        while True:
+            try:
+                await asyncio.sleep(5.0)
+                session_ids = self._chatroom_session_ids()
+                watcher.poll(ledger, session_ids=session_ids or None)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[MaiKnock][聊天室] 错误扫描循环异常：%r", exc)
+
+    def _chatroom_session_ids(self) -> List[str]:
+        """本聊天室所有虚拟群的 session_id（用于过滤错误快照）。"""
+        ledger = self._chatroom_ledger
+        if ledger is None:
+            return []
+        try:
+            rooms = ledger.list_rooms()
+        except Exception:  # noqa: BLE001
+            return []
+        out: List[str] = []
+        for room in rooms:
+            group_id = str(room.get("group_id") or "")
+            if not group_id:
+                group_id = mk_chatroom.virtual_group_id(str(room.get("room_id") or ""))
+            out.append(mk_chatroom.session_id_for_group(group_id))
+        return out
 
     async def _chatroom_style_fixed(self) -> Optional[bool]:
         """本 Bot 的说话风格是否已按敲门侧固化。
@@ -1018,6 +1077,9 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[MaiKnock][聊天室] 关闭共享账本时出错：%r", exc)
             self._chatroom_ledger = None
+        if self._chatroom_error_task is not None:
+            self._chatroom_error_task.cancel()
+            self._chatroom_error_task = None
         if self._chatroom_worker is not None:
             try:
                 await self._chatroom_worker.stop()

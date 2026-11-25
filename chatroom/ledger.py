@@ -163,6 +163,28 @@ SCHEMA: Tuple[str, ...] = (
     # ── 各 Bot 自报的接入状态（接入校验的握手层 / 风格层）──────────────
     # ⚠️ **每个实例只写自己那一行** —— 别的 Bot 的 api_key 不在本进程里，
     #    也就没法替别人测握手；中控把各行合起来算四态。
+    # ── 错误报告（429 限流等硬错误，**不许默默出错**）──────────────────
+    # ⚠️ 每个 Bot 的插件实例只扫**自己实例**的 llm_error 快照目录，
+    #    扫到就往这张表写一行；中控从账本汇总推给前端 ⇒
+    #    二号出的问题，一号的中控也看得见。
+    """
+    CREATE TABLE IF NOT EXISTS error_report (
+        report_id    TEXT PRIMARY KEY,      -- 快照文件名（天然唯一，可去重）
+        bot_id       TEXT NOT NULL DEFAULT '',
+        bot_name     TEXT NOT NULL DEFAULT '',
+        kind         TEXT NOT NULL DEFAULT '',   -- rate_limit | upstream_error | empty_reply
+        status_code  INTEGER NOT NULL DEFAULT 0,
+        provider     TEXT NOT NULL DEFAULT '',
+        model        TEXT NOT NULL DEFAULT '',
+        task         TEXT NOT NULL DEFAULT '',
+        room_id      TEXT NOT NULL DEFAULT '',
+        session_id   TEXT NOT NULL DEFAULT '',
+        message      TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT '',
+        acked        INTEGER NOT NULL DEFAULT 0   -- 前端读过一次就置 1
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_error_report_ack ON error_report(acked, created_at)",
     """
     CREATE TABLE IF NOT EXISTS bot_status (
         bot_id       TEXT PRIMARY KEY,
@@ -858,6 +880,61 @@ class ChatroomLedger:
                     _now(),
                 ),
             )
+
+    # ── 错误报告（429 等硬错误）────────────────────────────────────
+
+    def report_error(self, report: Dict[str, Any]) -> bool:
+        """登记一条错误报告。**按 report_id 去重**（同一个快照不重复报）。
+
+        返回 True = 新增；False = 之前报过（已存在）。
+        """
+        report_id = str(report.get("report_id") or "")
+        if not report_id:
+            return False
+        with self.write() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO error_report(report_id, bot_id, bot_name, kind,"
+                " status_code, provider, model, task, room_id, session_id, message,"
+                " created_at, acked) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                (
+                    report_id,
+                    str(report.get("bot_id") or ""),
+                    str(report.get("bot_name") or ""),
+                    str(report.get("kind") or ""),
+                    int(report.get("status_code") or 0),
+                    str(report.get("provider") or ""),
+                    str(report.get("model") or ""),
+                    str(report.get("task") or ""),
+                    str(report.get("room_id") or ""),
+                    str(report.get("session_id") or ""),
+                    str(report.get("message") or ""),
+                    str(report.get("created_at") or ""),
+                ),
+            )
+            return bool(cur.rowcount)
+
+    def list_errors(self, limit: int = 20, only_unacked: bool = False) -> List[Dict[str, Any]]:
+        """最近的错误报告（新的在前）。"""
+        sql = "SELECT * FROM error_report"
+        if only_unacked:
+            sql += " WHERE acked = 0"
+        sql += " ORDER BY created_at DESC, report_id DESC LIMIT ?"
+        with self.read() as conn:
+            rows = conn.execute(sql, (int(limit),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def ack_errors(self, report_ids: Optional[List[str]] = None) -> int:
+        """把错误标记为「用户已看到」。不给 id 就全标记。"""
+        with self.write() as conn:
+            if report_ids:
+                marks = ",".join("?" for _ in report_ids)
+                cur = conn.execute(
+                    f"UPDATE error_report SET acked = 1 WHERE report_id IN ({marks})",
+                    [str(item) for item in report_ids],
+                )
+            else:
+                cur = conn.execute("UPDATE error_report SET acked = 1 WHERE acked = 0")
+            return int(cur.rowcount or 0)
 
     def get_bot_status(self, bot_id: str) -> Optional[Dict[str, Any]]:
         with self.read() as conn:

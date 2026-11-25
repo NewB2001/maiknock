@@ -37,6 +37,24 @@ class ChatroomApiMixin:
         """一次性拉取页面需要的全部初始假数据。"""
         return await self._svc().shell_bootstrap()
 
+    @API("shell_ack_errors", description="确认已看到的上游错误（不再重复提示）", version="1")
+    async def shell_ack_errors(self, report_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """把错误标记为「用户已看到」。
+
+        ⚠️ **只在用户真的看到提示时才调** —— 标了就再也不会提示；
+        静默失败会退化成「提示也没了 ⇒ 没人知道出过错」。
+        """
+        return await self._svc().shell_ack_errors(report_ids)
+
+    @API("shell_errors", description="读取最近的上游错误（429 限流等）", version="1")
+    async def shell_errors(self, limit: int = 5) -> Dict[str, Any]:
+        """取最近的**未确认**上游错误。
+
+        ⚠️ 页面靠它轮询 ⇒ 宿主报错时**用户马上看得到**，
+        不用等下一次刷新或下一次提交才发现「Bot 刚才没接上话」。
+        """
+        return {"errors": await self._svc()._chatroom_errors(limit=limit)}
+
     @API("shell_rooms", description="读取房间列表（假数据）", version="1")
     async def shell_rooms(self) -> Dict[str, Any]:
         """单独刷新房间列表用。"""

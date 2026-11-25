@@ -30,6 +30,7 @@ from .mock_data import (
     STICKER_POOL,
     _build_segment,
 )
+from .errorscan import describe_report
 from .hostinfo import read_bot_config, read_bots
 from .identity import DEFAULT_PLATFORM, virtual_group_id
 from .roster import build_roster
@@ -326,6 +327,7 @@ class ChatroomService:
             "peers": self._peer_list(),
             "managed_bots": await self._managed_bot_list(),
             "narrator": NARRATOR,
+            "errors": await self._chatroom_errors(),
             "rooms": self._rooms,
             "timeline": self._seeded_timeline(),
             "private_threads": self._seeded_private_threads(),
@@ -958,6 +960,49 @@ class ChatroomService:
                 }
             )
         return resolved
+
+    # ---- 错误反馈（429 等硬错误，不许默默出错）------------------------
+
+    async def _chatroom_errors(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """取最近的**未确认**错误，写成给用户看的白话。
+
+        ⚠️ **中控（一号）能读到别的 Bot 报的错误** —— 各 Bot 的插件实例
+        扫自己实例的日志、写进共享账本，这里只是汇总。
+        """
+        ledger = self._ledger()
+        if ledger is None:
+            return []
+        try:
+            rows = ledger.list_errors(limit=limit, only_unacked=True)
+        except Exception:  # noqa: BLE001
+            return []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "report_id": str(row.get("report_id") or ""),
+                    "kind": str(row.get("kind") or ""),
+                    "bot_name": str(row.get("bot_name") or ""),
+                    "created_at": str(row.get("created_at") or ""),
+                    "text": describe_report(row, str(row.get("bot_name") or "")),
+                }
+            )
+        return out
+
+    async def shell_ack_errors(self, report_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """把错误标记为「用户已看到」。
+
+        ⚠️ **只在用户真的看到了才调** —— 标记了就再也不会提示，
+        静默失败会变成"提示也没了 ⇒ 没人知道出过错"。
+        """
+        ledger = self._ledger()
+        if ledger is None:
+            return {"ok": False, "error": "共享账本没开"}
+        try:
+            count = ledger.ack_errors(report_ids)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "acked": count}
 
     async def _real_submit_beat(
         self,

@@ -1131,6 +1131,8 @@
     myRoles: [],
     peers: [],
     managedBots: [],
+    errors: [],
+    errorTimer: null,
     privateSpeaker: "",
     timeline: {},
     privateThreads: [],
@@ -3325,6 +3327,47 @@
     setNotice($("private-script-error"), "err", text);
   }
 
+  /* ── 上游错误（429 限流等）─────────────────────────────────────────
+     ⚠️ 宿主的 LLM 报错**界面上本来什么都不显示** ⇒ Bot 就是「沉默」。
+     这里把账本里各 Bot 自报的错误显示在**群聊标题行的提示栏**里，
+     点一下就消失（并告诉后端「用户看到了」，不再重复提示）。
+     ─────────────────────────────────────────────────────────────── */
+
+  function renderErrorNotice() {
+    var errs = state.errors || [];
+    if (!errs.length) { clearError(); return; }
+    var latest = errs[0] || {};
+    var text = latest.text || ("上游出错：" + (latest.kind || "未知错误"));
+    if (errs.length > 1) {
+      text = text + "（另有 " + (errs.length - 1) + " 条同类报错）";
+    }
+    setNotice(errorBox(), "err", text);
+  }
+
+  async function ackErrors() {
+    var errs = state.errors || [];
+    if (!errs.length) { return; }
+    var ids = errs.map(function (e) { return e.report_id; }).filter(Boolean);
+    state.errors = [];
+    try {
+      if (ids.length) {
+        await window.maibot.action("shell_ack_errors", { report_ids: ids });
+      }
+    } catch (error) {
+      /* 标记失败不影响使用：提示已经消失了，下次刷新还会再报一次 */
+    }
+  }
+
+  async function pollErrors() {
+    try {
+      var data = await window.maibot.query("errors");
+      state.errors = (data && data.errors) || [];
+      renderErrorNotice();
+    } catch (error) {
+      /* 轮询失败不打扰用户（可能是插件重载中） */
+    }
+  }
+
   function clearPrivateError() {
     clearNotice($("private-script-error"));
   }
@@ -3434,7 +3477,7 @@
     $("memory-notice-close").onclick = function () { $("memory-notice").hidden = true; };
     $("submit-private").onclick = submitPrivate;
     $("stop-private-turn").onclick = stopPrivateTurn;
-    $("script-error").onclick = clearError;
+    $("script-error").onclick = function () { clearError(); ackErrors(); };
     $("private-script-error").onclick = clearPrivateError;
   }
 
@@ -3456,6 +3499,7 @@
       state.myRoles = data.my_roles || [];
       state.peers = data.peers || [];
       state.managedBots = data.managed_bots || [];
+      state.errors = data.errors || [];
       state.narrator = data.narrator || null;
       state.rooms = data.rooms || [];
       state.timeline = data.timeline || {};
@@ -3486,6 +3530,10 @@
       renderPrivateTurnState();
       renderStageBars();
       updateSubmitButtons();
+      renderErrorNotice();
+      // 轮询上游错误：宿主报错时提示自己冒出来（每 8 秒一次）
+      if (state.errorTimer) { clearInterval(state.errorTimer); }
+      state.errorTimer = setInterval(pollErrors, 8000);
     } catch (error) {
       showError("读取初始假数据失败：" + error.message);
     }
