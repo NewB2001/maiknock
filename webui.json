@@ -1,0 +1,335 @@
+{
+  "schema_version": 2,
+  "required_capabilities": [
+    "custom_pages",
+    "structured_arguments"
+  ],
+  "pages": [
+    {
+      "id": "studio",
+      "title": "聊天室",
+      "description": "",
+      "placement": "sidebar",
+      "icon": "list",
+      "mode": "custom",
+      "entry": "webui/index.html",
+      "layout": "viewport",
+      "queries": {
+        "bootstrap": {
+          "api": "shell_bootstrap"
+        },
+        "rooms": {
+          "api": "shell_rooms"
+        },
+        "my_roles": {
+          "api": "shell_my_roles"
+        }
+      },
+      "actions": {
+        "create_room": {
+          "api": "shell_create_room",
+          "parameters": {
+            "name": {
+              "type": "string",
+              "required": true,
+              "max_length": 40
+            }
+          }
+        },
+        "rename_room": {
+          "api": "shell_rename_room",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "name": {
+              "type": "string",
+              "required": true,
+              "max_length": 40
+            }
+          }
+        },
+        "delete_room": {
+          "api": "shell_delete_room",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            }
+          }
+        },
+        "submit_beat": {
+          "api": "shell_submit_beat",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "lines": {
+              "type": "array",
+              "required": false,
+              "max_items": 200,
+              "items": {
+                "type": "object",
+                "required": true,
+                "properties": {
+                  "speaker_member_id": {
+                    "type": "string",
+                    "required": false,
+                    "max_length": 64
+                  },
+                  "speaker": {
+                    "type": "string",
+                    "required": false,
+                    "max_length": 64
+                  },
+                  "text": {
+                    "type": "string",
+                    "required": true,
+                    "max_length": 4000
+                  }
+                }
+              }
+            },
+            "script": {
+              "type": "string",
+              "required": false,
+              "max_length": 16000
+            },
+            "speakers": {
+              "type": "array",
+              "required": false,
+              "max_items": 16,
+              "items": {
+                "type": "string",
+                "max_length": 64
+              }
+            },
+            "auto_reply": {
+              "type": "boolean",
+              "required": false
+            }
+          }
+        },
+        "add_member": {
+          "api": "shell_add_member",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "member_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            }
+          }
+        },
+        "remove_member": {
+          "api": "shell_remove_member",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "member_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            }
+          }
+        },
+        "replace_member": {
+          "api": "shell_replace_member",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "old_member_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "new_member_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            }
+          }
+        },
+        "create_member": {
+          "api": "shell_create_member",
+          "parameters": {
+            "room_id": {
+              "type": "string",
+              "required": false,
+              "max_length": 64
+            },
+            "display_name": {
+              "type": "string",
+              "required": true,
+              "max_length": 24
+            },
+            "kind": {
+              "type": "string",
+              "required": true,
+              "max_length": 16,
+              "choices": [
+                "user_role",
+                "bot"
+              ]
+            },
+            "avatar": {
+              "type": "string",
+              "required": false,
+              "max_length": 65536
+            },
+            "persona_label": {
+              "type": "string",
+              "required": false,
+              "max_length": 24
+            }
+          }
+        },
+        "reorder_my_roles": {
+          "api": "shell_reorder_my_roles",
+          "parameters": {
+            "order": {
+              "type": "array",
+              "required": true,
+              "max_items": 50,
+              "items": {
+                "type": "string",
+                "max_length": 64
+              }
+            }
+          }
+        },
+        "delete_my_role": {
+          "api": "shell_delete_my_role",
+          "parameters": {
+            "member_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            }
+          }
+        },
+        "update_member": {
+          "api": "shell_update_member",
+          "parameters": {
+            "member_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "display_name": {
+              "type": "string",
+              "required": false,
+              "max_length": 24
+            },
+            "avatar": {
+              "type": "string",
+              "required": false,
+              "max_length": 65536
+            },
+            "room_id": {
+              "type": "string",
+              "required": false,
+              "max_length": 64
+            }
+          }
+        },
+        "submit_private": {
+          "api": "shell_submit_private",
+          "parameters": {
+            "peer_member_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "lines": {
+              "type": "array",
+              "required": false,
+              "max_items": 100,
+              "items": {
+                "type": "object",
+                "required": true,
+                "properties": {
+                  "speaker_member_id": {
+                    "type": "string",
+                    "required": false,
+                    "max_length": 64
+                  },
+                  "speaker": {
+                    "type": "string",
+                    "required": false,
+                    "max_length": 64
+                  },
+                  "text": {
+                    "type": "string",
+                    "required": true,
+                    "max_length": 4000
+                  }
+                }
+              }
+            },
+            "script": {
+              "type": "string",
+              "required": false,
+              "max_length": 8000
+            }
+          }
+        },
+        "add_my_role": {
+          "api": "shell_add_my_role",
+          "parameters": {
+            "display_name": {
+              "type": "string",
+              "required": true,
+              "max_length": 24
+            },
+            "avatar": {
+              "type": "string",
+              "required": false,
+              "max_length": 65536
+            },
+            "persona_label": {
+              "type": "string",
+              "required": false,
+              "max_length": 24
+            }
+          }
+        },
+        "add_peer": {
+          "api": "shell_add_peer",
+          "parameters": {
+            "bot_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            }
+          }
+        },
+        "delete_peer": {
+          "api": "shell_delete_peer",
+          "parameters": {
+            "member_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            }
+          }
+        }
+      }
+    }
+  ]
+}

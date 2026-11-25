@@ -403,6 +403,66 @@ except Exception as _cmd_exc:  # noqa: BLE001
 
 
 # ---------------------------------------------------------------------------
+# 麦麦聊天室子包（chatroom/）：中控 + 18 个 WebUI 接口面
+#
+# ⚠️ 加载方式：**按目录**加载成一个包（`_load_package`），而不是按文件。
+#    因为包内要用**相对 import**（`from .mock_data import ...`），
+#    而宿主把插件**父目录**加进 sys.path、不是插件目录本身 ⇒
+#    裸 `import chatroom` 会 ImportError（踩坑 66）。
+# ⚠️ **先注册进 sys.modules 再 exec** —— 否则包内相对 import 找不到自己。
+# ⚠️ R6-29 纪律：加载失败必须可见（独立 error 日志），不许静默降级。
+# ⚠️ 失败时的降级策略：**换成桩基类**，插件照常加载、敲门功能不受影响；
+#    只是聊天室的 18 个接口不存在（页面上会报「插件无组件: shell_xxx」，
+#    原因明确）——**绝不让聊天室的加载失败把整个插件拖下水**。
+# ---------------------------------------------------------------------------
+
+
+def _load_package(package_name: str, dirname: str):
+    """按目录加载插件内的子包，并**先注册 sys.modules 再 exec**（支持包内相对 import）。"""
+    import importlib.util as _iu
+    import sys as _sys
+
+    pkg_dir = Path(__file__).parent / dirname
+    init_file = pkg_dir / "__init__.py"
+    if not init_file.exists():
+        raise ImportError(f"子包入口不存在：{init_file}")
+    spec = _iu.spec_from_file_location(
+        package_name, str(init_file), submodule_search_locations=[str(pkg_dir)]
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法为 {pkg_dir} 创建包 spec")
+    mod = _iu.module_from_spec(spec)
+    _sys.modules[package_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _ChatroomStub:
+    """聊天室子包加载失败时的占位基类。
+
+    只提供 ``__init__`` 透传，**不提供任何 API** ⇒ 宿主收集组件时
+    不会收进聊天室的接口，页面调用会得到明确的「插件无组件」错误，
+    而敲门本体照常工作。
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+
+
+mk_chatroom = None
+try:  # pragma: no cover - 加载失败只降级聊天室，不阻断插件其余功能
+    mk_chatroom = _load_package("maichat_chatroom", "chatroom")
+    _CHATROOM_BASE = mk_chatroom.api_mixin()
+except Exception as _cr_exc:  # noqa: BLE001
+    mk_chatroom = None
+    _CHATROOM_BASE = _ChatroomStub
+    logger.error(
+        "[MaiKnock] 聊天室子包 chatroom/ 加载失败，聊天室功能不可用（敲门本体不受影响）：%r",
+        _cr_exc,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 配置模型（自动生成 config.toml 与 WebUI 配置页）
 # 注意：__ui_label__ 仅在嵌套的 PluginConfigBase 子类上生效；
 # config_version 必须位于 [plugin] 节内（宿主强制约定 runner_main.py）。
@@ -602,7 +662,15 @@ class MaiknockConfig(PluginConfigBase):
 # ---------------------------------------------------------------------------
 
 
-class MaiKnockPlugin(MaiBotPlugin):
+class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
+    """麦麦敲门 + 麦麦聊天室。
+
+    ⚠️ **基类顺序有意义**：`_CHATROOM_BASE`（聊天室的 API 混入类）在前、
+       `MaiBotPlugin` 在后 ⇒
+       * 宿主用 `dir(instance)` 收集组件（maibot_sdk/components.py:788），
+         **MRO 上的方法都会被收进去** ⇒ 聊天室的 18 个接口照样能被 WebUI 调用；
+       * 子包加载失败时 `_CHATROOM_BASE` 退化成 `_ChatroomStub` ⇒ 插件照常加载。
+    """
     # B-1：挂载配置模型，宿主据此生成 config.toml 与 WebUI 配置页
     config_model = MaiknockConfig
 

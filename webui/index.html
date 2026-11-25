@@ -1,0 +1,3500 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>麦麦聊天室（壳阶段）</title>
+<style>
+  :root {
+    --bg: var(--maibot-background, #0f1318);
+    --surface: var(--maibot-surface, #171c23);
+    --fg: var(--maibot-foreground, #e6ecf3);
+    --muted: var(--maibot-muted, #8a97a6);
+    --soft: var(--maibot-soft, #1e252e);
+    --border: var(--maibot-border, #2b343f);
+    --primary: var(--maibot-primary, #4c8dff);
+    --primary-fg: var(--maibot-primary-foreground, #ffffff);
+    --danger: var(--maibot-danger, #e05c5c);
+    --radius: var(--maibot-radius, 14px);
+    --gap: 12px;
+  }
+
+  * { box-sizing: border-box; }
+
+  /* 宿主样式里的 .maibot-button / .stage 会显式设置 display，
+     覆盖 UA 的 [hidden]{display:none} —— 这里补回来，否则 hidden 属性失效。 */
+  [hidden] { display: none !important; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+
+  body.maibot-page {
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--maibot-font-body, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif);
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  #app {
+    /* 用 100% 而不是 var(--maibot-viewport-height)：
+       那个变量是父页面异步发来的「可见区高度」，窗口缩放后会有一段滞后，
+       用它会导致页面停在旧高度、下面留一条空白（看起来像写死了尺寸）。
+       100% 直接跟着 iframe 实际尺寸走，永远填满。 */
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap);
+    padding: var(--gap);
+  }
+
+  /* ── 顶栏 ─────────────────────────────────────────────── */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .viewtabs {
+    display: flex;
+    gap: 6px;
+    padding: 3px;
+    border-radius: 999px;
+    background: var(--soft);
+    border: 1px solid var(--border);
+  }
+
+  .viewtab {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 13px;
+    padding: 5px 16px;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+
+  .viewtab.is-active {
+    background: var(--primary);
+    color: var(--primary-fg);
+  }
+
+  /* ── 布局 ─────────────────────────────────────────────── */
+  .layout {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 288px minmax(0, 1fr);
+    gap: var(--gap);
+  }
+
+  .side {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap);
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* 左栏顶行：群聊 / 私聊 拨片 */
+  .side-tabs { flex: 0 0 auto; }
+  .side-tabs .viewtabs { width: 100%; }
+  .side-tabs .viewtab { flex: 1 1 0; text-align: center; }
+
+  .main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+    gap: var(--gap);
+    min-height: 0;
+  }
+
+  /* 时间线与私聊视图占同一格（互斥显示），剧本框独占右栏 */
+  #stage-view, #private-view { grid-column: 1; grid-row: 1; }
+  #composer, #composer-private { grid-column: 2; grid-row: 1; }
+
+  .panel, .stage, .composer {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+
+  .panel {
+    padding: 12px;
+    /* 每个面板自己滚 —— 之前是 overflow:hidden，内容超出直接被裁掉看不见 */
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+  }
+
+  /* 左栏的两个面板按内容分配高度，放不下时各自出现滚动条 */
+  .side > .panel { flex: 0 1 auto; }
+
+  .stage {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding-top: 6px;
+    padding-bottom: 8px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+    flex: 0 0 auto;
+  }
+
+  .panel-head .muted { font-weight: 400; }
+  .muted { color: var(--muted); font-size: 12px; }
+
+  /* 「私聊对象」标题行的手动刷新按钮（数据只在 boot 拉一次，不自动轮询） */
+  .panel-head .refresh-peers-btn { margin-left: auto; font-weight: 400; font-size: 11px; }
+
+  /* 标题行里的系统提示：占据剩余空间、超出省略号、不把标题行撑爆。
+     全文放在 title 上，鼠标悬停即可查看（短文本无需 ellipsis，样式自动不生效）。 */
+  .panel-head .head-notice {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    font-weight: 400;
+    text-align: right;
+  }
+  .panel-head .head-notice.err { color: var(--danger); }
+  .panel-head .head-notice.ok { color: #6ee7a8; }
+
+  /* ── 房间 ─────────────────────────────────────────────── */
+  .room-form { margin-bottom: 8px; }
+
+  .roomlist { list-style: none; margin: 0 0 8px; padding: 0; }
+
+  .roomlist li {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border-radius: 10px;
+    padding: 4px 4px 4px 10px;
+    margin-bottom: 2px;
+  }
+
+  .roomlist li.is-current { background: var(--soft); }
+
+  .room-name {
+    flex: 1;
+    cursor: pointer;
+    padding: 3px 0;
+    border-radius: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .room-name:hover { color: var(--primary); }
+
+  .icon-btn {
+    appearance: none;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: 8px;
+  }
+
+  .icon-btn:hover { border-color: var(--border); color: var(--fg); }
+  .icon-btn:disabled { opacity: .3; cursor: not-allowed; }
+  .icon-btn:disabled:hover { border-color: transparent; color: var(--muted); }
+  .icon-btn.is-danger:hover { border-color: var(--danger); color: var(--danger); }
+  .icon-btn.is-tiny { padding: 3px 4px; font-size: 11px; }
+
+  .room-form, .rename-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .rename-row { margin-top: 8px; }
+
+  .room-form input, .rename-row input {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: 13px;
+    padding: 6px 9px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+  }
+
+  button.maibot-button, .maibot-button {
+    font: inherit;
+    font-size: 13px;
+    padding: 6px 12px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--soft);
+    color: var(--fg);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  button.maibot-button:hover { border-color: var(--primary); }
+
+  button.maibot-button-primary {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: var(--primary-fg);
+  }
+
+  button.maibot-button-danger {
+    background: transparent;
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+
+  /* 次级按钮：描边 + 弱化文字色。
+     主操作（「开演（提交一幕）」）用 maibot-button-primary（橙），
+     低频功能（「时光机」）用这个 —— 同一个橙色不能既指主操作又指顺手点一下的东西。
+     选择器写足三个类，用来压过宿主注入的 .maibot-button 样式。 */
+  button.maibot-button-secondary {
+    background: transparent;
+    border-color: var(--border);
+    color: var(--muted);
+  }
+
+  button.maibot-button-secondary:hover {
+    color: var(--fg);
+    border-color: var(--primary);
+  }
+
+  /* ── 群员 ─────────────────────────────────────────────── */
+  .group-title {
+    font-size: 12px;
+    color: var(--muted);
+    margin: 10px 0 6px;
+  }
+
+  .memberlist { list-style: none; margin: 0; padding: 0; }
+
+  .memberlist li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 2px;
+  }
+
+  .memberlist li.is-current { background: var(--soft); border-radius: 10px; }
+  .memberlist li.is-clickable { cursor: pointer; }
+  .memberlist li.is-clickable:hover { background: var(--soft); border-radius: 10px; }
+
+  .avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    font-size: 14px;
+    color: #fff;
+    background: #5a6b80;
+    /* 圆牌里只放得下一个字或一张图。
+       不裁的话，任何多出来的文字（比如一整串 data URI）都会把圆牌撑开，
+       再把整条时间线撑出横向滚动条 —— 所以这里必须裁。 */
+    overflow: hidden;
+  }
+
+  .avatar.is-bot { background: #7a5cc4; }
+
+  /* 上传出来的头像：头像框里放一张图 */
+  button.avatar { padding: 0; overflow: hidden; }
+  .avatar-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 50%;
+    display: block;
+  }
+  .avatar.is-pending { background: transparent; border: 1px dashed var(--border); color: var(--muted); }
+
+  /* 连续同一条角色消息里，后面的几条不再重复画头像 —— 只留个空位保持对齐 */
+  .avatar.is-ghost { background: transparent; }
+
+  /* 图片没加载出来时的兜底：纯色圆牌 + 角色首字 */
+  .avatar.is-fallback { background: #5a6b80; }
+
+  button.avatar {
+    border: 1px solid transparent;
+    padding: 0;
+    cursor: pointer;
+  }
+
+  button.avatar:hover { border-color: var(--primary); }
+  button.avatar:disabled { cursor: default; opacity: .85; }
+  button.avatar:disabled:hover { border-color: transparent; }
+
+  .member-text { flex: 1; min-width: 0; }
+  .member-name { font-size: 13px; }
+  .member-name.is-editable { cursor: text; text-decoration: underline dotted var(--border); }
+  .member-name.is-editable:hover { color: var(--primary); }
+  .member-sub { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .name-edit {
+    font: inherit;
+    font-size: 13px;
+    width: 100%;
+    padding: 1px 5px;
+    border-radius: 6px;
+    border: 1px solid var(--primary);
+    background: var(--bg);
+    color: var(--fg);
+  }
+
+  .member-actions {
+    display: flex;
+    gap: 2px;
+    flex: 0 0 auto;
+  }
+
+  .member-actions .icon-btn { padding: 3px 5px; font-size: 11px; }
+
+  .status {
+    font-size: 11px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .status-ready { color: #6ee7a8; border-color: #2f6b4c; background: #12241a; }
+  .status-gateway_off { color: #ffd479; border-color: #6b5620; background: #2a2313; }
+  .status-stopped { color: #ff9b9b; border-color: #6b3030; background: #2a1717; }
+  .status-off { color: var(--muted); }
+
+  /* ── 面板（添加 / 换头像）──────────────────────────────── */
+  .picker {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--border);
+  }
+
+  .picker-title { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+
+  .member-add-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+
+  .mini-select {
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 6px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  .member-add-row .maibot-button { flex: 0 0 auto; padding: 5px 10px; }
+
+  /* 「我的角色」面板顶部：当前操作的角色（私聊以它为视角） */
+  .speaker-picker-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .speaker-picker-label { font-size: 12px; color: var(--muted); flex: 0 0 auto; }
+  .speaker-picker-row .script-speaker { flex: 1 1 auto; }
+
+  .picker-cands {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+
+  .picker-cand {
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--soft);
+    color: var(--fg);
+    cursor: pointer;
+  }
+
+  .picker-cand:hover:not(:disabled) { border-color: var(--primary); }
+  .picker-cand:disabled { opacity: .35; cursor: not-allowed; }
+
+  .emoji-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(34px, 1fr));
+    gap: 4px;
+    margin-bottom: 8px;
+  }
+
+  .emoji-cell {
+    aspect-ratio: 1;
+    font-size: 17px;
+    line-height: 1;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    background: var(--soft);
+    cursor: pointer;
+  }
+
+  .emoji-cell:hover { border-color: var(--primary); }
+
+  .picker-new {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .picker-new input, .picker-new select {
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 8px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    min-width: 0;
+  }
+
+  .picker-new input { flex: 1; min-width: 90px; }
+
+  /* ── 时间线 ───────────────────────────────────────────── */
+  .timeline {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    /* 聊天窗口只留纵向滚动，不该出现横向滚动条。
+       横向溢出几乎都是某条内容撑出来的（上一版是没兜底好的头像），
+       头像修好后这里本来就装得下；overflow-x: hidden 只是兜底，
+       真要还有超宽内容，也会被裁掉而不是把整条时间线拉宽。 */
+    overflow-x: hidden;
+    padding: 14px 16px;
+  }
+
+  .beat-divider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 16px 0 10px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  /* 用 order 把「回到此处」排到分割线右边（伪元素也是 flex item，可以排） */
+  .beat-divider::before { order: 1; }
+  .beat-divider .beat-label { order: 2; }
+  .beat-divider::after { order: 3; }
+  .beat-divider .beat-jump { order: 4; }
+
+  .beat-divider::before, .beat-divider::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  .beat-divider:first-child { margin-top: 0; }
+
+  /* 「回到此处」是个低频的小控件 —— 平时低调到近乎装饰，
+     鼠标移上去才显出边框和提示（↶ 图标 + title 说明它到底会干什么）。 */
+  .beat-jump {
+    font: inherit;
+    font-size: 11px;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    padding: 1px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .beat-jump:hover {
+    color: var(--primary);
+    border-color: var(--border);
+    background: var(--soft);
+  }
+
+  .msg { display: flex; gap: 10px; margin-bottom: 14px; }
+
+  /* 同一个角色连着发的几条消息：只有第一条带头像/名字/时间，后面几条省掉，
+     气泡之间也收紧一点 —— 纯样式的合并不改任何数据。 */
+  .msg.is-merged { margin-bottom: 8px; }
+  .msg.is-merged .msg-head { display: none; }
+
+  /* 我方角色靠右，麦麦 Bot 靠左 */
+  .msg.is-mine { flex-direction: row-reverse; }
+
+  .msg-main {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+    max-width: 78%;
+  }
+
+  .msg.is-mine .msg-main { align-items: flex-end; }
+
+  .msg-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 12px;
+    margin-bottom: 3px;
+    max-width: 100%;
+  }
+
+  .msg.is-mine .msg-head { justify-content: flex-end; }
+
+  .msg-head .name { color: var(--fg); font-weight: 600; font-size: 13px; }
+  .msg-head .tag { color: var(--muted); }
+  .msg-head .time { color: var(--muted); }
+
+  .bubble {
+    display: inline-block;
+    max-width: 100%;
+    padding: 7px 12px;
+    border-radius: 12px;
+    background: var(--soft);
+    border: 1px solid var(--border);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* 麦麦 Bot 的气泡偏紫，我方角色的偏绿 */
+  .kind-line .bubble { background: #1d2a1f; border-color: #2f6b4c; }
+  .kind-reply .bubble { background: #241f33; border-color: #453a6b; }
+  .kind-sticker .bubble { background: transparent; border-style: dashed; color: var(--muted); font-size: 13px; }
+
+  .kind-waiting .bubble {
+    background: transparent;
+    border-style: dashed;
+    color: var(--muted);
+  }
+
+  .dots::after {
+    content: "…";
+    animation: dots 1.2s steps(4, end) infinite;
+  }
+
+  @keyframes dots {
+    0% { opacity: 0.2; }
+    100% { opacity: 1; }
+  }
+
+  .turnstate {
+    border-top: 1px solid var(--border);
+    padding: 8px 16px;
+    font-size: 12px;
+    color: var(--muted);
+    font-family: var(--maibot-font-mono, ui-monospace, Consolas, monospace);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    flex: 0 0 auto;
+  }
+
+  .turnstate b { color: var(--fg); font-weight: 600; }
+
+  .empty {
+    color: var(--muted);
+    text-align: center;
+    padding: 40px 20px;
+    font-size: 13px;
+  }
+
+  /* ── 段（segment）：一条分隔线 + 这一段的所有消息 ─────────── */
+  .segment { position: relative; }
+
+  /* 已作废的段：保留、不消失、不重排，只是灰掉并标「已作废」 */
+  .segment.is-voided .msg { opacity: .32; filter: grayscale(1); }
+  .segment.is-voided .beat-divider { opacity: .6; }
+  .segment.is-voided .beat-label { text-decoration: line-through; }
+
+  /* 剧情段（时光机生成）：金色左边框 + 旁白角标，跟普通段区分 */
+  .msg.kind-narrator .bubble {
+    background: #2a2413;
+    border-color: #6b5620;
+    border-left: 3px solid #d8a53c;
+  }
+  .msg.kind-narrator .avatar { background: #8a6d1f; }
+  .msg.kind-narrator .msg-head .tag { color: #ffd479; }
+  .beat-divider.is-plot { color: #ffd479; }
+  .beat-divider.is-plot::before, .beat-divider.is-plot::after { background: #6b5620; }
+  .beat-divider .beat-skip {
+    font-size: 11px;
+    color: #ffd479;
+    border: 1px solid #6b5620;
+    border-radius: 999px;
+    padding: 0 7px;
+    white-space: nowrap;
+  }
+
+  /* 「回到此处」的轻量确认气泡（小卡片，不是全屏弹窗） */
+  .truncate-confirm {
+    margin: 4px 0 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--danger);
+    border-radius: 10px;
+    background: var(--soft);
+    font-size: 12px;
+    color: var(--fg);
+  }
+  .truncate-confirm .tc-text { margin-bottom: 8px; }
+  .truncate-confirm .tc-actions { display: flex; gap: 8px; }
+  .truncate-confirm .maibot-button { padding: 3px 10px; font-size: 12px; }
+
+  /* ── 危险操作的通用确认层（删除房间 / 角色 / 群员 / 私聊对象）───────── */
+  .confirm-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(0, 0, 0, .55);
+  }
+  .confirm-card {
+    width: 100%;
+    max-width: 320px;
+    padding: 16px 18px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--danger);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--fg);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .45);
+    font-size: 13px;
+  }
+  .confirm-card .cf-title { font-weight: 600; margin-bottom: 6px; }
+  .confirm-card .cf-detail { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  .confirm-card .cf-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+  /* 输入区上方的状态条 */
+  .stage-bar {
+    flex: 0 0 auto;
+    padding: 6px 10px;
+    border-radius: 9px;
+    border: 1px solid #6b5620;
+    background: #2a2413;
+    color: #ffd479;
+    font-size: 12px;
+  }
+
+  /* 一次性提示框 */
+  .notice-pop {
+    position: absolute;
+    top: 46px;
+    right: 14px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 320px;
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: 1px solid #6b5620;
+    background: #2a2413;
+    color: #ffd479;
+    font-size: 12px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
+  }
+
+  /* ── 时光机面板 ─────────────────────────────────────── */
+  .tm-panel {
+    flex: 0 0 auto;
+    margin: 0 12px 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--soft);
+  }
+  .tm-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .tm-row { display: flex; gap: 6px; margin-bottom: 8px; }
+  .tm-number, .tm-unit, .tm-plot {
+    font: inherit;
+    font-size: 13px;
+    padding: 6px 8px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+  }
+  .tm-number { width: 92px; }
+  .tm-plot {
+    width: 100%;
+    min-height: 90px;
+    resize: vertical;
+    line-height: 1.7;
+    font-family: var(--maibot-font-mono, ui-monospace, Consolas, monospace);
+  }
+  .tm-hint {
+    font-size: 11px;
+    color: var(--muted);
+    margin: 6px 0 8px;
+  }
+
+  /* ── 剧本（结构化行）──────────────────────────────────── */
+  .composer {
+    /* 上边距去掉，好让剧本窗的标题和聊天窗的标题在同一水平线上 */
+    padding: 0 12px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+    /* 剧本窗口自己滚，跟中间聊天窗口一个行为 */
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .composer-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    font-size: 13px;
+    flex-wrap: wrap;
+    /* 和聊天列的标题栏留一样的上边距，两边标题才能齐平 */
+    padding: 6px 0 8px;
+  }
+
+  .composer-head .maibot-button { font-weight: 400; }
+  .composer-head .spacer { flex: 1; }
+
+  .script-rows {
+    /* 不自己滚：整块随内容长高，由 .composer 统一滚，避免嵌套滚动条 */
+    flex: 1 0 auto;
+    min-height: 120px;
+    overflow: visible;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .script-hint { padding: 10px 2px; }
+
+  .script-row {
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr) 20px 20px 20px;
+    gap: 4px;
+    align-items: center;
+  }
+
+  .script-row .icon-btn { padding: 3px 2px; font-size: 11px; line-height: 1; }
+
+  .script-row.is-unassigned .script-speaker { border-color: var(--danger); color: var(--danger); }
+
+  .script-speaker, .script-text {
+    font: inherit;
+    font-size: 13px;
+    padding: 6px 8px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    min-width: 0;
+  }
+
+  .script-text { font-family: var(--maibot-font-mono, ui-monospace, Consolas, monospace); }
+
+  /* 私聊窗口的大文本框（一次只发一句话，不需要一行一行的结构） */
+  .script-big {
+    flex: 1 1 auto;
+    min-height: 160px;
+    resize: none;
+    font-family: var(--maibot-font-body, inherit);
+    font-size: 14px;
+    line-height: 1.8;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+  }
+
+  .composer-head .script-speaker {
+    font: inherit;
+    font-size: 13px;
+    padding: 4px 6px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    max-width: 150px;
+  }
+
+  .composer-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+    flex: 0 0 auto;
+  }
+
+  .field-title { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+
+  .checks { display: flex; flex-wrap: wrap; gap: 8px; }
+
+  .check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--soft);
+    cursor: pointer;
+    font-size: 13px;
+    user-select: none;
+  }
+
+  .check:hover { border-color: var(--primary); }
+
+  .check input { margin: 0; accent-color: var(--primary); }
+  .check .order { color: var(--muted); font-size: 11px; }
+
+  .opts { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+
+  .switch-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .switch-row input { accent-color: var(--primary); width: 15px; height: 15px; }
+
+  .composer-foot {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 0 0 auto;
+  }
+
+  .err { color: var(--danger); font-size: 12px; flex: 1; }
+  .ok { color: #6ee7a8; font-size: 12px; flex: 1; }
+
+  /* ── 私聊 ─────────────────────────────────────────────── */
+  .pv-note {
+    font-size: 12px;
+    color: var(--muted);
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+  }
+
+  /* 窄窗口（iframe 宽度不够放三栏）时改成上下两段。
+     注意断点看的是 **iframe 自己的宽度**（= 窗口宽度 - WebUI 侧栏），
+     不是浏览器窗口宽度。 */
+  @media (max-width: 980px) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+    .side {
+      flex-direction: row;
+      overflow-x: auto;
+      overflow-y: hidden;
+    }
+    .side > .panel { min-width: 260px; max-height: 168px; }
+    .main {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr) minmax(0, 0.75fr);
+    }
+    #stage-view, #private-view { grid-column: 1; grid-row: 1; }
+    #composer, #composer-private { grid-column: 1; grid-row: 2; }
+    .script-rows { min-height: 90px; }
+  }
+</style>
+</head>
+<body class="maibot-page">
+<div id="app">
+  <input id="avatar-file" type="file" accept="image/jpeg,image/png,image/webp" hidden>
+  <div class="layout">
+    <aside class="side">
+      <!-- 顶行：群聊 / 私聊 拨片（在左栏，不占聊天列的标题行） -->
+      <div class="side-tabs">
+        <nav class="viewtabs">
+          <button type="button" class="viewtab is-active" data-view="stage">群聊</button>
+          <button type="button" class="viewtab" data-view="private">私聊</button>
+        </nav>
+      </div>
+
+      <!-- 剧本群聊：房间 + 群员 -->
+      <section class="panel" id="panel-rooms">
+        <div class="panel-head">
+          <span>房间</span>
+          <span class="muted" id="room-count"></span>
+        </div>
+        <form class="room-form" id="room-create-form">
+          <input id="room-new-name" maxlength="40" placeholder="新房间名" autocomplete="off">
+          <button class="maibot-button maibot-button-primary" type="submit">新建</button>
+        </form>
+        <ul class="roomlist" id="roomlist"></ul>
+        <div class="rename-row" id="rename-row" hidden>
+          <input id="room-rename-name" maxlength="40" placeholder="新名字" autocomplete="off">
+          <button class="maibot-button" type="button" id="room-rename-save">改名</button>
+          <button class="maibot-button" type="button" id="room-rename-cancel">取消</button>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-members">
+        <div class="panel-head">
+          <span>群员</span>
+        </div>
+        <div class="member-add-row" id="member-add-row"></div>
+        <div class="group-title">我的角色</div>
+        <ul class="memberlist" id="members-user"></ul>
+        <div class="group-title">麦麦 Bot</div>
+        <ul class="memberlist" id="members-bot"></ul>
+        <div class="picker" id="member-picker" hidden></div>
+      </section>
+
+      <!-- 私聊：没有「房间」这回事，直接列宿主的受管 Bot（默认全部展示，无需增删）-->
+      <section class="panel" id="panel-private" hidden>
+        <div class="panel-head">
+          <span>私聊对象</span>
+          <span class="muted" id="private-peer-count"></span>
+          <button class="icon-btn refresh-peers-btn" type="button" id="refresh-peers-btn"
+                  title="重新拉取宿主的受管 Bot 名单（当前为一次性加载，不自动刷新）">刷新</button>
+        </div>
+        <ul class="memberlist" id="private-peers"></ul>
+      </section>
+
+      <!-- 我的角色：管理我自己演的角色（全局一份、有顺序） -->
+      <section class="panel" id="panel-my-roles" hidden>
+        <div class="panel-head">
+          <span>我的角色</span>
+        </div>
+        <div class="speaker-picker-row">
+          <span class="speaker-picker-label">当前操作的角色</span>
+          <select class="script-speaker" id="private-speaker" title="当前用哪个角色私聊"></select>
+        </div>
+        <div class="member-add-row" id="my-role-add-row"></div>
+        <ul class="memberlist" id="my-roles"></ul>
+      </section>
+    </aside>
+
+    <main class="main">
+      <section class="stage" id="stage-view">
+        <div class="panel-head">
+          <span id="stage-room-name">—</span>
+          <button class="maibot-button maibot-button-secondary" type="button" id="time-machine-btn"
+                  title="前往未来：生成一段剧情（低频功能，不抢主操作的注意力）">时光机</button>
+          <span class="head-notice" id="script-error" hidden></span>
+          <button class="maibot-button maibot-button-danger" type="button" id="stop-turn" hidden>停止本轮</button>
+        </div>
+        <div id="tm-slot-group"></div>
+        <div class="timeline" id="timeline"></div>
+        <div class="turnstate" id="turnstate" hidden></div>
+        <div class="notice-pop" id="memory-notice" hidden>
+          <span>注意：正式版会同步处理 Bot 记忆中的旧剧情，当前为界面演示</span>
+          <button class="icon-btn" type="button" id="memory-notice-close">✕</button>
+        </div>
+      </section>
+
+      <section class="stage" id="private-view" hidden>
+        <div class="panel-head">
+          <span id="private-title">私聊</span>
+          <button class="maibot-button maibot-button-secondary" type="button" id="time-machine-private-btn"
+                  title="前往未来：生成一段剧情（低频功能，不抢主操作的注意力）">时光机</button>
+          <span class="head-notice" id="private-script-error" hidden></span>
+          <button class="maibot-button maibot-button-danger" type="button" id="stop-private-turn" hidden>停止本轮</button>
+        </div>
+        <div id="tm-slot-private"></div>
+        <div class="timeline" id="private-timeline"></div>
+        <div class="turnstate" id="private-turnstate" hidden></div>
+      </section>
+
+      <!-- 剧本群聊的剧本窗口 -->
+      <section class="composer" id="composer">
+        <div class="composer-head">
+          <span>剧本</span>
+          <span class="spacer"></span>
+          <button class="maibot-button maibot-button-primary" type="button" id="add-line">＋ 加一句</button>
+        </div>
+
+        <div class="stage-bar" id="stage-bar" hidden></div>
+        <div class="script-rows" id="script-rows"></div>
+
+        <div class="composer-grid">
+          <div>
+            <div class="field-title">不勾选=随机接话</div>
+            <div class="checks" id="speaker-checks"></div>
+            <div class="muted" id="turn-hint" style="margin-top:6px"></div>
+          </div>
+        </div>
+
+        <div class="composer-foot">
+          <button class="maibot-button maibot-button-primary" type="button" id="submit-beat">发送消息</button>
+        </div>
+      </section>
+
+      <!-- 私聊的剧本窗口（与群聊那套独立） -->
+      <section class="composer" id="composer-private" hidden>
+        <div class="composer-head">
+          <span>消息发送</span>
+          <span class="muted" id="private-peer-note">只发给对方一人</span>
+        </div>
+
+        <div class="stage-bar" id="stage-bar-private" hidden></div>
+        <textarea class="script script-big" id="private-text" spellcheck="false"
+          placeholder="要说的话…"></textarea>
+
+        <div class="composer-foot">
+          <button class="maibot-button maibot-button-primary" type="button" id="submit-private">发送消息</button>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- 危险操作的通用确认层：内容由 askConfirm() 动态填入，默认隐藏 -->
+<div class="confirm-overlay" id="confirm-overlay" hidden>
+  <div class="confirm-card" role="alertdialog" aria-modal="true">
+    <div class="cf-title" id="confirm-title"></div>
+    <div class="cf-detail" id="confirm-detail"></div>
+    <div class="cf-actions">
+      <button class="maibot-button" type="button" id="confirm-cancel">取消</button>
+      <button class="maibot-button maibot-button-danger" type="button" id="confirm-ok">确认删除</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  // 只挑 Windows 10 自带 Segoe UI Emoji 里一定有的字形：
+  // 🥷(Emoji 12) 和 🪄(Emoji 13) 在 Win10 上会显示成豆腐块 □，别用。
+
+  var state = {
+    version: "",
+    notice: "",
+    timing: {},
+    memberPool: [],
+    rooms: [],
+    replaceTarget: null,
+    editingName: null,
+    scriptRows: [],
+    narrator: null,
+    privateTimeline: {},
+    currentPeerId: null,
+    truncateTarget: null,
+    stageNote: null,
+    memoryNoticeShown: false,
+    tmGroup: null,
+    tmPrivate: null,
+    tmOpen: null,
+    myRoles: [],
+    peers: [],
+    managedBots: [],
+    privateSpeaker: "",
+    timeline: {},
+    privateThreads: [],
+    currentRoomId: null,
+    currentThreadId: null,
+    currentView: "stage",
+    speakerOrder: [],
+    // 界面上不再有「等待节奏」和「写完自动接话」的开关：
+    // 等待一律走真实节奏（@点名 ≈23s / 自发 ≈50s），接话一律自动。
+    autoReply: true,
+    speed: 1,
+    turn: null,
+    lastTurn: null,
+    privateTurn: null,
+    privateLastTurn: null,
+    turnToken: 0,
+    privateTurnToken: 0,
+    elapsedTimer: null,
+    elapsedNode: null,
+    privateElapsedTimer: null,
+    privateElapsedNode: null
+  };
+
+  var STATUS_TEXT = {
+    ready: "可接入",
+    gateway_off: "未启用网关",
+    stopped: "未运行"
+  };
+
+  function memberById(id) {
+    for (var i = 0; i < state.memberPool.length; i += 1) {
+      if (state.memberPool[i].member_id === id) { return state.memberPool[i]; }
+    }
+    return null;
+  }
+
+  // 当前房间的群员（成员是「房间级」的配置，每个房间一份名单）
+  function roomMembers(room) {
+    if (!room) { return []; }
+    var list = [];
+    (room.member_ids || []).forEach(function (id) {
+      var member = memberById(id);
+      if (member) { list.push(member); }
+    });
+    list.sort(function (a, b) {
+      var aUser = a.kind === "user_role";
+      var bUser = b.kind === "user_role";
+      if (aUser !== bUser) { return aUser ? -1 : 1; }
+      return (a.sort_order || 99) - (b.sort_order || 99);
+    });
+    return list;
+  }
+
+  // 当前房间里的麦麦 Bot = 本轮接话的候选范围
+  function botMembers() {
+    return roomMembers(currentRoom()).filter(function (m) { return m.kind === "bot"; });
+  }
+
+  // 「我的角色」= 我自己演的角色，**全局一份、有顺序**（不挂在某个房间下）。
+  function allMyRoles() {
+    return state.myRoles;
+  }
+
+  // 剧本框里能选的角色**只有「我的角色」**——Bot 是接话方，不是说话方。
+  function myRoleMembers(room) {
+    if (!room) { return state.myRoles; }
+    var inRoom = {};
+    (room.member_ids || []).forEach(function (id) { inRoom[id] = true; });
+    return state.myRoles.filter(function (m) { return inRoom[m.member_id]; });
+  }
+
+  function currentRoom() {
+    for (var i = 0; i < state.rooms.length; i += 1) {
+      if (state.rooms[i].room_id === state.currentRoomId) { return state.rooms[i]; }
+    }
+    return null;
+  }
+
+  // 私聊线程 = 「对方 Bot」× 「我方角色」。切角色下拉时，聊天窗口就换到对应那一对。
+  function currentThread() {
+    var peerId = state.currentPeerId;
+    var myId = state.privateSpeaker;
+    for (var i = 0; i < state.privateThreads.length; i += 1) {
+      var thread = state.privateThreads[i];
+      if (thread.peer_member_id === peerId && thread.my_member_id === myId) { return thread; }
+    }
+    return null;
+  }
+
+  // 切到某个私聊对象。视角（当前操作的角色）由下拉框固定，不随点 Bot 而变；
+  // 只有当前角色已失效时才兜底选第一个。
+  function switchPeer(peerId) {
+    state.currentPeerId = peerId;
+    if (!allMyRoles().some(function (m) { return m.member_id === state.privateSpeaker; })) {
+      state.privateSpeaker = allMyRoles().length ? allMyRoles()[0].member_id : "";
+    }
+    renderPrivatePeers();
+    renderPrivateSpeaker();
+    renderPrivate();
+    renderPrivateTurnState();
+  }
+
+  // 切到另一个私聊对象：中间窗口的标题、时间线、剧本窗口、调试面板全跟着切
+  function switchThread(threadId) {
+    for (var i = 0; i < state.privateThreads.length; i += 1) {
+      if (state.privateThreads[i].thread_id === threadId) {
+        switchPeer(state.privateThreads[i].peer_member_id);
+        return;
+      }
+    }
+  }
+
+  function nowClock() {
+    var d = new Date();
+    function pad(n) { return n < 10 ? "0" + n : "" + n; }
+    return pad(d.getHours()) + ":" + pad(d.getMinutes());
+  }
+
+  /* ── 房间 ─────────────────────────────────────────────── */
+
+  function renderRooms() {
+    var list = $("roomlist");
+    list.innerHTML = "";
+    $("room-count").textContent = state.rooms.length + " 个";
+    state.rooms.forEach(function (room) {
+      var li = document.createElement("li");
+      if (room.room_id === state.currentRoomId) { li.className = "is-current"; }
+
+      var name = document.createElement("span");
+      name.className = "room-name";
+      name.textContent = room.name;
+      name.title = room.name + "（" + room.room_id + "）";
+      name.onclick = function () { switchRoom(room.room_id); };
+      li.appendChild(name);
+
+      var rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "icon-btn";
+      rename.textContent = "改名";
+      rename.onclick = function () { beginRename(room); };
+      li.appendChild(rename);
+
+      var exportButton = document.createElement("button");
+      exportButton.type = "button";
+      exportButton.className = "icon-btn";
+      exportButton.textContent = "导出";
+      exportButton.title = "导出这个房间的聊天记录";
+      exportButton.onclick = function () { exportRoom(room); };
+      li.appendChild(exportButton);
+
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "icon-btn is-danger";
+      remove.textContent = "✕";
+      remove.title = "删掉这个房间";
+      remove.onclick = function () {
+        askConfirm(
+          "删除房间「" + room.name + "」？",
+          "这个房间的聊天记录会一起清掉，不可撤销。",
+          function () { deleteRoom(room); }
+        );
+      };
+      li.appendChild(remove);
+
+      list.appendChild(li);
+    });
+  }
+
+  // 导出入口（UI 先立住）：真正的导出要等下一阶段把剧本存档落成 SQLite，
+  // 那时才有「一份可导出的记录」可导；壳阶段内存态导不出有意义的文件。
+  function exportRoom(room) {
+    var count = (state.timeline[room.room_id] || []).length;
+    showInfo(
+      "导出「" + room.name + "」（当前 " + count + " 条记录）：入口先立在这了。" +
+      "真正导出要等剧本存档落成 SQLite —— 现在房间记录只在内存里（插件重载就没），导不出有意义的文件。"
+    );
+  }
+
+  async function deleteRoom(room) {
+    try {
+      var result = await window.maibot.action("delete_room", { room_id: room.room_id });
+      var failure = businessError(result);
+      if (failure) { showError("删除房间失败：" + failure); return; }
+      state.rooms = result.rooms || state.rooms;
+      delete state.timeline[room.room_id];
+      if (state.currentRoomId === room.room_id) {
+        state.currentRoomId = state.rooms.length ? state.rooms[0].room_id : null;
+      }
+      clearError();
+      renderRooms();
+      renderMembers();
+      renderSpeakerChecks();
+      updateTurnHint();
+      renderScriptRows();
+      renderTimeline();
+    } catch (error) {
+      showError("删除房间失败：" + error.message);
+    }
+  }
+
+  function switchRoom(roomId) {
+    state.currentRoomId = roomId;
+    state.replaceTarget = null;
+    state.editingName = null;
+    $("rename-row").hidden = true;
+    // 点名名单只保留新房间里还在的 Bot
+    var allowed = {};
+    botMembers().forEach(function (member) { allowed[member.member_id] = true; });
+    state.speakerOrder = state.speakerOrder.filter(function (id) { return allowed[id]; });
+    // 剧本行里指向旧房间成员的也清掉
+    state.scriptRows = state.scriptRows.filter(function (row) {
+      return !row.member_id || allowed[row.member_id] || isUserRole(row.member_id);
+    });
+    renderRooms();
+    renderMembers();
+    renderSpeakerChecks();
+    updateTurnHint();
+    renderScriptRows();
+    renderTimeline();
+  }
+
+  function isUserRole(memberId) {
+    var member = memberById(memberId);
+    return !!(member && member.kind === "user_role");
+  }
+
+  function beginRename(room) {
+    var row = $("rename-row");
+    row.hidden = false;
+    $("room-rename-name").value = room.name;
+    $("room-rename-name").focus();
+  }
+
+  async function createRoom(event) {
+    event.preventDefault();
+    var input = $("room-new-name");
+    var name = input.value.trim();
+    if (!name) { input.focus(); return; }
+    try {
+      var result = await window.maibot.action("create_room", { name: name });
+      var failure = businessError(result);
+      if (failure) { showError("新建房间失败：" + failure); return; }
+      state.rooms = result.rooms || state.rooms;
+      input.value = "";
+      renderRooms();
+      if (result.created) { switchRoom(result.created.room_id); }
+    } catch (error) {
+      showError("新建房间失败：" + error.message);
+    }
+  }
+
+  async function renameRoom() {
+    var room = currentRoom();
+    if (!room) { return; }
+    var name = $("room-rename-name").value.trim();
+    if (!name) { showError("房间名不能为空"); return; }
+    try {
+      var result = await window.maibot.action("rename_room", { room_id: room.room_id, name: name });
+      var failure = businessError(result);
+      if (failure) { showError("重命名失败：" + failure); return; }
+      state.rooms = result.rooms || state.rooms;
+      $("rename-row").hidden = true;
+      renderRooms();
+      renderTimeline();
+    } catch (error) {
+      showError("重命名失败：" + error.message);
+    }
+  }
+
+  /* ── 群员 ─────────────────────────────────────────────── */
+
+  function renderMembers() {
+    var userBox = $("members-user");
+    var botBox = $("members-bot");
+    userBox.innerHTML = "";
+    botBox.innerHTML = "";
+
+    var members = roomMembers(currentRoom());
+    var users = members.filter(function (m) { return m.kind === "user_role"; });
+    var bots = members.filter(function (m) { return m.kind === "bot"; });
+
+    if (!members.length) {
+      var empty = document.createElement("li");
+      empty.className = "muted";
+      empty.textContent = "这个房间还没有群员，点「＋ 添加」挑人。";
+      userBox.appendChild(empty);
+    }
+    users.forEach(function (member) { userBox.appendChild(memberRow(member, false)); });
+    bots.forEach(function (member) { botBox.appendChild(memberRow(member, true)); });
+    renderMemberPicker();
+    // 下游的添加组件：只列上游（我的角色 / 私聊对象）已经有的角色
+    buildAddRow("member-add-row", "pick", null, function (args) {
+      memberAction("add_member", args);
+    });
+  }
+
+  // 换头像：选图 → canvas 缩到 128×128 → JPEG → **data URI 直接交给插件**
+  //
+  // 这里**不走宿主的上传通道**（不申请 webui.claim_upload）：
+  // 上传通道会把图片落到 <实例根>/data/plugins/<插件>/uploads/，
+  // 而「不写 Bot 的 data/ 目录」是本项目的铁律 —— 原样保留，不申请豁免。
+  // 改成纯内存：图片只在页面里缩一次，变成一段 data URI 传给插件，**一个字节都不落盘**。
+  //
+  // 代价：头像只活在插件内存里，插件重载就回出厂 emoji。
+  // 这与壳阶段「房间 / 时间线也只存在内存」的语义一致，是特性不是缺陷。
+  // 填肉阶段头像改随聊天室自己的 SQLite 存档走（data URI 存 TEXT），仍不碰宿主上传通道。
+  function pickAvatarImage(memberId) {
+    var input = $("avatar-file");
+    input.value = "";
+    input.onchange = function () {
+      var file = input.files && input.files[0];
+      if (!file) { return; }
+      shrinkImage(file).then(function (dataUrl) {
+        return window.maibot.action("update_member", {
+          member_id: memberId,
+          avatar: dataUrl
+        });
+      }).then(function (result) {
+        var failure = businessError(result);
+        if (failure) { showError("头像设置失败：" + failure); return; }
+        applyMemberResult(result);
+        clearError();
+      }).catch(function (error) {
+        showError("头像设置失败：" + (error && error.message ? error.message : error));
+      });
+    };
+    input.click();
+  }
+
+  // 宿主对 **整个 args JSON** 的上限是 65536 字节（src/plugin_runtime/webui_schema.py
+  // 的 MAX_ARGUMENT_BYTES），不是单个参数的上限 —— avatar 的 data URI 得和其它参数
+  // 一起算进这个总量，所以这里留出余量（member_id + JSON 结构开销）。
+  // 128×128 的 JPEG 实测最坏情况（纯随机噪声）约 16655 字符，真实照片远小于此；
+  // 万一超了，先降一档质量重编码，仍超才报错 —— 不让宿主抛一个看不懂的 schema 错。
+  var AVATAR_MAX_CHARS = 48000;
+
+  function shrinkImage(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onerror = function () { reject(new Error("图片读不出来")); };
+      reader.onload = function () {
+        var img = new Image();
+        img.onerror = function () { reject(new Error("这张图打不开")); };
+        img.onload = function () {
+          var size = 128;
+          var canvas = document.createElement("canvas");
+          canvas.width = size;
+          canvas.height = size;
+          var ctx = canvas.getContext("2d");
+          var scale = Math.max(size / img.width, size / img.height);
+          var w = img.width * scale;
+          var h = img.height * scale;
+          ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+          var dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+          if (dataUrl.length <= AVATAR_MAX_CHARS) {
+            resolve(dataUrl);
+            return;
+          }
+          // 超了：降一档质量再试
+          var smaller = canvas.toDataURL("image/jpeg", 0.6);
+          if (smaller.length <= AVATAR_MAX_CHARS) {
+            resolve(smaller);
+            return;
+          }
+          reject(new Error("这张图太大了，换一张或小一点的"));
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // 上传 / 改名等操作回来的数据统一刷一遍
+  function applyMemberResult(result) {
+    if (result.member_pool) { state.memberPool = result.member_pool; }
+    if (result.my_roles) { state.myRoles = result.my_roles; }
+    if (result.peers) { state.peers = result.peers; }
+    if (result.managed_bots) { state.managedBots = result.managed_bots; }
+    if (result.rooms) { state.rooms = result.rooms; }
+    renderMyRoles();
+    renderPrivatePeers();
+    renderMembers();
+    renderSpeakerChecks();
+    updateTurnHint();
+    renderScriptRows();
+    renderTimeline();
+  }
+
+  // 头像统一走这里，三种情况：
+  //   · data URI（上传来的图）→ 渲染成 <img>；
+  //   · 图片加载失败 → 退回「角色首字」的纯色圆牌（**绝不露出 alt 文本**，
+  //     也绝不能让破图把圆牌撑大 —— 那会顺带把整条时间线撑出横向滚动条）；
+  //   · emoji / 普通文字 → 直接当文字放进去。
+  // 注意判断用的是 "data:" 而不是 "data:image"：万一某条路径把 data URI 截短了
+  // （例如只剩 "data:ima"），它也该走「图片 → 加载失败 → 首字兜底」这条路，
+  // 而不是当成普通文字把 "data:ima" 原样露出来。
+  function fillAvatar(node, value, fallbackText) {
+    node.innerHTML = "";
+    var raw = value || "";
+    if (raw.indexOf("data:") === 0) {
+      var pic = document.createElement("img");
+      pic.className = "avatar-img";
+      pic.alt = "";
+      pic.addEventListener("error", function () {
+        node.innerHTML = "";
+        node.textContent = fallbackText || "？";
+        node.classList.add("is-fallback");
+      });
+      pic.src = raw;
+      node.appendChild(pic);
+      return;
+    }
+    node.textContent = raw || fallbackText || "？";
+  }
+
+  function memberRow(member, isBot) {
+    var li = document.createElement("li");
+
+    // 头像：我方角色可点（**上传图片**）；Bot 的头像来自它自己的配置，只读
+    var avatar = document.createElement("button");
+    avatar.type = "button";
+    avatar.className = "avatar" + (isBot ? " is-bot" : "");
+    fillAvatar(avatar, member.avatar, member.display_name.slice(0, 1));
+    if (member.editable) {
+      avatar.title = "点击上传头像";
+      avatar.onclick = function () { pickAvatarImage(member.member_id); };
+    } else {
+      // 状态不再单独占一列（太占地方），挪到头像的悬停提示里
+      avatar.title = "Bot 群员的头像来自它自己的配置\n" + statusDetail(member);
+      avatar.disabled = true;
+    }
+    li.appendChild(avatar);
+
+    var text = document.createElement("div");
+    text.className = "member-text";
+
+    if (state.editingName === member.member_id && member.editable) {
+      var nameInput = document.createElement("input");
+      nameInput.className = "name-edit";
+      nameInput.value = member.display_name;
+      nameInput.onkeydown = function (event) {
+        if (event.key === "Enter") { event.preventDefault(); saveName(member.member_id, nameInput.value); }
+        if (event.key === "Escape") { state.editingName = null; renderMembers(); }
+      };
+      nameInput.onblur = function () { saveName(member.member_id, nameInput.value); };
+      text.appendChild(nameInput);
+      setTimeout(function () { nameInput.focus(); nameInput.select(); }, 0);
+    } else {
+      var name = document.createElement("div");
+      name.className = "member-name" + (member.editable ? " is-editable" : "");
+      name.textContent = member.display_name;
+      if (member.editable) {
+        name.title = "点击改名字";
+        name.onclick = function () { state.editingName = member.member_id; renderMembers(); };
+      } else {
+        // Bot 的身份信息不单独占一行，挪到名字的悬停提示里
+        name.title = member.persona_label + " · " + (member.bot_name || "未登记 Bot");
+      }
+      text.appendChild(name);
+    }
+
+    if (isBot) {
+      // Bot 行多一行身份：人格标签 · Bot 名（我方角色只显示名字）
+      var sub = document.createElement("div");
+      sub.className = "member-sub";
+      sub.textContent = member.bot_name || "未登记 Bot";
+      text.appendChild(sub);
+    }
+    li.appendChild(text);
+
+    var actions = document.createElement("div");
+    actions.className = "member-actions";
+    var replace = document.createElement("button");
+    replace.type = "button";
+    replace.className = "icon-btn";
+    replace.textContent = "替换";
+    replace.title = "用别的群员顶替他（先删后增）";
+    replace.onclick = function () { startReplace(member.member_id); };
+    actions.appendChild(replace);
+    var remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-btn is-danger";
+    remove.textContent = "删除";
+    remove.title = "把他移出这个房间（已有发言保留）";
+    remove.onclick = function () {
+      askConfirm(
+        "把「" + member.display_name + "」移出房间？",
+        "他已有的发言会保留，但不再留在这个群里。",
+        function () { removeMember(member.member_id); }
+      );
+    };
+    actions.appendChild(remove);
+    li.appendChild(actions);
+    return li;
+  }
+
+  function statusDetail(member) {
+    if (member.status === "ready") {
+      return "名单层：Bot 运行中；握手层：maim 网关 api_key 连通 → 可接入";
+    }
+    if (member.status === "gateway_off") {
+      return "名单层：Bot 在册；握手层：maim 网关未启用或 key 不对 → 去 bot_config.toml 的 [maim_message] 打开";
+    }
+    return "名单层：Bot 已停止 → 先在机器人管理里启动它";
+  }
+
+  /* ── 成员增 / 删 / 换 / 改 ────────────────────────────── */
+
+  function startReplace(memberId) {
+    state.replaceTarget = memberId;
+    renderMemberPicker();
+  }
+
+  /* ── 添加组件（三个地方共用一个构建器）────────────────────
+     · 上游（我的角色 / 私聊对象）：**新建**一个角色并登记 —— 名字输入 + 添加
+     · 下游（房间群员）：**从上游挑**一个角色加进房间 —— 双联下拉 + 添加
+     下游永远只列上游已经有的角色：上游没加过的，这里选不到。            */
+
+  function buildAddRow(rowId, mode, kind, onDone) {
+    var row = $(rowId);
+    if (!row) { return; }
+    row.innerHTML = "";
+
+    if (mode === "create") {
+      // 上游：新建
+      var input = document.createElement("input");
+      input.type = "text";
+      input.className = "mini-select";
+      input.maxLength = 24;
+      input.placeholder = "角色名字";
+      row.appendChild(input);
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "maibot-button";
+      button.textContent = "添加";
+      button.onclick = function () {
+        var name = (input.value || "").trim();
+        if (!name) { showError("先给它起个名字"); return; }
+        onDone({ display_name: name });
+        input.value = "";
+      };
+      row.appendChild(button);
+      return;
+    }
+
+    // 下游：从上游挑
+    var kindSelect = document.createElement("select");
+    kindSelect.className = "mini-select";
+    kindSelect.title = "先选角色类型";
+    [["user_role", "我的角色"], ["bot", "麦麦Bot"]].forEach(function (pair) {
+      var option = document.createElement("option");
+      option.value = pair[0];
+      option.textContent = pair[1];
+      kindSelect.appendChild(option);
+    });
+    row.appendChild(kindSelect);
+    var memberSelect = document.createElement("select");
+    memberSelect.className = "mini-select";
+    memberSelect.title = "选一个角色";
+    row.appendChild(memberSelect);
+    var addButton = document.createElement("button");
+    addButton.type = "button";
+    addButton.className = "maibot-button";
+    addButton.textContent = "添加";
+    row.appendChild(addButton);
+
+    function fill() {
+      var chosen = kindSelect.value;
+      var room = currentRoom();
+      var inRoom = {};
+      (room && room.member_ids ? room.member_ids : []).forEach(function (id) { inRoom[id] = true; });
+      memberSelect.innerHTML = "";
+      // 上游名单：我的角色 + 私聊对象（与 replace 候选同一套来源）
+      var upstream = chosen === "user_role" ? state.myRoles : state.peers;
+      var candidates = upstream.filter(function (member) { return member.kind === chosen; });
+      if (!candidates.length) {
+        var none = document.createElement("option");
+        none.value = "";
+        none.textContent = "（上游还没有，先去左边添加）";
+        memberSelect.appendChild(none);
+        return;
+      }
+      // 只列还没进房间的：全部都在房间里时就别再把这些名字摆出来了
+      var free = candidates.filter(function (member) { return !inRoom[member.member_id]; });
+      if (!free.length) {
+        var done = document.createElement("option");
+        done.value = "";
+        done.textContent = "（都已添加）";
+        memberSelect.appendChild(done);
+        return;
+      }
+      free.forEach(function (member) {
+        var option = document.createElement("option");
+        option.value = member.member_id;
+        option.textContent = member.display_name;
+        memberSelect.appendChild(option);
+      });
+      memberSelect.value = free[0].member_id;
+    }
+    kindSelect.onchange = fill;
+    addButton.onclick = function () {
+      var memberId = memberSelect.value;
+      if (!memberId) { showError("上游还没有这个角色，先去左边添加"); return; }
+      onDone({ member_id: memberId });
+    };
+    fill();
+  }
+
+  // 群员面板里的候选列表：**替换**某个人时用
+  // · 就近出现：从「我的角色」点开就贴在 members-user 后，从「麦麦 Bot」点开就贴在 members-bot 后
+  // · 候选只列**同类且不在房间里**的角色：我的角色只换我的角色、Bot 只换 Bot，
+  //   而且已经在房间里的不再列出（否则选它只会把两个人换位，不是替换）
+  function renderMemberPicker() {
+    var box = $("member-picker");
+    if (!state.replaceTarget) { box.hidden = true; box.innerHTML = ""; return; }
+
+    var target = memberById(state.replaceTarget);
+    if (!target) { state.replaceTarget = null; box.hidden = true; box.innerHTML = ""; return; }
+    var isUser = target.kind === "user_role";
+
+    // 把操作栏挪到被替换者所属那一组的正下方，而不是一直待在面板底部
+    var anchor = $(isUser ? "members-user" : "members-bot");
+    if (anchor && anchor.nextSibling !== box) {
+      anchor.parentNode.insertBefore(box, anchor.nextSibling);
+    }
+
+    box.hidden = false;
+    box.innerHTML = "";
+
+    var title = document.createElement("div");
+    title.className = "picker-title";
+    title.textContent = "用谁顶替「" + target.display_name + "」：";
+    box.appendChild(title);
+
+    var cands = document.createElement("div");
+    cands.className = "picker-cands";
+    // 已在房间里的成员（含被替换者自己）都不能当候选
+    var room = currentRoom();
+    var inRoom = {};
+    (room && room.member_ids ? room.member_ids : []).forEach(function (id) { inRoom[id] = true; });
+    // 只从同类上游里挑：我的角色 → state.myRoles；Bot → state.peers（与 buildAddRow 一致）
+    var upstream = isUser ? state.myRoles : state.peers;
+    var kind = isUser ? "user_role" : "bot";
+    var free = upstream.filter(function (member) {
+      return member.kind === kind && !inRoom[member.member_id];
+    });
+    if (!free.length) {
+      var none = document.createElement("div");
+      none.className = "muted";
+      none.textContent = "（没有可替换的角色）";
+      cands.appendChild(none);
+    }
+    free.forEach(function (member) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "picker-cand";
+      button.textContent = member.display_name;
+      button.onclick = function () {
+        var oldId = state.replaceTarget;
+        state.replaceTarget = null;
+        memberAction("replace_member", { old_member_id: oldId, new_member_id: member.member_id });
+      };
+      cands.appendChild(button);
+    });
+    box.appendChild(cands);
+
+    var cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "maibot-button";
+    cancel.textContent = "取消";
+    cancel.onclick = function () { state.replaceTarget = null; renderMemberPicker(); };
+    box.appendChild(cancel);
+  }
+
+
+
+
+
+  function pickCandidate(memberId) {
+    if (state.replaceTarget) {
+      var oldId = state.replaceTarget;
+      state.replaceTarget = null;
+      memberAction("replace_member", { old_member_id: oldId, new_member_id: memberId });
+    } else {
+      memberAction("add_member", { member_id: memberId });
+    }
+  }
+
+  function removeMember(memberId) {
+    memberAction("remove_member", { member_id: memberId });
+  }
+
+  function createMember(displayName, kind, input) {
+    if (!displayName || !displayName.trim()) { showError("先给新群员起个名字"); return; }
+    memberAction("create_member", { display_name: displayName.trim(), kind: kind }, function () {
+      if (input) { input.value = ""; }
+    });
+  }
+
+  function saveName(memberId, value) {
+    if (state.editingName !== memberId) { return; }
+    state.editingName = null;
+    var clean = (value || "").trim();
+    var member = memberById(memberId);
+    if (!member || !member.editable) { renderMembers(); return; }
+    if (!clean) { renderMembers(); showError("名字不能为空"); return; }
+    if (clean === member.display_name) { renderMembers(); return; }
+    memberAction("update_member", { member_id: memberId, display_name: clean });
+  }
+
+  function memberAction(action, args, onOk) {
+    var room = currentRoom();
+    if (!room) { showError("先选一个房间"); return; }
+    var payload = { room_id: room.room_id };
+    Object.keys(args || {}).forEach(function (key) { payload[key] = args[key]; });
+    window.maibot.action(action, payload).then(function (result) {
+      var failure = businessError(result);
+      if (failure) { showError(failure); renderMembers(); return; }
+      state.rooms = result.rooms || state.rooms;
+      if (result.member_pool) { state.memberPool = result.member_pool; }
+      // 点名名单只保留还在本房间里的 Bot
+      var allowed = {};
+      botMembers().forEach(function (member) { allowed[member.member_id] = true; });
+      state.speakerOrder = state.speakerOrder.filter(function (id) { return allowed[id]; });
+      clearError();
+      renderMembers();
+      renderSpeakerChecks();
+      updateTurnHint();
+      renderScriptRows();
+      renderTimeline();
+      if (onOk) { onOk(); }
+    }).catch(function (error) {
+      showError("操作失败：" + error.message);
+    });
+  }
+
+  /* ── 本轮谁接话 ───────────────────────────────────────── */
+
+  function renderSpeakerChecks() {
+    var box = $("speaker-checks");
+    box.innerHTML = "";
+    botMembers().forEach(function (member) {
+      var label = document.createElement("label");
+      label.className = "check";
+
+      var input = document.createElement("input");
+      input.type = "checkbox";
+      input.value = member.member_id;
+      input.checked = state.speakerOrder.indexOf(member.member_id) >= 0;
+      input.onchange = function () {
+        var at = state.speakerOrder.indexOf(member.member_id);
+        if (input.checked) {
+          if (at < 0) { state.speakerOrder.push(member.member_id); }
+        } else if (at >= 0) {
+          state.speakerOrder.splice(at, 1);
+        }
+        // 只刷新顺序角标，不重建 DOM —— 重建会把刚点中的复选框换掉，
+        // 既丢焦点，也会让外部自动化检测不到状态变化。
+        refreshSpeakerOrder();
+        updateTurnHint();
+      };
+      label.appendChild(input);
+
+      var name = document.createElement("span");
+      name.textContent = member.display_name;
+      label.appendChild(name);
+
+      var order = document.createElement("span");
+      order.className = "order";
+      label.appendChild(order);
+
+      box.appendChild(label);
+    });
+    refreshSpeakerOrder();
+  }
+
+  function refreshSpeakerOrder() {
+    var labels = document.querySelectorAll("#speaker-checks .check");
+    for (var i = 0; i < labels.length; i += 1) {
+      var input = labels[i].querySelector("input");
+      var badge = labels[i].querySelector(".order");
+      if (!input || !badge) { continue; }
+      var at = state.speakerOrder.indexOf(input.value);
+      badge.textContent = at >= 0 ? "#" + (at + 1) : "";
+    }
+  }
+
+  // 勾了人时才给一句顺序反馈；一个都没勾时不显示任何字（面板标题已经说了「不勾选=随机接话」）
+  function updateTurnHint() {
+    var timing = state.timing || {};
+    if (state.speakerOrder.length) {
+      var names = state.speakerOrder.map(function (id) {
+        var member = memberById(id);
+        return member ? member.display_name : id;
+      });
+      $("turn-hint").textContent =
+        names.join(" → ") + "（约 " + (timing.named_seconds || 23) + "s 一人）";
+    } else {
+      $("turn-hint").textContent = "";
+    }
+  }
+
+  /* ── 剧本（结构化行）──────────────────────────────────── */
+
+  // 剧本框里能选的角色**只有「我的角色」**——Bot 是接话方，不是说话方。
+  function renderScriptRows() {
+    renderRowsInto($("script-rows"), state.scriptRows, myRoleMembers(currentRoom()));
+  }
+
+  // 私聊窗口只有一个发言人 + 一段话，没有「台词行」那套结构。
+  function renderPrivateSpeaker() {
+    var select = $("private-speaker");
+    var roles = allMyRoles();
+    select.innerHTML = "";
+    roles.forEach(function (member) {
+      var option = document.createElement("option");
+      option.value = member.member_id;
+      option.textContent = member.display_name;
+      if (member.member_id === state.privateSpeaker) { option.selected = true; }
+      select.appendChild(option);
+    });
+    if (!state.privateSpeaker && roles.length) {
+      state.privateSpeaker = roles[0].member_id;
+      select.value = state.privateSpeaker;
+    }
+    if (!roles.length) {
+      var empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "（还没有我的角色）";
+      select.appendChild(empty);
+    }
+  }
+
+  function renderRowsInto(box, rows, roles) {
+    box.innerHTML = "";
+    if (!rows.length) {
+      var hint = document.createElement("div");
+      hint.className = "muted script-hint";
+      hint.textContent = "还没有台词。点「＋ 加一句」挑个角色写一句。";
+      box.appendChild(hint);
+      return;
+    }
+    rows.forEach(function (row, index) {
+      box.appendChild(scriptRowEl(row, index, roles, rows));
+    });
+  }
+
+  function scriptRowEl(row, index, roles, list) {
+    var el = document.createElement("div");
+    el.className = "script-row" + (row.member_id ? "" : " is-unassigned");
+
+    var select = document.createElement("select");
+    select.className = "script-speaker";
+    var placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = row.member_id ? "— 选角色 —" : "— 未指派 —";
+    select.appendChild(placeholder);
+    roles.forEach(function (member) {
+      var option = document.createElement("option");
+      option.value = member.member_id;
+      option.textContent = member.display_name;
+      if (member.member_id === row.member_id) { option.selected = true; }
+      select.appendChild(option);
+    });
+    select.onchange = function () {
+      row.member_id = select.value;
+      var member = memberById(select.value);
+      row.speaker = member ? member.display_name : "";
+      renderScriptRows();
+    };
+    el.appendChild(select);
+
+    var input = document.createElement("input");
+    input.type = "text";
+    input.className = "script-text";
+    input.value = row.text;
+    input.placeholder = "台词…";
+    input.oninput = function () { row.text = input.value; updateSubmitButtons(); };
+    el.appendChild(input);
+
+    // ↑↓ 调整这一行在剧本里的位置 —— 顺序很重要：
+    // 它决定 Bot 读到台词的先后，等同于真实群聊里群友发言的先后。
+    var up = document.createElement("button");
+    up.type = "button";
+    up.className = "icon-btn";
+    up.textContent = "↑";
+    up.title = "上移一行";
+    up.disabled = index === 0;
+    up.onclick = function () { moveRow(list, index, -1); };
+    el.appendChild(up);
+
+    var down = document.createElement("button");
+    down.type = "button";
+    down.className = "icon-btn";
+    down.textContent = "↓";
+    down.title = "下移一行";
+    down.disabled = index === list.length - 1;
+    down.onclick = function () { moveRow(list, index, 1); };
+    el.appendChild(down);
+
+    var del = document.createElement("button");
+    del.type = "button";
+    del.className = "icon-btn is-danger";
+    del.textContent = "✕";
+    del.title = "删掉这一行";
+    del.onclick = function () { removeRow(row); };
+    el.appendChild(del);
+    return el;
+  }
+
+  function moveRow(list, index, delta) {
+    var at = index + delta;
+    if (at < 0 || at >= list.length) { return; }
+    var moved = list[index];
+    list[index] = list[at];
+    list[at] = moved;
+    renderScriptRows();
+  }
+
+  function removeRow(row) {
+    var at = state.scriptRows.indexOf(row);
+    if (at >= 0) { state.scriptRows.splice(at, 1); }
+    renderScriptRows();
+    updateSubmitButtons();
+  }
+
+  function addRowTo(list, preferMemberId) {
+    var roles = myRoleMembers(currentRoom());
+    var pick = preferMemberId || "";
+    if (!pick) {
+      // 沿用上一行的角色：连续说同一个角色最常见
+      var last = list[list.length - 1];
+      if (last && last.member_id && memberById(last.member_id)) {
+        pick = last.member_id;
+      } else if (roles.length) {
+        pick = roles[0].member_id;
+      }
+    }
+    var member = memberById(pick);
+    list.push({
+      member_id: pick,
+      speaker: member ? member.display_name : "",
+      text: ""
+    });
+    renderScriptRows();
+    updateSubmitButtons();
+    var inputs = document.querySelectorAll("#script-rows .script-text");
+    if (inputs.length) { inputs[inputs.length - 1].focus(); }
+  }
+
+  /* ── 我的角色（私聊模式下的管理面板）────────────────────── */
+
+  function renderMyRoles() {
+    var box = $("my-roles");
+    box.innerHTML = "";
+    var roles = allMyRoles();
+    if (!roles.length) {
+      var empty = document.createElement("li");
+      empty.className = "muted";
+      empty.textContent = "还没有我的角色，在上面新建一个。";
+      box.appendChild(empty);
+    }
+    roles.forEach(function (member, index) {
+      box.appendChild(myRoleRow(member, index, roles));
+    });
+    // 上游的添加组件：新建一个我的角色
+    buildAddRow("my-role-add-row", "create", "user_role", function (args) {
+      myRoleAction("add_my_role", args);
+    });
+  }
+
+  function myRoleRow(member, index, roles) {
+    var li = document.createElement("li");
+
+    var avatar = document.createElement("button");
+    avatar.type = "button";
+    avatar.className = "avatar";
+    fillAvatar(avatar, member.avatar, member.display_name.slice(0, 1));
+    avatar.title = "点击上传头像";
+    avatar.onclick = function () { pickAvatarImage(member.member_id); };
+    li.appendChild(avatar);
+
+    var text = document.createElement("div");
+    text.className = "member-text";
+    if (state.editingName === member.member_id) {
+      var nameInput = document.createElement("input");
+      nameInput.className = "name-edit";
+      nameInput.value = member.display_name;
+      nameInput.onkeydown = function (event) {
+        if (event.key === "Enter") { event.preventDefault(); saveMyRoleName(member.member_id, nameInput.value); }
+        if (event.key === "Escape") { state.editingName = null; renderMyRoles(); }
+      };
+      nameInput.onblur = function () { saveMyRoleName(member.member_id, nameInput.value); };
+      text.appendChild(nameInput);
+      setTimeout(function () { nameInput.focus(); nameInput.select(); }, 0);
+    } else {
+      var name = document.createElement("div");
+      name.className = "member-name is-editable";
+      name.textContent = member.display_name;
+      name.title = "点击改名字";
+      name.onclick = function () { state.editingName = member.member_id; renderMyRoles(); };
+      text.appendChild(name);
+    }
+    li.appendChild(text);
+
+    var actions = document.createElement("div");
+    actions.className = "member-actions";
+
+    var up = document.createElement("button");
+    up.type = "button";
+    up.className = "icon-btn";
+    up.textContent = "↑";
+    up.title = "上移一位";
+    up.disabled = index === 0;
+    up.onclick = function () { moveMyRole(index, -1); };
+    actions.appendChild(up);
+
+    var down = document.createElement("button");
+    down.type = "button";
+    down.className = "icon-btn";
+    down.textContent = "↓";
+    down.title = "下移一位";
+    down.disabled = index === roles.length - 1;
+    down.onclick = function () { moveMyRole(index, 1); };
+    actions.appendChild(down);
+
+    var del = document.createElement("button");
+    del.type = "button";
+    del.className = "icon-btn is-danger";
+    del.textContent = "删除";
+    del.title = "删掉这个角色（也会从所有房间里移除）";
+    del.onclick = function () {
+      askConfirm(
+        "删除我的角色「" + member.display_name + "」？",
+        "这个角色会从所有房间里一并移除，不可撤销。",
+        function () { deleteMyRole(member.member_id); }
+      );
+    };
+    actions.appendChild(del);
+
+    li.appendChild(actions);
+    return li;
+  }
+
+  function moveMyRole(index, delta) {
+    var roles = allMyRoles().slice();
+    var at = index + delta;
+    if (at < 0 || at >= roles.length) { return; }
+    var moved = roles[index];
+    roles[index] = roles[at];
+    roles[at] = moved;
+    myRoleAction("reorder_my_roles", {
+      order: roles.map(function (m) { return m.member_id; })
+    });
+  }
+
+  function deleteMyRole(memberId) {
+    myRoleAction("delete_my_role", { member_id: memberId });
+  }
+
+  function saveMyRoleName(memberId, value) {
+    if (state.editingName !== memberId) { return; }
+    state.editingName = null;
+    var clean = (value || "").trim();
+    var member = memberById(memberId);
+    if (!member) { renderMyRoles(); return; }
+    if (!clean) { renderMyRoles(); showError("名字不能为空"); return; }
+    if (clean === member.display_name) { renderMyRoles(); return; }
+    myRoleAction("update_member", { member_id: memberId, display_name: clean });
+  }
+
+  function myRoleAction(action, args, onOk) {
+    window.maibot.action(action, args).then(function (result) {
+      var failure = businessError(result);
+      if (failure) { showError(failure); renderMyRoles(); return; }
+      if (result.member_pool) { state.memberPool = result.member_pool; }
+      if (result.my_roles) { state.myRoles = result.my_roles; }
+      if (result.peers) { state.peers = result.peers; }
+      if (result.managed_bots) { state.managedBots = result.managed_bots; }
+      if (result.rooms) { state.rooms = result.rooms; }
+      clearError();
+      renderMyRoles();
+      renderPrivatePeers();
+      renderPrivateSpeaker();
+      renderMembers();
+      renderSpeakerChecks();
+      updateTurnHint();
+      renderScriptRows();
+      renderTimeline();
+      if (onOk) { onOk(); }
+    }).catch(function (error) {
+      showError("操作失败：" + error.message);
+    });
+  }
+
+
+
+  /* ── 时间线 ───────────────────────────────────────────── */
+
+
+  /* ── 段（segment）的基础操作 ──────────────────────────────
+     一段 = 我方一次提交的多条台词 + 紧随其后的一轮 Bot 回复。
+     时间线就是「一串段」，月光宝盒的截断就是在这串段上做。 */
+
+  function segmentsOf(scope) {
+    if (scope === "private") {
+      var key = (state.currentPeerId || "") + "::" + (state.privateSpeaker || "");
+      if (!state.privateTimeline[key]) {
+        var thread = currentThread();
+        state.privateTimeline[key] = thread ? (thread.segments || []).map(cloneSegment) : [];
+      }
+      return state.privateTimeline[key];
+    }
+    if (!state.timeline[state.currentRoomId]) {
+      state.timeline[state.currentRoomId] = [];
+    }
+    return state.timeline[state.currentRoomId];
+  }
+
+  function cloneSegment(segment) {
+    return {
+      seq: segment.seq,
+      kind: segment.kind || "normal",
+      voided: !!segment.voided,
+      skip: segment.skip || null,
+      messages: (segment.messages || []).map(function (message) { return Object.assign({}, message); })
+    };
+  }
+
+  function nextSeq(segments) {
+    var max = 0;
+    segments.forEach(function (segment) { if (segment.seq > max) { max = segment.seq; } });
+    return max + 1;
+  }
+
+  // 新内容插到「舞台位置」= 最后一个未作废段之后。
+  // 没截断过时它就是末尾（= 追加）；截断过时它就是「从这里继续」的那个位置。
+  function insertSegment(segments, segment) {
+    var at = 0;
+    for (var i = 0; i < segments.length; i += 1) {
+      if (!segments[i].voided) { at = i + 1; }
+    }
+    segments.splice(at, 0, segment);
+    return segment;
+  }
+
+  /* ── 月光宝盒：回到过去（按段截断）────────────────────── */
+
+  function openTruncateConfirm(scope, index) {
+    state.truncateTarget = { scope: scope, index: index };
+    // 保持滚动位置：点「回到此处」不该把聊天窗口拽到最底端
+    renderScope(scope, true);
+  }
+
+  function cancelTruncate() {
+    var scope = state.truncateTarget ? state.truncateTarget.scope : "group";
+    state.truncateTarget = null;
+    renderScope(scope, true);
+  }
+
+  // 确认气泡里的文案：**动态算**保留哪几段、作废哪几段、一共多少条消息
+  function truncateSummary(scope, index) {
+    var segments = segmentsOf(scope);
+    if (!segments.length) { return { text: "这里还没有内容。", count: 0, first: 0, last: 0 }; }
+    var target = segments[index];
+    var voided = segments.slice(index);
+    var count = 0;
+    voided.forEach(function (segment) { count += (segment.messages || []).length; });
+    var first = target.seq;
+    var last = segments[segments.length - 1].seq;
+    var keep = index;
+    // 作废段的幕号未必连续（截断后新段会插在前面，幕号更大），
+    // 所以文案要分两种情况说，不能硬凑成「第 N~M 段」。
+    var seqs = voided.map(function (segment) { return segment.seq; });
+    var contiguous = seqs.every(function (seq, index) {
+      return index === 0 || seq === seqs[index - 1] + 1;
+    });
+    var text;
+    if (keep <= 0) {
+      text = "将作废全部 " + voided.length + " 段（第 " + seqs.join("、") + " 幕，共 " + count + " 条消息）";
+    } else if (contiguous) {
+      text = "将保留第 1~" + keep + " 段，作废第 " + first + "~" + last + " 段（共 " + count + " 条消息）";
+    } else {
+      text = "将保留第 1~" + keep + " 段，作废 " + voided.length + " 段（第 "
+        + seqs.join("、") + " 幕，共 " + count + " 条消息）";
+    }
+    return { text: text, count: count, first: first, last: last, keep: keep };
+  }
+
+  function confirmTruncate(scope, index) {
+    var segments = segmentsOf(scope);
+    for (var i = index; i < segments.length; i += 1) { segments[i].voided = true; }
+    var seq = segments[index] ? segments[index].seq : 0;
+    state.truncateTarget = null;
+    state.stageNote = { scope: scope, seq: seq };
+    if (!state.memoryNoticeShown) {
+      state.memoryNoticeShown = true;
+      showMemoryNotice();
+    }
+    renderScope(scope, true);
+    renderStageBars();
+  }
+
+  function showMemoryNotice() {
+    var box = $("memory-notice");
+    if (box) { box.hidden = false; }
+  }
+
+  function renderStageBars() {
+    ["stage-bar", "stage-bar-private"].forEach(function (id) {
+      var box = $(id);
+      if (!box) { return; }
+      var note = state.stageNote;
+      var scope = id === "stage-bar" ? "group" : "private";
+      if (!note || note.scope !== scope) { box.hidden = true; box.textContent = ""; return; }
+      box.hidden = false;
+      box.textContent = "舞台已回到第 " + note.seq + " 段之前，从这里继续";
+    });
+  }
+
+  /* ── 时光机：前往未来（生成剧情段）────────────────────── */
+
+  function buildTimeMachine(scope, slotId) {
+    var slot = $(slotId);
+    if (!slot) { return; }
+    slot.innerHTML = "";
+    var panel = document.createElement("div");
+    panel.className = "tm-panel";
+    panel.hidden = true;
+
+    var head = document.createElement("div");
+    head.className = "tm-head";
+    var title = document.createElement("span");
+    title.textContent = "时光机";
+    head.appendChild(title);
+    var close = document.createElement("button");
+    close.type = "button";
+    close.className = "icon-btn";
+    close.textContent = "✕";
+    close.onclick = function () { panel.hidden = true; };
+    head.appendChild(close);
+    panel.appendChild(head);
+
+    var row = document.createElement("div");
+    row.className = "tm-row";
+    var number = document.createElement("input");
+    number.type = "text";
+    number.inputMode = "numeric";
+    number.className = "tm-number";
+    number.placeholder = "数字";
+    // 只允许数字
+    number.oninput = function () {
+      var clean = number.value.replace(/[^0-9]/g, "");
+      if (clean !== number.value) { number.value = clean; }
+    };
+    row.appendChild(number);
+    var unit = document.createElement("select");
+    unit.className = "tm-unit";
+    ["时", "分", "秒", "年", "月", "日"].forEach(function (item) {
+      var option = document.createElement("option");
+      option.value = item;
+      option.textContent = item;
+      unit.appendChild(option);
+    });
+    row.appendChild(unit);
+    panel.appendChild(row);
+
+    var plot = document.createElement("textarea");
+    plot.className = "tm-plot";
+    plot.placeholder = "一行一条剧情事件…";
+    panel.appendChild(plot);
+
+    var hint = document.createElement("div");
+    hint.className = "tm-hint";
+    hint.textContent = "不写的话Bot角色就会自行脑补，剧情容易失控！";
+    panel.appendChild(hint);
+
+    var generate = document.createElement("button");
+    generate.type = "button";
+    generate.className = "maibot-button maibot-button-primary";
+    generate.textContent = "生成剧情";
+    generate.onclick = function () { generatePlot(scope, number.value, unit.value, plot.value); };
+    panel.appendChild(generate);
+
+    slot.appendChild(panel);
+    panel.toggle = function () { panel.hidden = !panel.hidden; };
+    return panel;
+  }
+
+  function generatePlot(scope, numberText, unit, plotText) {
+    var amount = parseInt(numberText, 10);
+    if (!amount || amount <= 0) {
+      showError("先填一个大于 0 的数字");
+      return;
+    }
+    var lines = (plotText || "").split(/\r?\n/).map(function (line) { return line.trim(); })
+      .filter(function (line) { return line.length > 0; });
+    if (!lines.length) {
+      showError("至少写一条剧情事件");
+      return;
+    }
+    var narrator = state.narrator || { member_id: "narrator", display_name: "剧情旁白", kind: "narrator", avatar: "📖" };
+    var segments = segmentsOf(scope);
+    var segment = {
+      seq: nextSeq(segments),
+      kind: "plot",
+      voided: false,
+      skip: { number: amount, unit: unit },
+      messages: []
+    };
+    lines.forEach(function (line, index) {
+      segment.messages.push({
+        message_id: "plot_" + Date.now() + "_" + index,
+        speaker_member_id: narrator.member_id,
+        speaker_name: narrator.display_name,
+        speaker_kind: narrator.kind,
+        kind: "narrator",
+        content: line,
+        time: nowClock()
+      });
+    });
+    insertSegment(segments, segment);
+    clearError();
+    renderScope(scope);
+  }
+
+  function toggleTimeMachine(scope) {
+    var panel = scope === "private" ? state.tmPrivate : state.tmGroup;
+    if (!panel) { return; }
+    if (state.tmOpen === scope) {
+      panel.hidden = true;
+      state.tmOpen = null;
+    } else {
+      if (state.tmGroup) { state.tmGroup.hidden = true; }
+      if (state.tmPrivate) { state.tmPrivate.hidden = true; }
+      panel.hidden = false;
+      state.tmOpen = scope;
+    }
+  }
+  function renderTimeline(keepScroll) {
+    var box = $("timeline");
+    var saved = keepScroll ? box.scrollTop : null;
+    box.innerHTML = "";
+    var room = currentRoom();
+    // 顶栏标题直接显示房间名，不加「群聊 ·」前缀（视图本身已经说明了当前模式）
+    $("stage-room-name").textContent = room ? room.name : "群聊";
+
+    var segments = segmentsOf("group");
+    if (!segments.length) {
+      var empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "这个房间还没有台词。写一幕「选角色 + 台词」，点「发送消息」试试。";
+      box.appendChild(empty);
+      return;
+    }
+    segments.forEach(function (segment, index) {
+      box.appendChild(segmentElement(segment, index, "group"));
+    });
+    if (saved === null) { scrollToBottom(box); } else { box.scrollTop = saved; }
+  }
+
+  // 一段的 DOM：分隔线 + 这段的所有消息
+  function segmentElement(segment, index, scope) {
+    var wrap = document.createElement("div");
+    wrap.className = "segment" + (segment.voided ? " is-voided" : "")
+      + (segment.kind === "plot" ? " is-plot" : "");
+    wrap.appendChild(segmentDivider(segment, index, scope));
+    (segment.messages || []).forEach(function (message) {
+      appendMessageRow(wrap, message);
+    });
+    return wrap;
+  }
+
+  function segmentDivider(segment, index, scope) {
+    var div = document.createElement("div");
+    div.className = "beat-divider"
+      + (segment.kind === "plot" ? " is-plot" : "")
+      + (segment.voided ? " is-voided" : "");
+
+    var label = document.createElement("span");
+    label.className = "beat-label";
+    label.textContent = "第 " + segment.seq + " 幕";
+    if (segment.kind === "plot") { label.textContent += " · 剧情"; }
+    if (segment.voided) { label.textContent += "（已作废）"; }
+    div.appendChild(label);
+
+    if (segment.skip) {
+      var skip = document.createElement("span");
+      skip.className = "beat-skip";
+      skip.textContent = "⏳ +" + segment.skip.number + " " + segment.skip.unit;
+      div.appendChild(skip);
+    }
+
+    var jump = document.createElement("button");
+    jump.type = "button";
+    jump.className = "beat-jump";
+    jump.textContent = "↶ 回到此处";
+    jump.title = "回到这一幕之前：把它和后面的段一起作废（点一下会先问你要不要确认）";
+    jump.onclick = function () { openTruncateConfirm(scope, index); };
+    div.appendChild(jump);
+
+    return div;
+  }
+
+  // 确认气泡挂在对应分隔线的后面
+  function renderScope(scope, keepScroll) {
+    if (scope === "private") { renderPrivate(keepScroll); } else { renderTimeline(keepScroll); }
+    renderTruncateBubble(scope);
+  }
+
+  function renderTruncateBubble(scope) {
+    var host = scope === "private" ? $("private-timeline") : $("timeline");
+    if (!host) { return; }
+    var old = host.querySelector(".truncate-confirm");
+    if (old) { old.remove(); }
+    var target = state.truncateTarget;
+    if (!target || target.scope !== scope) { return; }
+
+    var segments = segmentsOf(scope);
+    if (target.index >= segments.length) { state.truncateTarget = null; return; }
+    var summary = truncateSummary(scope, target.index);
+
+    var card = document.createElement("div");
+    card.className = "truncate-confirm";
+    var text = document.createElement("div");
+    text.className = "tc-text";
+    text.textContent = summary.text;
+    card.appendChild(text);
+
+    var actions = document.createElement("div");
+    actions.className = "tc-actions";
+    var ok = document.createElement("button");
+    ok.type = "button";
+    ok.className = "maibot-button maibot-button-danger";
+    ok.textContent = "确认截断";
+    ok.onclick = function () { confirmTruncate(scope, target.index); };
+    actions.appendChild(ok);
+    var cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "maibot-button";
+    cancel.textContent = "取消";
+    // 走 cancelTruncate()，它会**保住滚动位置**。
+    // 之前这里直接调 renderScope(scope)（少了 keepScroll），
+    // 结果点一下「取消」时间线就被甩到最底端 —— 看着像"点了就跳走"。
+    cancel.onclick = function () { cancelTruncate(); };
+    actions.appendChild(cancel);
+    card.appendChild(actions);
+
+    // 插到第 index 段的分隔线后面
+    var wraps = host.querySelectorAll(".segment");
+    if (wraps[target.index]) {
+      wraps[target.index].insertBefore(card, wraps[target.index].children[1] || null);
+    } else {
+      host.appendChild(card);
+    }
+    // 气泡必须看得见：它挂在那一条分隔线下面，
+    // 那一条要是落在视口外（或贴着视口下沿），用户就只会觉得"点了没反应"。
+    // 只在看不见的时候才动滚动 —— 本来就看得见就一点都不动。
+    revealCard(card, host);
+  }
+
+  // 把确认气泡挪进时间线的可视区（尽量少挪）
+  function revealCard(card, host) {
+    var hostRect = host.getBoundingClientRect();
+    var rect = card.getBoundingClientRect();
+    if (rect.top >= hostRect.top && rect.bottom <= hostRect.bottom) { return; }
+    var delta = rect.top < hostRect.top
+      ? rect.top - hostRect.top - 8
+      : rect.bottom - hostRect.bottom + 8;
+    host.scrollTop += delta;
+  }
+
+  // 注：旧版这里还有个 beatDivider(seq)，它调用的 jumpToBeat 从来没定义过，
+  // 而且整段代码没有任何地方调用（真正在用的是 segmentDivider）——
+  // 属于死代码，已删，免得以后有人误调它直接炸 ReferenceError。
+
+  // 气泡行。merged = true 表示「同一个角色连着发的又一条」——
+  // 这时不再重复画头像和名字/时间，只留一个空头像位保持左右对齐。
+  function messageRow(message, merged) {
+    var member = memberById(message.speaker_member_id);
+    var isNarrator = message.speaker_kind === "narrator" || message.kind === "narrator";
+    var isBot = isNarrator ? false : (member ? member.kind === "bot" : message.speaker_kind === "bot");
+    var isMine = !isBot && !isNarrator;
+
+    var row = document.createElement("div");
+    row.className = "msg kind-" + (message.kind || "line")
+      + (isMine ? " is-mine" : "")
+      + (merged ? " is-merged" : "");
+    row.dataset.speaker = message.speaker_member_id || "";
+
+    var avatar = document.createElement("div");
+    avatar.className = "avatar" + (isBot ? " is-bot" : "");
+    if (merged) {
+      // 合并进来的这条不重复画头像，留个空位撑住宽度就行
+      avatar.classList.add("is-ghost");
+    } else if (isNarrator) {
+      avatar.textContent = (state.narrator && state.narrator.avatar) || "📖";
+      avatar.title = "剧情旁白（固定身份，不可被扮演）";
+    } else {
+      // 头像可能是上传来的图片（data URI），也可能只是 emoji。
+      // 统一走 fillAvatar：图片坏了就退回首字圆牌，
+      // 绝不会把整串 data URI 当文字写进圆牌里（那会把时间线撑出横向滚动条）。
+      fillAvatar(avatar, member && member.avatar, (message.speaker_name || "?").slice(0, 1));
+    }
+    row.appendChild(avatar);
+
+    var main = document.createElement("div");
+    main.className = "msg-main";
+
+    if (!merged) {
+      var head = document.createElement("div");
+      head.className = "msg-head";
+      var name = document.createElement("span");
+      name.className = "name";
+      name.textContent = message.speaker_name;
+      head.appendChild(name);
+      var tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = isNarrator ? "剧情旁白" : (isBot ? "麦麦 Bot" : "我饰演");
+      head.appendChild(tag);
+      var time = document.createElement("span");
+      time.className = "time";
+      time.textContent = message.time || "";
+      head.appendChild(time);
+      main.appendChild(head);
+    }
+
+    var bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = message.content;
+    main.appendChild(bubble);
+
+    row.appendChild(main);
+    return row;
+  }
+
+  // 往一段里追加一条消息：若上一条是同一个人，就把这条并成「不带头像」的那条。
+  function appendMessageRow(container, message) {
+    var speaker = message.speaker_member_id || "";
+    var merged = false;
+    var kids = container.children;
+    for (var i = kids.length - 1; i >= 0; i -= 1) {
+      if (kids[i].classList && kids[i].classList.contains("msg")) {
+        merged = !!speaker && kids[i].dataset.speaker === speaker;
+        break;
+      }
+    }
+    container.appendChild(messageRow(message, merged));
+  }
+
+  function scrollToBottom(box) {
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function renderPrivate(keepScroll) {
+    var box = $("private-timeline");
+    var saved = keepScroll ? box.scrollTop : null;
+    box.innerHTML = "";
+    // 标题按「对方 × 我方角色」拼，跟有没有线程无关。
+    // 对方从受管 Bot / 成员池里找（私聊列表的数据源），不再依赖 state.peers。
+    var peer = null;
+    (state.managedBots || []).some(function (item) {
+      if (item.peer_member_id === state.currentPeerId) {
+        peer = { member_id: item.peer_member_id, display_name: item.peer_name || item.bot_name };
+        return true;
+      }
+      return false;
+    });
+    if (!peer) { peer = memberById(state.currentPeerId); }
+    var myName = "";
+    state.myRoles.forEach(function (item) {
+      if (item.member_id === state.privateSpeaker) { myName = item.display_name; }
+    });
+    $("private-title").textContent = peer
+      ? ((myName || "我") + " ⇄ " + peer.display_name)
+      : "私聊";
+    // 右栏那行小字直说「只发给谁」，别用「只递给对方一人」这种绕口的说法
+    var peerNote = $("private-peer-note");
+    if (peerNote) {
+      peerNote.textContent = peer ? ("仅" + peer.display_name + "可见") : "只发给对方一人";
+    }
+
+    var segments = segmentsOf("private");
+    if (!segments.length) {
+      var empty2 = document.createElement("div");
+      empty2.className = "empty";
+      empty2.textContent = peer
+        ? "和「" + peer.display_name + "」还没有聊天记录。"
+        : "还没有私聊线程。";
+      box.appendChild(empty2);
+      return;
+    }
+    segments.forEach(function (segment, index) {
+      box.appendChild(segmentElement(segment, index, "private"));
+    });
+    if (saved === null) { scrollToBottom(box); } else { box.scrollTop = saved; }
+  }
+
+  // 「最近和当前操作角色聊过」的时间：取该线程最后一条消息的 time（HH:MM），
+  // 没聊过返回空串 —— 排序时空串沉底，再按首字母兜底。
+  function lastChatTime(peerMemberId) {
+    var myId = state.privateSpeaker;
+    if (!myId) { return ""; }
+    var latest = "";
+    (state.privateThreads || []).forEach(function (thread) {
+      if (thread.peer_member_id !== peerMemberId || thread.my_member_id !== myId) { return; }
+      var msgs = [];
+      (thread.segments || []).forEach(function (seg) {
+        (seg.messages || []).forEach(function (msg) { msgs.push(msg); });
+      });
+      if (!msgs.length) { return; }
+      var t = msgs[msgs.length - 1].time || "";
+      if (t > latest) { latest = t; }
+    });
+    return latest;
+  }
+
+  // 手动刷新「私聊对象」：重新向宿主拉一次 bootstrap，只更新私聊相关的数据。
+  // 页面本身不轮询，这是唯一的主动拉取入口。
+  async function refreshPrivatePeers() {
+    var btn = $("refresh-peers-btn");
+    if (btn) { btn.disabled = true; }
+    // 记住当前选中，刷新后尽量保住（对方若已不在名单里才回退到第一个）
+    var keepPeerId = state.currentPeerId;
+    var keepSpeakerId = state.privateSpeaker;
+    try {
+      var data = await window.maibot.query("bootstrap");
+      if (data.member_pool) { state.memberPool = data.member_pool; }
+      if (data.my_roles) { state.myRoles = data.my_roles; }
+      if (data.managed_bots) { state.managedBots = data.managed_bots; }
+      if (data.private_threads) {
+        state.privateThreads = data.private_threads;
+        state.privateTimeline = {}; // 线程快照变了，旧的重绘缓存作废
+      }
+      // 当前对方：还在名单里就保留，否则回退到第一个
+      var ids = (state.managedBots || []).map(function (b) { return b.peer_member_id; });
+      state.currentPeerId = ids.indexOf(keepPeerId) >= 0 ? keepPeerId : (ids.length ? ids[0] : null);
+      // 当前操作角色：还在角色列表里就保留，否则回退到第一个
+      var roleIds = (state.myRoles || []).map(function (m) { return m.member_id; });
+      state.privateSpeaker = roleIds.indexOf(keepSpeakerId) >= 0
+        ? keepSpeakerId : (roleIds.length ? roleIds[0] : "");
+
+      renderPrivatePeers();
+      renderPrivateSpeaker();
+      renderPrivate();
+      renderPrivateTurnState();
+      clearPrivateError();
+    } catch (error) {
+      showPrivateError("刷新失败：" + (error && error.message ? error.message : error));
+    } finally {
+      if (btn) { btn.disabled = false; }
+    }
+  }
+
+  // 私聊对象 = 宿主的**全部受管 Bot**（默认全展示，不提供增删）。
+  // 排序：最近和「当前操作的角色」聊过的排上面；没聊过按名字首字母。
+  function renderPrivatePeers() {
+    var box = $("private-peers");
+    box.innerHTML = "";
+    var bots = (state.managedBots || []).map(function (managed) {
+      // 补全展示字段：受管名单只有 bot_id / peer_member_id / peer_name
+      var full = memberById(managed.peer_member_id) || {};
+      return {
+        member_id: managed.peer_member_id,
+        display_name: managed.peer_name || full.display_name || managed.bot_name || "未命名 Bot",
+        bot_name: managed.bot_name || "",
+        avatar: full.avatar || "🤖",
+        status: full.status || "",
+        last: lastChatTime(managed.peer_member_id)
+      };
+    });
+    bots.sort(function (a, b) {
+      if (a.last !== b.last) {
+        // 有聊过的排前面；都是 HH:MM，字典序即时间序
+        if (!a.last) { return 1; }
+        if (!b.last) { return -1; }
+        return a.last < b.last ? 1 : -1; // 越晚越靠前
+      }
+      return a.display_name.localeCompare(b.display_name, "zh-CN");
+    });
+
+    $("private-peer-count").textContent = bots.length + " 个";
+    var currentPeer = state.currentPeerId;
+    bots.forEach(function (peer) {
+      var li = document.createElement("li");
+      li.className = "is-clickable";
+      if (peer.member_id === currentPeer) { li.className += " is-current"; }
+      li.title = "点一下切到这个私聊";
+
+      var avatar = document.createElement("div");
+      avatar.className = "avatar is-bot";
+      fillAvatar(avatar, peer.avatar, peer.display_name.slice(0, 1));
+      avatar.title = "接入状态：" + (STATUS_TEXT[peer.status] || peer.status);
+      li.appendChild(avatar);
+
+      var text = document.createElement("div");
+      text.className = "member-text";
+      var name = document.createElement("div");
+      name.className = "member-name";
+      name.textContent = peer.display_name;
+      var sub = document.createElement("div");
+      sub.className = "member-sub";
+      sub.textContent = peer.last ? ("最近聊于 " + peer.last) : (peer.bot_name || "私聊对象");
+      text.appendChild(name);
+      text.appendChild(sub);
+      li.appendChild(text);
+
+      li.onclick = function () { switchPeer(peer.member_id); };
+      box.appendChild(li);
+    });
+  }
+
+  /* ── 提交一幕（群聊）──────────────────────────────────── */
+
+  // 「开演」「发送」在内容为空时直接禁用（不点就没提示）
+  function updateSubmitButtons() {
+    var hasScript = state.scriptRows.some(function (row) { return (row.text || "").trim(); });
+    var beatButton = $("submit-beat");
+    if (beatButton) { beatButton.disabled = !hasScript; }
+    var text = $("private-text");
+    var sendButton = $("submit-private");
+    if (sendButton) { sendButton.disabled = !text || !text.value.trim(); }
+  }
+
+  function collectLines(rows) {
+    return rows
+      .filter(function (row) { return (row.text || "").trim(); })
+      .map(function (row) {
+        return {
+          speaker_member_id: row.member_id,
+          speaker: row.speaker,
+          text: row.text.trim()
+        };
+      });
+  }
+
+  async function submitBeat() {
+    if (state.turn) {
+      showError("上一幕还在演，先等它演完（或点「停止本轮」）。");
+      return;
+    }
+    var room = currentRoom();
+    if (!room) { showError("先选一个房间。"); return; }
+
+    var lines = collectLines(state.scriptRows);
+    if (!lines.length) { showError("这一幕还没有台词。"); return; }
+    var unassigned = lines.filter(function (line) { return !line.speaker_member_id; });
+    if (unassigned.length) {
+      showError("有 " + unassigned.length + " 行还没指定角色，请在每行左边的下拉框里选一个。");
+      return;
+    }
+
+    var button = $("submit-beat");
+    button.disabled = true;
+    try {
+      var result = await window.maibot.action("submit_beat", {
+        room_id: room.room_id,
+        lines: lines,
+        speakers: state.speakerOrder.slice(),
+        auto_reply: state.autoReply
+      });
+      var failure = businessError(result);
+      if (failure) { showError(failure); return; }
+      clearError();
+      updateSubmitButtons();
+      await playBeat(room, result);
+    } catch (error) {
+      showError("提交失败：" + error.message);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function playBeat(room, plan) {
+    var token = ++state.turnToken;
+    var box = $("timeline");
+
+    // 这一段 = 我方这次提交的多条台词 + 紧随其后的一轮 Bot 回复
+    var segments = segmentsOf("group");
+    var segment = {
+      seq: nextSeq(segments),
+      kind: "normal",
+      voided: false,
+      messages: []
+    };
+    insertSegment(segments, segment);
+    var index = segments.indexOf(segment);
+    state.stageNote = null;
+    renderStageBars();
+
+    renderTimeline();
+    var wraps = $("timeline").querySelectorAll(".segment");
+    var wrap = wraps[index] || null;
+
+    (plan.lines || []).forEach(function (line) {
+      var message = {
+        message_id: "live_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+        speaker_member_id: line.member_id,
+        speaker_name: line.display_name,
+        speaker_kind: line.kind,
+        kind: "line",
+        content: line.text,
+        time: nowClock()
+      };
+      segment.messages.push(message);
+      if (wrap && wrap.isConnected) { appendMessageRow(wrap, message); }
+    });
+    scrollToBottom(box);
+
+    var turn = {
+      room_id: room.room_id,
+      beat_seq: segment.seq,
+      strategy: plan.strategy,
+      strategy_label: plan.strategy_label,
+      seed: plan.seed,
+      silenced: plan.silenced || [],
+      ordered: (plan.plan || []).map(function (item) { return item.display_name; }),
+      started_at: Date.now(),
+      index: 0
+    };
+    state.turn = turn;
+    $("stop-turn").hidden = false;
+    renderTurnState();
+    state.elapsedTimer = setInterval(updateElapsed, 250);
+
+    if (!state.autoReply || !plan.plan || !plan.plan.length) {
+      finishTurn(token, "这个房间里没有能接话的 Bot。");
+      return;
+    }
+
+    for (var i = 0; i < plan.plan.length; i += 1) {
+      if (token !== state.turnToken) { return; }
+      var item = plan.plan[i];
+      turn.index = i;
+      var waiter = waitingRow(item.display_name);
+      if (wrap && wrap.isConnected) { wrap.appendChild(waiter); }
+      scrollToBottom(box);
+
+      var deadline = Date.now() + item.delay_seconds * 1000 / state.speed;
+      await waitUntil(deadline, token, "group");
+      if (token !== state.turnToken) { return; }
+
+      if (waiter.parentNode) { waiter.parentNode.removeChild(waiter); }
+      // item.silenced 为真 = 这一轮她没开口：时间线上什么都不留（FR-09）。
+      // 沉默名单由插件在计划里一次给出（turn.silenced），这里不要重复追加。
+      if (!item.silenced) {
+        (item.lines || []).forEach(function (line) {
+          var message = {
+            message_id: "live_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+            speaker_member_id: item.member_id,
+            speaker_name: item.display_name,
+            speaker_kind: item.kind,
+            kind: line.kind,
+            content: line.content,
+            time: nowClock()
+          };
+          segment.messages.push(message);
+          if (wrap && wrap.isConnected) { appendMessageRow(wrap, message); }
+        });
+      }
+      renderTurnState();
+      updateElapsed();
+      scrollToBottom(box);
+    }
+
+    finishTurn(token, null);
+  }
+
+  /* ── 提交（私聊）──────────────────────────────────────── */
+
+  async function submitPrivate() {
+    if (state.privateTurn) {
+      showPrivateError("上一句还在等回复，先等它回（或点「停止本轮」）。");
+      return;
+    }
+    var thread = currentThread();
+    if (!thread) { showPrivateError("还没有私聊对象。"); return; }
+
+    var text = ($("private-text").value || "").trim();
+    if (!text) { showPrivateError("还没写要说什么。"); return; }
+    var speakerId = $("private-speaker").value;
+    if (!speakerId) { showPrivateError("先在左边「我的角色」里加一个角色。"); return; }
+    var speaker = memberById(speakerId);
+
+    var button = $("submit-private");
+    button.disabled = true;
+    try {
+      var result = await window.maibot.action("submit_private", {
+        peer_member_id: state.currentPeerId,
+        lines: [{
+          speaker_member_id: speakerId,
+          speaker: speaker ? speaker.display_name : "",
+          text: text
+        }]
+      });
+      var failure = businessError(result);
+      if (failure) { showPrivateError(failure); return; }
+      clearPrivateError();
+      $("private-text").value = "";
+      updateSubmitButtons();
+      await playPrivate(thread, result);
+    } catch (error) {
+      showPrivateError("发送失败：" + error.message);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function playPrivate(thread, plan) {
+    var token = ++state.privateTurnToken;
+    var box = $("private-timeline");
+
+    var segments = segmentsOf("private");
+    var segment = {
+      seq: nextSeq(segments),
+      kind: "normal",
+      voided: false,
+      messages: []
+    };
+    insertSegment(segments, segment);
+    var index = segments.indexOf(segment);
+    state.stageNote = null;
+    renderStageBars();
+
+    renderPrivate();
+    var wraps = $("private-timeline").querySelectorAll(".segment");
+    var wrap = wraps[index] || null;
+
+    (plan.lines || []).forEach(function (line) {
+      var message = {
+        message_id: "pv_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+        speaker_member_id: line.member_id,
+        speaker_name: line.display_name,
+        speaker_kind: line.kind,
+        kind: "line",
+        content: line.text,
+        time: nowClock()
+      };
+      segment.messages.push(message);
+      if (wrap && wrap.isConnected) { appendMessageRow(wrap, message); }
+    });
+    scrollToBottom(box);
+
+    var turn = {
+      thread_id: thread.thread_id,
+      peer_name: plan.peer_name,
+      seed: plan.seed,
+      ordered: (plan.plan || []).map(function (item) { return item.display_name; }),
+      started_at: Date.now()
+    };
+    state.privateTurn = turn;
+    $("stop-private-turn").hidden = false;
+    renderPrivateTurnState();
+    state.privateElapsedTimer = setInterval(updatePrivateElapsed, 250);
+
+    for (var i = 0; i < (plan.plan || []).length; i += 1) {
+      if (token !== state.privateTurnToken) { return; }
+      var item = plan.plan[i];
+      var waiter = waitingRow(item.display_name);
+      if (wrap && wrap.isConnected) { wrap.appendChild(waiter); }
+      scrollToBottom(box);
+
+      var deadline = Date.now() + item.delay_seconds * 1000 / state.speed;
+      await waitUntil(deadline, token, "private");
+      if (token !== state.privateTurnToken) { return; }
+
+      if (waiter.parentNode) { waiter.parentNode.removeChild(waiter); }
+      (item.lines || []).forEach(function (line) {
+        var message = {
+          message_id: "pv_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7),
+          speaker_member_id: item.member_id,
+          speaker_name: item.display_name,
+          speaker_kind: item.kind,
+          kind: line.kind,
+          content: line.content,
+          time: nowClock()
+        };
+        segment.messages.push(message);
+        if (wrap && wrap.isConnected) { appendMessageRow(wrap, message); }
+      });
+      renderPrivateTurnState();
+      updatePrivateElapsed();
+      scrollToBottom(box);
+    }
+
+    finishPrivateTurn(token, null);
+  }
+
+  function waitingRow(name) {
+    var row = document.createElement("div");
+    row.className = "msg kind-waiting";
+
+    var avatar = document.createElement("div");
+    avatar.className = "avatar is-pending";
+    avatar.textContent = "…";
+    row.appendChild(avatar);
+
+    var main = document.createElement("div");
+    main.className = "msg-main";
+
+    var head = document.createElement("div");
+    head.className = "msg-head";
+    var label = document.createElement("span");
+    label.className = "name";
+    label.textContent = name;
+    head.appendChild(label);
+    var tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = "麦麦 Bot";
+    head.appendChild(tag);
+    main.appendChild(head);
+
+    var bubble = document.createElement("div");
+    bubble.className = "bubble dots";
+    bubble.textContent = "等待" + name + "接话";
+    main.appendChild(bubble);
+
+    row.appendChild(main);
+    return row;
+  }
+
+  // 用墙上时钟算截止时间，而不是「数 tick」：
+  // 标签页切到后台时浏览器会把定时器降频到 1Hz，数 tick 会让节奏严重走样；
+  // 按时间戳算，切回来时会直接补上落后的那一段。
+  // scope 决定用哪个 token 判定「这一轮被取消了」——
+  // 群聊用 turnToken，私聊用 privateTurnToken，两个不能混。
+  function waitUntil(deadline, token, scope) {
+    return new Promise(function (resolve) {
+      var timer = setInterval(function () {
+        var alive = scope === "private"
+          ? token === state.privateTurnToken
+          : token === state.turnToken;
+        if (!alive) { clearInterval(timer); resolve(); return; }
+        if (Date.now() >= deadline) { clearInterval(timer); resolve(); }
+      }, 250);
+    });
+  }
+
+  function finishTurn(token, note) {
+    if (token !== state.turnToken) { return; }
+    if (state.turn) {
+      state.turn.final_elapsed = (Date.now() - state.turn.started_at) * state.speed / 1000;
+      state.lastTurn = state.turn;
+    }
+    state.turn = null;
+    if (state.elapsedTimer) { clearInterval(state.elapsedTimer); state.elapsedTimer = null; }
+    $("stop-turn").hidden = true;
+    renderTurnState(note || "本轮结束。");
+  }
+
+  function stopTurn() {
+    if (!state.turn) { return; }
+    state.turnToken += 1;
+    if (state.elapsedTimer) { clearInterval(state.elapsedTimer); state.elapsedTimer = null; }
+    var box = $("timeline");
+    var waiting = box.querySelectorAll(".kind-waiting");
+    for (var i = 0; i < waiting.length; i += 1) { waiting[i].remove(); }
+    if (state.turn) { state.lastTurn = state.turn; }
+    state.turn = null;
+    $("stop-turn").hidden = true;
+    renderTurnState("本轮已手动停止。");
+  }
+
+  function renderTurnState(note) {
+    var box = $("turnstate");
+    var turn = state.turn || state.lastTurn;
+    if (!turn && !note) { box.hidden = true; state.elapsedNode = null; return; }
+    box.hidden = false;
+    box.innerHTML = "";
+    state.elapsedNode = null;
+    if (turn) {
+      addState(box, "策略", turn.strategy_label);
+      addState(box, "seed", turn.seed);
+      addState(box, "顺序", turn.ordered.join(" → ") || "—");
+      state.elapsedNode = addState(box, "已等待",
+        (turn.final_elapsed !== undefined ? turn.final_elapsed : 0).toFixed(1) + "s");
+      if (turn.silenced && turn.silenced.length) {
+        addState(box, "沉默（不进时间线）", turn.silenced.join("、"));
+      }
+    }
+    if (note) { addState(box, "说明", note); }
+  }
+
+  function updateElapsed() {
+    if (!state.elapsedNode || !state.turn) { return; }
+    var scaled = (Date.now() - state.turn.started_at) * state.speed / 1000;
+    state.elapsedNode.textContent = scaled.toFixed(1) + "s";
+  }
+
+  function finishPrivateTurn(token, note) {
+    if (token !== state.privateTurnToken) { return; }
+    if (state.privateTurn) {
+      state.privateTurn.final_elapsed = (Date.now() - state.privateTurn.started_at) * state.speed / 1000;
+      state.privateLastTurn = state.privateTurn;
+    }
+    state.privateTurn = null;
+    if (state.privateElapsedTimer) { clearInterval(state.privateElapsedTimer); state.privateElapsedTimer = null; }
+    $("stop-private-turn").hidden = true;
+    renderPrivateTurnState(note || "本轮结束。");
+    renderPrivatePeers(); // 刚聊过，把对方排到最上面
+  }
+
+  function stopPrivateTurn() {
+    if (!state.privateTurn) { return; }
+    state.privateTurnToken += 1;
+    if (state.privateElapsedTimer) { clearInterval(state.privateElapsedTimer); state.privateElapsedTimer = null; }
+    var box = $("private-timeline");
+    var waiting = box.querySelectorAll(".kind-waiting");
+    for (var i = 0; i < waiting.length; i += 1) { waiting[i].remove(); }
+    if (state.privateTurn) { state.privateLastTurn = state.privateTurn; }
+    state.privateTurn = null;
+    $("stop-private-turn").hidden = true;
+    renderPrivateTurnState("本轮已手动停止。");
+  }
+
+  function renderPrivateTurnState(note) {
+    var box = $("private-turnstate");
+    var turn = state.privateTurn || state.privateLastTurn;
+    if (!turn && !note) { box.hidden = true; state.privateElapsedNode = null; return; }
+    box.hidden = false;
+    box.innerHTML = "";
+    state.privateElapsedNode = null;
+    if (turn) {
+      addState(box, "对方", turn.peer_name);
+      addState(box, "seed", turn.seed);
+      state.privateElapsedNode = addState(box, "已等待",
+        (turn.final_elapsed !== undefined ? turn.final_elapsed : 0).toFixed(1) + "s");
+    }
+    if (note) { addState(box, "说明", note); }
+  }
+
+  function updatePrivateElapsed() {
+    if (!state.privateElapsedNode || !state.privateTurn) { return; }
+    var scaled = (Date.now() - state.privateTurn.started_at) * state.speed / 1000;
+    state.privateElapsedNode.textContent = scaled.toFixed(1) + "s";
+  }
+
+  function addState(box, key, value) {
+    var span = document.createElement("span");
+    var strong = document.createElement("b");
+    strong.textContent = value;
+    span.appendChild(document.createTextNode(key + " "));
+    span.appendChild(strong);
+    box.appendChild(span);
+    return strong;
+  }
+
+  /* ── 提示 ─────────────────────────────────────────────── */
+
+  // 系统提示写在**聊天窗口的标题行**（时光机右边），群聊 / 私聊各有一个。
+  // 用 classList 只增删状态类，保住 head-notice 这个省略号样式类不被覆盖；
+  // 全文始终挂在 title 上，文本再长也只省略显示、hover 能看全。
+  function errorBox() {
+    return state.currentView === "private" ? $("private-script-error") : $("script-error");
+  }
+
+  function setNotice(box, kind, text) {
+    if (!box) { return; }
+    box.classList.remove("err", "ok");
+    box.classList.add("head-notice", kind);
+    box.textContent = text;
+    box.title = text;
+    box.hidden = false;
+  }
+
+  function clearNotice(box) {
+    if (!box) { return; }
+    box.hidden = true;
+    box.textContent = "";
+    box.title = "";
+  }
+
+  function showError(text) {
+    setNotice(errorBox(), "err", text);
+  }
+
+  function clearError() {
+    ["script-error", "private-script-error"].forEach(function (id) { clearNotice($(id)); });
+  }
+
+  // 说明性提示（比如「导出还没实现」），跟错误分开放
+  function showInfo(text) {
+    setNotice($("script-error"), "ok", text);
+  }
+
+  function showPrivateError(text) {
+    setNotice($("private-script-error"), "err", text);
+  }
+
+  function clearPrivateError() {
+    clearNotice($("private-script-error"));
+  }
+
+  /* ── 危险操作的通用确认层 ────────────────────────────────
+     只用于删房间 / 删角色 / 删群员 / 删私聊对象这类不可撤销的操作。
+     点【确认删除】才真正执行；取消 / ESC / 点遮罩都只是关掉，什么都不做。
+     同一时刻只显示一个，重复调用以最后一次为准。                    */
+  var confirmAction = null;
+
+  function closeConfirm() {
+    confirmAction = null;
+    var overlay = $("confirm-overlay");
+    if (overlay) { overlay.hidden = true; }
+  }
+
+  function askConfirm(title, detail, onConfirm) {
+    var overlay = $("confirm-overlay");
+    if (!overlay) { if (onConfirm) { onConfirm(); } return; }
+    confirmAction = onConfirm || null;
+    $("confirm-title").textContent = title;
+    $("confirm-detail").textContent = detail || "这个操作不可撤销。";
+    overlay.hidden = false;
+    $("confirm-ok").focus();
+  }
+
+  function initConfirm() {
+    $("confirm-ok").onclick = function () {
+      var action = confirmAction;
+      closeConfirm();
+      if (action) { action(); }
+    };
+    $("confirm-cancel").onclick = closeConfirm;
+    // 只点遮罩本身才算取消，点卡片内部不关
+    $("confirm-overlay").onclick = function (event) {
+      if (event.target === $("confirm-overlay")) { closeConfirm(); }
+    };
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && !$("confirm-overlay").hidden) { closeConfirm(); }
+    });
+  }
+
+  // 业务失败由插件用 ok=false 返回（不抛异常），这里统一取错误文案
+  function businessError(result) {
+    if (result && result.ok === false) {
+      return result.error || "操作失败";
+    }
+    return null;
+  }
+
+  /* ── 视图切换 ─────────────────────────────────────────── */
+
+  function switchView(view) {
+    state.currentView = view;
+    var isPrivate = view === "private";
+    // 换视图时把还开着的确认气泡收掉（两个视图各有一份，别串场）
+    state.truncateTarget = null;
+    var tabs = document.querySelectorAll(".viewtab");
+    for (var i = 0; i < tabs.length; i += 1) {
+      tabs[i].classList.toggle("is-active", tabs[i].getAttribute("data-view") === view);
+    }
+    // 中栏：群聊时间线 / 私聊时间线
+    $("stage-view").hidden = isPrivate;
+    $("private-view").hidden = !isPrivate;
+    // 右栏：两套独立的剧本窗口
+    $("composer").hidden = isPrivate;
+    $("composer-private").hidden = !isPrivate;
+    // 左栏：私聊没有「房间」这回事，只列私聊对象 + 我的角色
+    $("panel-rooms").hidden = isPrivate;
+    $("panel-members").hidden = isPrivate;
+    $("panel-private").hidden = !isPrivate;
+    $("panel-my-roles").hidden = !isPrivate;
+    if (isPrivate) {
+      renderPrivate();
+      renderPrivatePeers();
+      renderMyRoles();
+      renderPrivateSpeaker();
+      renderPrivateTurnState();
+    }
+  }
+
+  /* ── 启动 ─────────────────────────────────────────────── */
+
+  function bindEvents() {
+    initConfirm();
+    // 群聊/私聊 拨片现在在两个视图的标题栏里各有一份，用事件委托统一处理
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest(".viewtab");
+      if (target) { switchView(target.getAttribute("data-view")); }
+    });
+    $("room-create-form").onsubmit = createRoom;
+    $("room-rename-save").onclick = renameRoom;
+    $("room-rename-cancel").onclick = function () { $("rename-row").hidden = true; };
+    $("add-line").onclick = function () { addRowTo(state.scriptRows); };
+    $("refresh-peers-btn").onclick = refreshPrivatePeers;
+    $("private-text").oninput = function () { updateSubmitButtons(); };
+    $("private-speaker").onchange = function (event) {
+      state.privateSpeaker = event.target.value;
+      renderPrivatePeers(); // 按新角色重新排「最近聊过」的顺序
+      renderPrivate();
+      renderPrivateTurnState();
+    };
+    $("submit-beat").onclick = submitBeat;
+    $("stop-turn").onclick = stopTurn;
+    $("time-machine-btn").onclick = function () { toggleTimeMachine("group"); };
+    $("time-machine-private-btn").onclick = function () { toggleTimeMachine("private"); };
+    $("memory-notice-close").onclick = function () { $("memory-notice").hidden = true; };
+    $("submit-private").onclick = submitPrivate;
+    $("stop-private-turn").onclick = stopPrivateTurn;
+    $("script-error").onclick = clearError;
+    $("private-script-error").onclick = clearPrivateError;
+  }
+
+  function applyContext(context) {
+    if (!context) { return; }
+    if (context.theme) {
+      document.documentElement.setAttribute("data-theme", context.theme);
+    }
+  }
+
+  async function boot() {
+    bindEvents();
+    try {
+      var data = await window.maibot.query("bootstrap");
+      state.version = data.version || "";
+      state.notice = data.notice || "";
+      state.timing = data.timing || {};
+      state.memberPool = data.member_pool || [];
+      state.myRoles = data.my_roles || [];
+      state.peers = data.peers || [];
+      state.managedBots = data.managed_bots || [];
+      state.narrator = data.narrator || null;
+      state.rooms = data.rooms || [];
+      state.timeline = data.timeline || {};
+      state.privateThreads = data.private_threads || [];
+      state.privateTimeline = {};
+      state.currentRoomId = state.rooms.length ? state.rooms[0].room_id : null;
+      state.currentThreadId = state.privateThreads.length ? state.privateThreads[0].thread_id : null;
+      // 当前对方从受管 Bot 名单取（私聊列表的数据源），不再依赖线程顺序
+      state.currentPeerId = state.managedBots.length
+        ? state.managedBots[0].peer_member_id
+        : (state.privateThreads.length ? state.privateThreads[0].peer_member_id : null);
+
+      // 时光机：群聊、私聊各一个面板（共用同一套逻辑）
+      state.tmGroup = buildTimeMachine("group", "tm-slot-group");
+      state.tmPrivate = buildTimeMachine("private", "tm-slot-private");
+
+      renderRooms();
+      renderMembers();
+      renderMyRoles();
+      renderSpeakerChecks();
+      updateTurnHint();
+      renderScriptRows();
+      renderPrivateSpeaker();
+      renderTimeline();
+      renderPrivate();
+      renderPrivatePeers();
+      renderTurnState();
+      renderPrivateTurnState();
+      renderStageBars();
+      updateSubmitButtons();
+    } catch (error) {
+      showError("读取初始假数据失败：" + error.message);
+    }
+  }
+
+  window.addEventListener("maibot:context", function (event) { applyContext(event.detail); });
+
+  window.maibot.ready.then(function (context) {
+    applyContext(context);
+    return boot();
+  }).catch(function (error) {
+    showError("页面初始化失败：" + (error && error.message ? error.message : error));
+  });
+})();
+</script>
+</body>
+</html>
