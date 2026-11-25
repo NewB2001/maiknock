@@ -32,7 +32,7 @@ from .mock_data import (
 )
 from .errorscan import describe_report
 from .hostinfo import read_bot_config, read_bots
-from .identity import DEFAULT_PLATFORM, virtual_group_id
+from .identity import DEFAULT_PLATFORM, session_id_for_private, virtual_group_id
 from .roster import build_roster
 from . import formation, narrator
 
@@ -1187,8 +1187,46 @@ class ChatroomService:
         """私聊窗口的线程列表（**懒加载**）。
 
         ⚠️ bootstrap 一次带全部线程会撑爆宿主的 API 上限（512 KiB，实测踩过）。
+        real 模式：从账本读「有历史的私聊线程」，按**最后活动时刻**倒序（D11.3）；
+        没有历史的对端由前端用「全部受管 Bot」列表兜底展示。
         """
-        return {"private_threads": self._seeded_private_threads()}
+        if await self._data_source() != "real":
+            return {"private_threads": self._seeded_private_threads()}
+        ledger = self._ledger()
+        if ledger is None:
+            return {"private_threads": self._seeded_private_threads()}
+        # ⚠️ 先同步真名单 —— 否则 self._members 还停在种子默认（不认识真 bot_id）
+        await self._sync_real_members()
+        rows = await self._alread(ledger.list_private_rooms) or []
+        pool = self._member_map()
+        threads: List[Dict[str, Any]] = []
+        # 按最后活动时刻倒序（最近聊过的排最上面）
+        for row in sorted(rows, key=lambda r: str(r.get("last_at") or ""), reverse=True):
+            peer_bot = str(row.get("peer_bot_id") or "")
+            peer_mid = ""
+            if peer_bot:
+                peer_mid = await self._alread(ledger.find_member_by_bot_id, peer_bot) or f"bot_{peer_bot}"
+            peer = pool.get(peer_mid) if peer_mid else None
+            my = pool.get(str(row.get("my_member_id") or ""))
+            thread_id = str(row.get("thread_id") or "")
+            segments = await self._alread(ledger.list_timeline, thread_id) or []
+            threads.append(
+                {
+                    "thread_id": thread_id,
+                    "peer_member_id": peer_mid,
+                    "peer_name": (peer or {}).get("display_name") or "",
+                    "peer_kind": "bot",
+                    "peer_status": (peer or {}).get("status") or STATUS_READY,
+                    "peer_status_label": (peer or {}).get("status_label")
+                    or STATUS_LABELS.get(STATUS_READY, ""),
+                    "my_member_id": str(row.get("my_member_id") or ""),
+                    "my_name": (my or {}).get("display_name") or "",
+                    "last_at": str(row.get("last_at") or ""),
+                    "segments": segments,
+                }
+            )
+        return {"private_threads": threads}
+
 
     async def shell_timeline(self, room_id: str) -> Dict[str, Any]:
         """一个房间的时间线（页面切房间时拉）。
@@ -1875,6 +1913,118 @@ class ChatroomService:
             },
         ]
 
+    async def _real_submit_private(
+        self,
+        peer_member_id: str,
+        lines: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """真模式私聊：把台词递进「对方那个 Bot」的**专属私聊流**（S11）。
+
+        ⚠️ **专属私聊流**：不传 group_info ⇒ 宿主把它当私聊，
+        session_id = ``md5(f"webui_{发言人账号}_private")``。
+        发言人账号是**我方角色**的账号（如 ``user.role_naruto``），
+        **不是**用户自己的 WebUI 私聊（那是 ``internal_account:self_owner``）⇒ 天然不混流。
+        ⚠️ 私聊只说给**对方那一个 Bot**（FR-15 可见性硬要求）；群聊才全员可见。
+        """
+        ledger = self._ledger()
+        if ledger is None:
+            return {"ok": False, "error": "共享账本没开，聊天室暂时不能私聊"}
+        await self._sync_real_members()
+        pool = self._member_map()
+        peer = pool.get(peer_member_id)
+        if peer is None or peer.get("kind") != "bot":
+            return {"ok": False, "error": f"私聊对象不存在：{peer_member_id}"}
+        if not str(peer.get("bot_id") or ""):
+            return {"ok": False, "error": "私聊对象没有可用的 bot_id"}
+
+        # 解析台词：发言人必须是「我方角色」
+        resolved: List[Dict[str, Any]] = []
+        for item in (lines or []):
+            if not isinstance(item, dict):
+                continue
+            mid = str(item.get("speaker_member_id") or "").strip()
+            text = str(item.get("text") or "").strip()
+            member = pool.get(mid)
+            if member is None or member.get("kind") != "user_role":
+                return {"ok": False, "error": f"发言人不是你的角色：{mid or '（空）'}"}
+            if not text:
+                continue
+            resolved.append(
+                {
+                    "member_id": mid,
+                    "display_name": member["display_name"],
+                    "kind": member["kind"],
+                    "text": text,
+                    "platform": str(member.get("platform") or DEFAULT_PLATFORM),
+                    "account": str(member.get("account") or ""),
+                }
+            )
+        if not resolved:
+            return {"ok": False, "error": "还没有台词"}
+
+        speaker = resolved[0]
+        speaker_account = str(speaker.get("account") or "")
+        if not speaker_account:
+            return {"ok": False, "error": "发言角色没有账号（平台身份缺失）"}
+        thread_id = f"private_{peer_member_id}_{speaker['member_id']}"
+        session_id = session_id_for_private(speaker_account, str(speaker.get("platform") or DEFAULT_PLATFORM))
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        segment_id = f"seg_{int(time.time() * 1000)}"
+        messages = [
+            {
+                "message_id": f"{segment_id}_m{index}",
+                "speaker_member_id": line["member_id"],
+                "speaker_name": line["display_name"],
+                "kind": "line",
+                "content": line["text"],
+                "created_at": stamp,
+            }
+            for index, line in enumerate(resolved)
+        ]
+
+        def _do() -> int:
+            ledger.append_segment(thread_id, segment_id, "normal", messages)
+            seq = ledger.next_delivery_seq()
+            queued = 0
+            for line in resolved:
+                ledger.enqueue_delivery(
+                    delivery_id=f"{segment_id}_d{seq}",
+                    target_bot_id=str(peer.get("bot_id") or ""),
+                    content=line["text"],
+                    room_id=thread_id,
+                    segment_id=segment_id,
+                    sender_member_id=line["member_id"],
+                    sender_platform=line["platform"],
+                    sender_account=line["account"],
+                    sender_nickname=line["display_name"],
+                    # ⚠️ **group_id 留空 ⇒ 私聊**（worker 会传 None 让信封不带 group_info）
+                    group_id="",
+                    group_name="",
+                    seq=seq,
+                    turn_id="",
+                    wave=0,
+                )
+                seq += 1
+                queued += 1
+            return queued
+
+        try:
+            queued = await ledger.run(_do)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"写私聊投递失败：{exc}"}
+        return {
+            "ok": True,
+            "stage": "real",
+            "thread_id": thread_id,
+            "session_id": session_id,
+            "peer_member_id": str(peer.get("member_id") or ""),
+            "peer_name": str(peer.get("display_name") or ""),
+            "my_member_id": speaker["member_id"],
+            "my_name": speaker["display_name"],
+            "queued": queued,
+            "lines": [{k: v for k, v in item.items() if k != "account" and k != "platform"} for item in resolved],
+        }
+
     async def shell_submit_private(
         self,
         peer_member_id: str,
@@ -1893,6 +2043,9 @@ class ChatroomService:
         返回的形状和群聊的调度计划一致（顺序 / 等待秒数 / 消息行），
         页面那边用同一套演法。
         """
+        # ⚠️ **真模式**：私聊要真的递给对方那一个 Bot（专属私聊流），不是本地演。
+        if await self._data_source() == "real":
+            return await self._real_submit_private(peer_member_id, lines)
         pool = self._member_map()
         peer = pool.get(peer_member_id)
         if peer is None or peer.get("kind") != "bot":

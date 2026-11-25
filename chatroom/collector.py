@@ -31,6 +31,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .identity import session_id_for_private
+
 _log = logging.getLogger("plugin.maiknock.webui_companion")
 
 #: 我方角色的账号前缀（`user.<member_id>`）⇒ 用它区分「谁说的话」
@@ -190,8 +192,24 @@ class ReplyCollector:
             return 0
         if not pending:
             return 0
+        # ⚠️ **私聊回读**：待收投递里若有私聊单（group_id 为空、room 是 private_），
+        #    它所在的群流其实是「专属私聊流」``md5(webui_<发言人账号>_private)``。
+        #    这些 session 不在房间表里 ⇒ 从待收投递里派生出来一起采。
+        sessions = dict(self._sessions)
+        for row in pending:
+            is_private = (
+                str(row.get("group_id") or "") == ""
+                and str(row.get("room_id") or "").startswith("private_")
+            )
+            if not is_private:
+                continue
+            account = str(row.get("sender_account") or "")
+            if not account:
+                continue
+            sid = session_id_for_private(account)
+            sessions.setdefault(sid, str(row.get("room_id") or ""))
         collected = 0
-        for session_id, room_id in list(self._sessions.items()):
+        for session_id, room_id in list(sessions.items()):
             fetched = await self._fetch(session_id)
             self._log.info(
                 "[聊天室] 回读 %s：取到 %d 条（room=%s）",

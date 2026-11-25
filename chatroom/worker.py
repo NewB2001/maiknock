@@ -87,13 +87,17 @@ class DeliveryWorker:
         if not self._ledger.claim_delivery(delivery_id, self._bot_id):
             return 0
         content = str(task.get("content") or "")
+        # ⚠️ **group_id 为空 ⇒ 私聊**（宿主按 group_info 是否为 None 分私聊/群聊）。
+        #    群聊任务一定带 group_id；只有私聊任务留空 ⇒ 传 None 让信封不带 group_info。
+        raw_group_id = str(task.get("group_id") or "")
+        send_group_id = raw_group_id if raw_group_id else None
         try:
             ok = await self._gateway.send_text(
                 self._bot_id,
                 content,
                 user_id=str(task.get("sender_account") or ""),
                 user_nickname=str(task.get("sender_nickname") or ""),
-                group_id=str(task.get("group_id") or ""),
+                group_id=send_group_id,
                 group_name=str(task.get("group_name") or ""),
             )
         except Exception as exc:  # noqa: BLE001

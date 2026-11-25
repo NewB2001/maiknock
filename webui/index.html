@@ -2846,7 +2846,7 @@
       if (data.member_pool) { state.memberPool = data.member_pool; }
       if (data.my_roles) { state.myRoles = data.my_roles; }
       if (data.managed_bots) { state.managedBots = data.managed_bots; }
-      if (data.private_threads) {
+      if (data.private_threads && data.private_threads.length) {
         state.privateThreads = data.private_threads;
         state.privateTimeline = {}; // 线程快照变了，旧的重绘缓存作废
       }
@@ -2862,6 +2862,9 @@
       renderPrivateSpeaker();
       renderPrivate();
       renderPrivateTurnState();
+      // ⚠️ 真模式下私聊线程要单独拉（bootstrap 的 private_threads 是懒加载空表）
+      state.privateTimeline = {};
+      await loadPrivateThreads();
       clearPrivateError();
     } catch (error) {
       showPrivateError("刷新失败：" + (error && error.message ? error.message : error));
@@ -3165,6 +3168,11 @@
       clearPrivateError();
       $("private-text").value = "";
       updateSubmitButtons();
+      // ⚠️ 真模式：私聊已真的递进对方 Bot 的专属私聊流 ⇒ 轮询账本线程等回复。
+      if (result && result.stage === "real") {
+        await pollPrivateReal(thread, result, ++state.privateTurnToken);
+        return;
+      }
       await playPrivate(thread, result);
     } catch (error) {
       showPrivateError("发送失败：" + error.message);
@@ -3352,6 +3360,33 @@
     if (!state.elapsedNode || !state.turn) { return; }
     var scaled = (Date.now() - state.turn.started_at) * state.speed / 1000;
     state.elapsedNode.textContent = scaled.toFixed(1) + "s";
+  }
+
+  // ⚠️ 真模式私聊：台词已递进对方 Bot 的专属私聊流，回复由她异步产生
+  //    ⇒ 轮询账本线程直到出现回复（清私有缓存让 segmentsOf 从最新 thread.segments 重建）。
+  async function pollPrivateReal(thread, plan, token) {
+    state.privateTurn = {
+      peer_member_id: state.currentPeerId,
+      my_member_id: state.privateSpeaker,
+      started_at: Date.now(),
+      index: 0,
+      real: true
+    };
+    $("stop-private-turn").hidden = false;
+    renderPrivateTurnState("已发出，等麦麦回复……");
+    state.privateElapsedTimer = setInterval(updatePrivateElapsed, 250);
+    var deadline = Date.now() + 160000 / Math.max(state.speed || 1, 0.1);
+    while (token === state.privateTurnToken && Date.now() < deadline) {
+      state.privateTimeline = {};          // 清缓存 ⇒ 下次 segmentsOf 重建
+      await loadPrivateThreads();
+      var segs = segmentsOf("private");
+      var last = segs.length ? segs[segs.length - 1] : null;
+      if (last && (last.messages || []).some(function (m) { return m.kind === "reply"; })) {
+        break;
+      }
+      await new Promise(function (resolve) { setTimeout(resolve, 3000); });
+    }
+    finishPrivateTurn(token, token === state.privateTurnToken ? "本轮结束。" : null);
   }
 
   function finishPrivateTurn(token, note) {

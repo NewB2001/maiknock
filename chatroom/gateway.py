@@ -60,7 +60,7 @@ def build_envelope(
     platform: str = DEFAULT_PLATFORM,
     user_id: str,
     user_nickname: str = "",
-    group_id: str = "",
+    group_id: Optional[str] = "",
     group_name: str = "",
     api_key: str = "",
     message_id: Optional[str] = None,
@@ -81,9 +81,15 @@ def build_envelope(
     user_info: Dict[str, Any] = {"platform": platform, "user_id": str(user_id)}
     if user_nickname:
         user_info["user_nickname"] = str(user_nickname)
-    group_info: Dict[str, Any] = {"platform": platform, "group_id": str(group_id)}
-    if group_name:
-        group_info["group_name"] = str(group_name)
+    # ⚠️ **私聊 vs 群聊由「有没有 group_info」决定**（宿主 bot.py:1030：
+    #    ``if group_info is None: 私聊``）。``group_id=None`` ⇒ 不传 group_info ⇒ 走私聊流
+    #    ``md5(f"{platform}_{user_id}_private")``；给字符串 ⇒ 走群聊流。
+    if group_id is None:
+        group_info: Optional[Dict[str, Any]] = None
+    else:
+        group_info = {"platform": platform, "group_id": str(group_id)}
+        if group_name:
+            group_info["group_name"] = str(group_name)
 
     return {
         "ver": ENVELOPE_VERSION,
@@ -272,7 +278,7 @@ class MaimConnection:
         *,
         user_id: str,
         user_nickname: str = "",
-        group_id: str = "",
+        group_id: Optional[str] = "",
         group_name: str = "",
     ) -> bool:
         """递一条文本进对方的群流。成功返回 True。

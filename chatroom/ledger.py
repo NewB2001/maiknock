@@ -668,6 +668,40 @@ class ChatroomLedger:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_private_rooms(self) -> List[Dict[str, Any]]:
+        """私聊线程列表（room_id 形如 ``private_<peer>_<speaker>``）。
+
+        ⚠️ 私聊不建 ``room`` 表行（那是群聊舞台），只靠 segment/message 的 room_id
+        前缀区分 ⇒ 这里从 segment 表按前缀聚合，带**最后活动时刻**（用于排序，D11.3）。
+        ⚠️ **线程的 (对方, 发言人) 从投递行反查**，不靠解析 room_id ——
+        ``peer_member_id``（如 ``bot_ddf73be…``）本身带下划线，字符串切不可靠。
+        """
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT room_id, MAX(created_at) AS last_at, COUNT(*) AS seg_count"
+                " FROM segment WHERE room_id LIKE 'private_%'"
+                " GROUP BY room_id"
+            ).fetchall()
+            out: List[Dict[str, Any]] = []
+            for row in rows:
+                room_id = str(row["room_id"])
+                # 取一条投递反查 (对方 bot_id, 发言人 member_id)
+                drow = conn.execute(
+                    "SELECT target_bot_id, sender_member_id FROM delivery"
+                    " WHERE room_id = ? ORDER BY seq DESC LIMIT 1",
+                    (room_id,),
+                ).fetchone()
+                out.append(
+                    {
+                        "thread_id": room_id,
+                        "last_at": str(row["last_at"] or ""),
+                        "seg_count": int(row["seg_count"] or 0),
+                        "peer_bot_id": str(drow["target_bot_id"]) if drow else "",
+                        "my_member_id": str(drow["sender_member_id"]) if drow else "",
+                    }
+                )
+        return out
+
     def get_room(self, room_id: str) -> Optional[Dict[str, Any]]:
         with self.read() as conn:
             row = conn.execute(
