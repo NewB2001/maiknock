@@ -216,13 +216,11 @@ class ChatroomService:
         pool = []
         for member in self._member_pool():
             pool.append(await self._resolve_member(member))
+        source = await self._data_source()
         return {
             "version": CHATROOM_VERSION,
-            "stage": "shell",
-            "notice": (
-                "壳阶段：本页所有内容都是假数据（Mock）。"
-                "不连接 maim 网关、不读写任何 Bot 数据、不做任何消息处理。"
-            ),
+            "stage": "shell" if source == "mock" else "real",
+            "notice": self._notice(source),
             "member_pool": pool,
             "my_roles": self._my_role_list(),
             "peers": self._peer_list(),
@@ -239,6 +237,44 @@ class ChatroomService:
                 "note": "实测参考：@点名 23s、无点名自发接话 51s、沉默观察 150s 超时。",
             },
         }
+
+    # ---- 配置读取（真实数据源接上后，这里是唯一的入口）--------------
+
+    async def _chatroom_cfg(self) -> Dict[str, Any]:
+        """读插件配置的 [chatroom] 段。
+
+        ⚠️ 读插件自己的配置**必须**用 `config.get_plugin` 能力；
+        `ctx.config.get()` 读的是宿主全局主配置（插件陷阱 1）。
+        ⚠️ 读不到就返回空 dict ⇒ 全部走默认值（mock / 关），**不抛异常**。
+        """
+        plugin = self._plugin
+        getter = getattr(plugin, "_plugin_config", None)
+        if getter is None:
+            return {}
+        try:
+            raw = await getter()
+        except Exception:  # noqa: BLE001
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        cfg = raw.get("chatroom")
+        return cfg if isinstance(cfg, dict) else {}
+
+    async def _data_source(self) -> str:
+        """当前数据来源：mock（演示）或 real（真递话真收话）。"""
+        cfg = await self._chatroom_cfg()
+        source = str(cfg.get("data_source") or "mock").strip().lower()
+        return source if source in ("mock", "real") else "mock"
+
+    @staticmethod
+    def _notice(source: str) -> str:
+        """页面顶部那句提示 —— 必须跟当前数据源一致，不能说假话。"""
+        if source == "real":
+            return "正式模式：台词会真的递进各 Bot 的虚拟群，回复是麦麦真说的。"
+        return (
+            "演示模式：本页所有内容都是假数据（Mock）。"
+            "不连接 maim 网关、不读写任何 Bot 数据、不做任何消息处理。"
+        )
 
     async def shell_rooms(self) -> Dict[str, Any]:
         """单独刷新房间列表用。"""
