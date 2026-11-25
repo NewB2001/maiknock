@@ -784,6 +784,12 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         self._chatroom_bot_name = str(me.get("name") or "")
 
         cfg = await self._chatroom_config()
+        logger.info(
+            "[MaiKnock][聊天室] 配置：enabled=%s data_source=%s 账本=%s key=%s",
+            cfg.get("enabled"), cfg.get("data_source"),
+            "已配" if str(cfg.get("ledger_path") or "").strip() else "未配（用推导路径）",
+            "已配" if str(cfg.get("api_key") or "").strip() else "未配",
+        )
         ledger_path = str(cfg.get("ledger_path") or "").strip()
         if not ledger_path:
             # ⚠️ 默认路径由**工作区根**推导 ⇒ 一号二号拿到的是**同一个路径**

@@ -147,14 +147,26 @@ class ChatroomService:
         items: List[Dict[str, Any]] = []
         pool = self._member_map()
         for entry in self._real_roster():
-            member_id = f"bot_{entry['bot_id']}"
-            peer = pool.get(member_id)
+            # ⚠️ **按 bot_id 找成员，不能按派生的 id 找** ——
+            #    `_sync_real_members` 匹配到已有成员时**保留原来的 member_id**
+            #    （比如壳阶段的 bot_hinata 就还是 bot_hinata），
+            #    按 `bot_<bot_id>` 查会查不到 ⇒ peer_name 退化成实例名。
+            member = next(
+                (
+                    item
+                    for item in pool.values()
+                    if item.get("kind") == "bot"
+                    and str(item.get("bot_id") or "") == str(entry["bot_id"])
+                ),
+                None,
+            )
+            member_id = member["member_id"] if member else f"bot_{entry['bot_id']}"
             items.append(
                 {
                     "bot_id": entry["bot_id"],
                     "bot_name": entry["bot_name"],
                     "peer_member_id": member_id,
-                    "peer_name": peer["display_name"] if peer else entry["bot_name"],
+                    "peer_name": member["display_name"] if member else entry["bot_name"],
                     "status": entry["status"],
                     "status_label": entry["status_label"],
                     "selectable": entry["selectable"],
