@@ -936,6 +936,119 @@ class ChatroomLedger:
                 cur = conn.execute("UPDATE error_report SET acked = 1 WHERE acked = 0")
             return int(cur.rowcount or 0)
 
+    # ── 回读协作（S6）─────────────────────────────────────────────────
+
+    def find_delivery_segment(self, target_bot_id: str, room_id: str) -> str:
+        """找「我回应的是哪一段」——取该 Bot 最近一条**还没收完**的投递。
+
+        ⚠️ 按 ``seq`` 倒序取（最近的投递优先），已 ``collected`` 的跳过
+        （那段已经收过了，别把新回复挂到旧段上）。
+        """
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT segment_id FROM delivery"
+                " WHERE target_bot_id = ? AND room_id = ? AND state != ?"
+                " ORDER BY seq DESC LIMIT 1",
+                (target_bot_id, room_id, DELIVERY_COLLECTED),
+            ).fetchone()
+        return str(row[0]) if row else ""
+
+    def ensure_open_segment(self, room_id: str) -> str:
+        """给「没有对应投递的回复」开一个兜底段（历史消息、旁白等）。
+
+        ⚠️ 兜底段也走正常的时间线渲染 ⇒ 用户至少能看到"她说过什么"，
+        而不是回复凭空消失。
+        """
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT segment_id FROM segment WHERE room_id = ? AND kind = 'loose'"
+                " ORDER BY seq DESC LIMIT 1", (room_id,)
+            ).fetchone()
+        if row:
+            return str(row[0])
+        seq = self.next_segment_seq(room_id)
+        segment_id = f"seg_loose_{room_id}_{seq}"
+        with self.write() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO segment(segment_id, room_id, seq, kind, created_at, voided)"
+                " VALUES (?,?,?,'loose',?,0)",
+                (segment_id, room_id, seq, _now()),
+            )
+        return segment_id
+
+    def mark_deliveries_collected(self, target_bot_id: str) -> int:
+        """把该 Bot 已投递完的投递标记为 collected。"""
+        with self.write() as conn:
+            cur = conn.execute(
+                "UPDATE delivery SET state = ?, collected_at = ?"
+                " WHERE target_bot_id = ? AND state = ?",
+                (DELIVERY_COLLECTED, _now(), target_bot_id, DELIVERY_DELIVERED),
+            )
+            return int(cur.rowcount or 0)
+
+    # ── 消息（S6 回读落库）───────────────────────────────────────────
+
+    def append_message(self, message: Dict[str, Any]) -> bool:
+        """追加一条消息行。**按 message_id 去重**（同一群消息只收一次）。
+
+        返回 True = 新增；False = 之前收过。
+        """
+        message_id = str(message.get("message_id") or "")
+        if not message_id:
+            return False
+        with self.write() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO message(message_id, segment_id, room_id,"
+                " speaker_member_id, speaker_name, kind, content, created_at, voided)"
+                " VALUES (?,?,?,?,?,?,?,?,0)",
+                (
+                    message_id,
+                    str(message.get("segment_id") or ""),
+                    str(message.get("room_id") or ""),
+                    str(message.get("speaker_member_id") or ""),
+                    str(message.get("speaker_name") or ""),
+                    str(message.get("kind") or "line"),
+                    str(message.get("content") or ""),
+                    str(message.get("created_at") or ""),
+                ),
+            )
+            return bool(cur.rowcount)
+
+    def list_timeline(self, room_id: str) -> List[Dict[str, Any]]:
+        """一个房间的时间线（页���要的形状）。
+
+        ⚠️ **只收没作废的段与消息**（软作废，见 truncate_from）。
+        ⚠️ 消息按段归组；段内按落库顺序（= 群里的发言顺序）。
+        """
+        segments = self.list_segments(room_id, include_voided=False)
+        messages = self.list_messages(room_id, include_voided=False)
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for msg in messages:
+            grouped.setdefault(str(msg.get("segment_id") or ""), []).append(msg)
+        timeline: List[Dict[str, Any]] = []
+        for segment in segments:
+            segment_id = str(segment.get("segment_id") or "")
+            timeline.append(
+                {
+                    "seq": segment.get("seq"),
+                    "kind": segment.get("kind") or "normal",
+                    "voided": bool(segment.get("voided")),
+                    "created_at": segment.get("created_at") or "",
+                    "messages": [
+                        {
+                            "message_id": m.get("message_id"),
+                            "speaker_member_id": m.get("speaker_member_id") or "",
+                            "speaker_name": m.get("speaker_name") or "",
+                            "kind": m.get("kind") or "line",
+                            "content": m.get("content") or "",
+                            "time": str(m.get("created_at") or "")[-8:-3],
+                        }
+                        for m in grouped.get(segment_id, [])
+                    ],
+                }
+            )
+        return timeline
+
     # ── 聊天室状态快照（房间 / 群员 / 两个上游名单）────────────────────
     # ⚠️ 为什么用「整体快照」而不是逐表增量：这套状态很小（几个房间 + 十几个群员），
     #    整体写一次最简单，也**天然一致**（不会出现房间写了成员没写）。

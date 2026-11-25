@@ -722,6 +722,9 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 错误扫描器（把宿主的 429 等硬错误变成用户看得见的提示，chatroom/errorscan.py）
         self._chatroom_error_watcher = None
         self._chatroom_error_task = None
+        # 回读器（把自己群流里的 Bot 回复收进共享账本，chatroom/collector.py）
+        self._chatroom_collector = None
+        self._chatroom_collector_task = None
 
     # ---- 生命周期（B-2：宿主只调用 on_load/on_unload/on_config_update）----
 
@@ -886,6 +889,65 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             return
         self._chatroom_error_watcher = watcher
         self._chatroom_error_task = asyncio.create_task(self._chatroom_error_loop())
+        self._chatroom_start_collector()
+
+    async def _chatroom_start_collector(self) -> None:
+        """起回读循环：把 Bot 的回复收进共享账本（S6）。
+
+        ⚠️ **每个 Bot 只读自己群流的副本** —— 各 Bot 的群流本来就是独立的副本
+        （08 §3.3 实测：一号库里没有二号的回复）⇒ 天然不会重复收。
+        写进**共享账本** ⇒ 中控汇总时两边的回复都显示得出来。
+        """
+        if self._chatroom_collector is not None:
+            return
+        if self._chatroom_ledger is None:
+            return
+        collector = mk_chatroom.collector.ReplyCollector(
+            self.ctx, self._chatroom_ledger, self._chatroom_bot_id
+        )
+        self._chatroom_collector = collector
+        self._chatroom_collector_task = asyncio.create_task(self._chatroom_collector_loop())
+
+    async def _chatroom_collector_loop(self) -> None:
+        """定期回读自己群流里的新回复。"""
+        collector = self._chatroom_collector
+        if collector is None:
+            return
+        while True:
+            try:
+                await asyncio.sleep(5.0)
+                sessions = self._chatroom_room_sessions()
+                if sessions:
+                    collector.set_sessions(sessions)
+                    await collector.poll()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[MaiKnock][聊天室] 回读循环异常：%r", exc)
+
+    def _chatroom_room_sessions(self) -> Dict[str, str]:
+        """房间里所有虚拟群的 {session_id: room_id}。
+
+        ⚠️ 房间从**账本**读（real 模式下房间已持久化），读不到才用内存里的。
+        """
+        out: Dict[str, str] = {}
+        ledger = self._chatroom_ledger
+        rooms: List[Dict[str, Any]] = []
+        if ledger is not None:
+            try:
+                rooms = ledger.list_rooms()
+            except Exception:  # noqa: BLE001
+                rooms = []
+        if not rooms:
+            svc = getattr(self, "_chatroom", None)
+            rooms = list(getattr(svc, "_rooms", []) or [])
+        for room in rooms:
+            room_id = str(room.get("room_id") or "")
+            if not room_id:
+                continue
+            group_id = str(room.get("group_id") or "") or mk_chatroom.virtual_group_id(room_id)
+            out[mk_chatroom.session_id_for_group(group_id)] = room_id
+        return out
         logger.info(
             "[MaiKnock][聊天室] 错误扫描已启动（实例日志：%s）", watcher.root
         )
@@ -1080,6 +1142,9 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         if self._chatroom_error_task is not None:
             self._chatroom_error_task.cancel()
             self._chatroom_error_task = None
+        if self._chatroom_collector_task is not None:
+            self._chatroom_collector_task.cancel()
+            self._chatroom_collector_task = None
         if self._chatroom_worker is not None:
             try:
                 await self._chatroom_worker.stop()

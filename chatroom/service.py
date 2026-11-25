@@ -382,7 +382,7 @@ class ChatroomService:
             "narrator": NARRATOR,
             "errors": await self._chatroom_errors(),
             "rooms": self._rooms,
-            "timeline": self._seeded_timeline(),
+            "timeline": await self._timeline_for_page(source),
             "private_threads": self._seeded_private_threads(),
             "timing": {
                 "named_seconds": DELAY_NAMED_SECONDS,
@@ -1015,6 +1015,35 @@ class ChatroomService:
         return resolved
 
     # ---- 错误反馈（429 等硬错误，不许默默出错）------------------------
+
+    async def _timeline_for_page(self, source: str) -> Dict[str, Any]:
+        """页面要的时间线。
+
+        - **real 模式**：从**共享账本**读（含回读收进来的 Bot 回复）
+          —— 没读到的房间退回出厂预置时间线（别让房间空着）。
+        - **mock 模式**：出厂预置时间线。
+        """
+        if source != "real":
+            return self._seeded_timeline()
+        ledger = self._ledger()
+        if ledger is None:
+            return self._seeded_timeline()
+        timeline: Dict[str, Any] = {}
+        try:
+            rooms = ledger.list_rooms()
+        except Exception:  # noqa: BLE001
+            rooms = []
+        for room in rooms:
+            room_id = str(room.get("room_id") or "")
+            if not room_id:
+                continue
+            segments = ledger.list_timeline(room_id)
+            if segments:
+                timeline[room_id] = segments
+        # 账本里还没有段的房间 ⇒ 用出厂预置的（房间不至于空着）
+        for room_id, segments in (self._seeded_timeline() or {}).items():
+            timeline.setdefault(room_id, segments)
+        return timeline
 
     async def _chatroom_errors(self, limit: int = 5) -> List[Dict[str, Any]]:
         """取最近的**未确认**错误，写成给用户看的白话。
