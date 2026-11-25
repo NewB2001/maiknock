@@ -112,6 +112,52 @@ class ChatroomService:
             )
         return items
 
+    # ---- 状态持久化（重载不丢房间与群员）--------------------------------
+
+    async def restore_state(self) -> bool:
+        """从账本恢复房间/群员/名单。
+
+        ⚠️ **为什么必须做**：插件每次被宿主重载（改 .py、配置变更、崩溃重启）
+        内存态就没了 —— 用户加的 Bot、建的房间、重排的顺序全丢。
+        账本是唯一能跨重载存活的地方。
+
+        账本里还没有 ⇒ 把当前的出厂假数据**迁进去**（第一次 real 模式时的快照）。
+        返回 True = 从账本恢复了；False = 用出厂数据并已写入账本。
+        """
+        ledger = self._ledger()
+        if ledger is None:
+            return False
+        try:
+            state = ledger.load_state()
+        except Exception:  # noqa: BLE001
+            return False
+        if state:
+            self._rooms = list(state.get("rooms") or [])
+            self._members = {str(m.get("member_id")): dict(m) for m in (state.get("members") or [])}
+            self._my_role_order = list(state.get("my_role_order") or [])
+            self._peer_order = list(state.get("peer_order") or [])
+            return True
+        # 第一次：把出厂假数据写进账本（此后以账本为准）
+        await self.persist_state()
+        return False
+
+    async def persist_state(self) -> None:
+        """把当前房间/群员/名单写回账本。"""
+        ledger = self._ledger()
+        if ledger is None:
+            return
+        try:
+            ledger.save_state(
+                {
+                    "rooms": self._rooms,
+                    "members": list(self._members.values()),
+                    "my_role_order": self._my_role_order,
+                    "peer_order": self._peer_order,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            return
+
     # ---- 真实名单（real 模式）-------------------------------------------
 
     def _workspace(self):
@@ -311,6 +357,8 @@ class ChatroomService:
     async def shell_bootstrap(self) -> Dict[str, Any]:
         """一次性拉取页面需要的全部初始数据。"""
         source = await self._data_source()
+        # ⚠️ 先恢复持久化状态（重载不丢房间与群员），再按真实名单同步 Bot 成员
+        await self.restore_state()
         # ⚠️ **顺序要紧**：先按数据源同步群员，再组装 member_pool ——
         #    否则返回的还是同步**之前**的旧名单（假 Bot 还在、真 Bot 没建）。
         await self._sync_real_members()

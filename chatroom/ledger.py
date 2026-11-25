@@ -849,7 +849,7 @@ class ChatroomLedger:
             return int(cur.rowcount or 0)
 
 
-# ── 各 Bot 的接入状态（自报）───────────────────────────────────────
+    # ── 各 Bot 的接入状态（自报）─────────────────────────────────────
 
     def set_bot_status(
         self,
@@ -935,6 +935,103 @@ class ChatroomLedger:
             else:
                 cur = conn.execute("UPDATE error_report SET acked = 1 WHERE acked = 0")
             return int(cur.rowcount or 0)
+
+    # ── 聊天室状态快照（房间 / 群员 / 两个上游名单）────────────────────
+    # ⚠️ 为什么用「整体快照」而不是逐表增量：这套状态很小（几个房间 + 十几个群员），
+    #    整体写一次最简单，也**天然一致**（不会出现房间写了成员没写）。
+    # ⚠️ 为什么要存：插件**每次重载都会丢内存态**（宿主改 .py 就重载）⇒
+    #    用户加的 Bot、建的房间、重排的顺序全没了。
+
+    def save_state(self, state: Dict[str, Any]) -> None:
+        """把聊天室的房间/群员/名单整体写进账本（覆盖式）。"""
+        rooms = state.get("rooms") or []
+        members = state.get("members") or []
+        my_roles = state.get("my_role_order") or []
+        peers = state.get("peer_order") or []
+        with self.write() as conn:
+            conn.execute("DELETE FROM room_member")
+            conn.execute("DELETE FROM member_list")
+            conn.execute("DELETE FROM room")
+            conn.execute("DELETE FROM member")
+            for room in rooms:
+                conn.execute(
+                    "INSERT OR REPLACE INTO room(room_id, name, mode, group_id, created_at, config_json)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (
+                        str(room.get("room_id") or ""),
+                        str(room.get("name") or ""),
+                        str(room.get("mode") or "stage"),
+                        str(room.get("group_id") or ""),
+                        str(room.get("created_at") or ""),
+                        json.dumps(room.get("config_json") or {}, ensure_ascii=False),
+                    ),
+                )
+            for member in members:
+                conn.execute(
+                    "INSERT OR REPLACE INTO member(member_id, kind, display_name, avatar,"
+                    " persona_label, sort_order, bot_id, platform, account, status,"
+                    " last_active_at, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        str(member.get("member_id") or ""),
+                        str(member.get("kind") or "user_role"),
+                        str(member.get("display_name") or ""),
+                        str(member.get("avatar") or ""),
+                        str(member.get("persona_label") or ""),
+                        int(member.get("sort_order") or 0),
+                        str(member.get("bot_id") or ""),
+                        str(member.get("platform") or ""),
+                        str(member.get("account") or ""),
+                        str(member.get("status") or ""),
+                        float(member.get("last_active_at") or 0),
+                        str(member.get("created_at") or ""),
+                    ),
+                )
+            for list_id, order in (("my_roles", my_roles), ("peers", peers)):
+                for index, member_id in enumerate(order):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO member_list(list_id, member_id, sort_order)"
+                        " VALUES (?,?,?)",
+                        (list_id, str(member_id), index),
+                    )
+            for room in rooms:
+                for index, member_id in enumerate(room.get("member_ids") or []):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO room_member(room_id, member_id, sort_order)"
+                        " VALUES (?,?,?)",
+                        (str(room.get("room_id") or ""), str(member_id), index),
+                    )
+
+    def load_state(self) -> Optional[Dict[str, Any]]:
+        """读回聊天室状态；账本里没有 ⇒ 返回 None（调用方保留出厂假数据）。"""
+        with self.read() as conn:
+            rooms = [dict(r) for r in conn.execute("SELECT * FROM room").fetchall()]
+            if not rooms:
+                return None
+            members = [dict(r) for r in conn.execute("SELECT * FROM member").fetchall()]
+            room_members = [
+                dict(r) for r in conn.execute(
+                    "SELECT room_id, member_id FROM room_member ORDER BY room_id, sort_order"
+                ).fetchall()
+            ]
+            lists: Dict[str, List[str]] = {}
+            for row in conn.execute("SELECT DISTINCT list_id FROM member_list").fetchall():
+                lists[str(row["list_id"])] = [
+                    str(r["member_id"]) for r in conn.execute(
+                        "SELECT member_id FROM member_list WHERE list_id = ? ORDER BY sort_order",
+                        (row["list_id"],),
+                    ).fetchall()
+                ]
+        grouped: Dict[str, List[str]] = {}
+        for row in room_members:
+            grouped.setdefault(str(row["room_id"]), []).append(str(row["member_id"]))
+        for room in rooms:
+            room["member_ids"] = grouped.get(str(room["room_id"]), [])
+        return {
+            "rooms": rooms,
+            "members": members,
+            "my_role_order": lists.get("my_roles", []),
+            "peer_order": lists.get("peers", []),
+        }
 
     def get_bot_status(self, bot_id: str) -> Optional[Dict[str, Any]]:
         with self.read() as conn:
