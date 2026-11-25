@@ -149,7 +149,14 @@ SCHEMA: Tuple[str, ...] = (
         created_at       TEXT NOT NULL DEFAULT '',
         delivered_at     TEXT NOT NULL DEFAULT '',
         collected_at     TEXT NOT NULL DEFAULT '',
-        baseline_ts      REAL NOT NULL DEFAULT 0
+        baseline_ts      REAL NOT NULL DEFAULT 0,
+        group_id         TEXT NOT NULL DEFAULT '',
+        group_name       TEXT NOT NULL DEFAULT '',
+        sender_platform  TEXT NOT NULL DEFAULT '',
+        sender_account   TEXT NOT NULL DEFAULT '',
+        sender_nickname  TEXT NOT NULL DEFAULT '',
+        attempts         INTEGER NOT NULL DEFAULT 0,
+        seq              INTEGER NOT NULL DEFAULT 0
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_delivery_target ON delivery(target_bot_id, state)",
@@ -168,6 +175,45 @@ SCHEMA: Tuple[str, ...] = (
     )
     """,
 )
+
+#: 需要在**已存在的表**上补的列（`CREATE TABLE IF NOT EXISTS` 不会加列）。
+#: ⚠️ 表结构会随开发演进 ⇒ 必须有迁移，否则老账本会一直缺列。
+#:    格式：{表名: {列名: "列定义"}}
+MIGRATIONS: Dict[str, Dict[str, str]] = {
+    "delivery": {
+        "group_id": "TEXT NOT NULL DEFAULT ''",
+        "group_name": "TEXT NOT NULL DEFAULT ''",
+        "sender_platform": "TEXT NOT NULL DEFAULT ''",
+        "sender_account": "TEXT NOT NULL DEFAULT ''",
+        "sender_nickname": "TEXT NOT NULL DEFAULT ''",
+        "attempts": "INTEGER NOT NULL DEFAULT 0",
+        "seq": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: Dict[str, str]) -> List[str]:
+    """给已存在的表补列（返回实际补了哪些列）。
+
+    ⚠️ SQLite 的 ``ALTER TABLE ... ADD COLUMN`` 不支持带默认值的 NOT NULL 之外的复杂约束，
+    所以这里的列定义一律用 ``TEXT NOT NULL DEFAULT ''`` 这种最稳的形状。
+    """
+    try:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error:
+        return []
+    if not existing:
+        return []          # 表还没建（首次打开）⇒ 不用迁移
+    added: List[str] = []
+    for column, definition in columns.items():
+        if column in existing:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            added.append(column)
+        except sqlite3.Error:
+            continue
+    return added
 
 
 def _now() -> str:
@@ -230,7 +276,21 @@ class ChatroomLedger:
         self._apply_pragmas(conn)
         for ddl in SCHEMA:
             conn.execute(ddl)
+        # ⚠️ 迁移：**已存在**的表要补列（CREATE TABLE IF NOT EXISTS 不会加列）
+        for table, columns in MIGRATIONS.items():
+            added = _ensure_columns(conn, table, columns)
+            if added:
+                self._log_migration(table, added)
         self._conn = conn
+
+    @staticmethod
+    def _log_migration(table: str, added: List[str]) -> None:
+        """迁移日志（补了列要说一声，别静默）。"""
+        import logging
+
+        logging.getLogger("plugin.maiknock.webui_companion").info(
+            "[聊天室] 账本迁移：表 %s 补了列 %s", table, "、".join(added)
+        )
 
     @staticmethod
     def _apply_pragmas(conn: sqlite3.Connection) -> None:
@@ -636,21 +696,54 @@ class ChatroomLedger:
         segment_id: str = "",
         sender_member_id: str = "",
         baseline_ts: Optional[float] = None,
+        group_id: str = "",
+        group_name: str = "",
+        sender_platform: str = "",
+        sender_account: str = "",
+        sender_nickname: str = "",
+        seq: int = 0,
     ) -> Dict[str, Any]:
-        """登记一条投递任务（跨 Bot 的工作单）。"""
+        """登记一条投递任务（跨 Bot 的工作单）。
+
+        ⚠️ **投递身份写进任务里**（平台 / 账号 / 昵称 / 群）——
+        领单的那个 Bot 进程**没有**中控的角色登记表，
+        身份随任务走才不会认错人（02 文档「平台身份固定」铁则）。
+        ⚠️ ``seq`` 是**中控分配的单调序号**——``created_at`` 只有秒级精度，
+        同一秒建的多条任务排序不确定 ⇒ 台词会乱序递。
+        """
         created = _now()
+        columns = (
+            "delivery_id", "segment_id", "room_id", "target_bot_id",
+            "sender_member_id", "content", "state", "created_at",
+            "delivered_at", "collected_at", "baseline_ts",
+            "group_id", "group_name", "sender_platform", "sender_account",
+            "sender_nickname", "attempts", "seq",
+        )
+        values = (
+            delivery_id, segment_id, room_id, target_bot_id,
+            sender_member_id, content, DELIVERY_PENDING, created,
+            "", "",
+            float(baseline_ts if baseline_ts is not None else time.time()),
+            group_id, group_name, sender_platform, sender_account,
+            sender_nickname, 0, int(seq),
+        )
+        placeholders = ",".join("?" for _ in columns)
         with self.write() as conn:
             conn.execute(
-                "INSERT INTO delivery(delivery_id, segment_id, room_id, target_bot_id,"
-                " sender_member_id, content, state, created_at, delivered_at, collected_at, baseline_ts)"
-                " VALUES (?,?,?,?,?,?,?,?,'','',?)",
-                (
-                    delivery_id, segment_id, room_id, target_bot_id,
-                    sender_member_id, content, DELIVERY_PENDING, created,
-                    float(baseline_ts if baseline_ts is not None else time.time()),
-                ),
+                f"INSERT INTO delivery({','.join(columns)}) VALUES ({placeholders})",
+                values,
             )
         return self.get_delivery(delivery_id)
+
+    def next_delivery_seq(self) -> int:
+        """下一个投递序号（**全局单调递增**）。
+
+        ⚠️ 为什么需要它：``created_at`` 只有**秒级**精度 ⇒ 同一秒建的多条任务
+        排序是不确定的 ⇒ 台词会乱序递。序号由中控分配，保证顺序。
+        """
+        with self.read() as conn:
+            row = conn.execute("SELECT MAX(seq) FROM delivery").fetchone()
+        return int(row[0] or 0) + 1
 
     def get_delivery(self, delivery_id: str) -> Optional[Dict[str, Any]]:
         with self.read() as conn:
@@ -664,7 +757,7 @@ class ChatroomLedger:
         with self.read() as conn:
             rows = conn.execute(
                 "SELECT * FROM delivery WHERE target_bot_id = ? AND state = ?"
-                " ORDER BY created_at, delivery_id LIMIT ?",
+                " ORDER BY seq, created_at, delivery_id LIMIT ?",
                 (target_bot_id, DELIVERY_PENDING, int(limit)),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -676,7 +769,7 @@ class ChatroomLedger:
         """
         with self.write() as conn:
             cur = conn.execute(
-                "UPDATE delivery SET state = ?, delivered_at = ?"
+                "UPDATE delivery SET state = ?, delivered_at = ?, attempts = attempts + 1"
                 " WHERE delivery_id = ? AND target_bot_id = ? AND state = ?",
                 (DELIVERY_DELIVERED, _now(), delivery_id, target_bot_id, DELIVERY_PENDING),
             )
@@ -693,9 +786,33 @@ class ChatroomLedger:
         """超时：点名了却没开口。**只记状态，不产消息行**（FR-09：沉默不进时间线）。"""
         with self.write() as conn:
             conn.execute(
-                "UPDATE delivery SET state = ? WHERE delivery_id = ? AND state = ?",
-                (DELIVERY_TIMEOUT, delivery_id, DELIVERY_PENDING),
+                "UPDATE delivery SET state = ? WHERE delivery_id = ? AND state IN (?, ?)",
+                (DELIVERY_TIMEOUT, delivery_id, DELIVERY_PENDING, DELIVERY_DELIVERED),
             )
+
+    def requeue_delivery(self, delivery_id: str, max_attempts: int = 3) -> bool:
+        """递话失败 ⇒ **放回待办**（网关抖一下不该把这句话丢了）。
+
+        超过 ``max_attempts`` 就不再重试 ⇒ 标超时（看得见"这句没递出去"）。
+        返回 True = 已放回待办；False = 次数用尽，已标超时。
+        """
+        with self.write() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM delivery WHERE delivery_id = ?", (delivery_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if int(row[0] or 0) >= max_attempts:
+                conn.execute(
+                    "UPDATE delivery SET state = ? WHERE delivery_id = ?",
+                    (DELIVERY_TIMEOUT, delivery_id),
+                )
+                return False
+            conn.execute(
+                "UPDATE delivery SET state = ? WHERE delivery_id = ? AND state = ?",
+                (DELIVERY_PENDING, delivery_id, DELIVERY_DELIVERED),
+            )
+            return True
 
     def cancel_deliveries(self, room_id: str) -> int:
         """「停止本轮」：把该房间还没递出去的任务标成取消。

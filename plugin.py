@@ -717,6 +717,8 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         self._chatroom_workspace = None
         # maim 网关连接池（跨 Bot 递话的通道，chatroom/gateway.py）
         self._chatroom_gateway = None
+        # 投递 worker（领单 → 递话 → 回填状态，chatroom/worker.py）
+        self._chatroom_worker = None
 
     # ---- 生命周期（B-2：宿主只调用 on_load/on_unload/on_config_update）----
 
@@ -839,7 +841,28 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             "[MaiKnock][聊天室] 握手层通过：已连上 %s 的消息网关（%s）",
             self._chatroom_bot_id[:12], conn.endpoint(),
         )
+        await self._chatroom_start_worker()
         await self._chatroom_report_status()
+
+    async def _chatroom_start_worker(self) -> None:
+        """起投递循环：把账本里派给**本 Bot** 的台词递进本 Bot 的虚拟群。
+
+        ⚠️ **各 Bot 各领各的单**（方案 B）：每个实例只用自己的 key 递给自己，
+        跨 Bot 的协调靠共享账本里的投递任务。
+        """
+        if self._chatroom_worker is not None:
+            return
+        ledger = self._chatroom_ledger
+        pool = self._chatroom_gateway
+        if ledger is None or pool is None:
+            return
+        delivery_enabled = bool((await self._chatroom_config()).get("delivery", {}).get("enabled"))
+        if not delivery_enabled:
+            logger.info("[MaiKnock][聊天室] 递送开关未开，不起投递循环")
+            return
+        worker = mk_chatroom.DeliveryWorker(ledger, pool, self._chatroom_bot_id)
+        worker.start()
+        self._chatroom_worker = worker
 
     async def _chatroom_style_fixed(self) -> Optional[bool]:
         """本 Bot 的说话风格是否已按敲门侧固化。
@@ -995,6 +1018,12 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[MaiKnock][聊天室] 关闭共享账本时出错：%r", exc)
             self._chatroom_ledger = None
+        if self._chatroom_worker is not None:
+            try:
+                await self._chatroom_worker.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[MaiKnock][聊天室] 停投递循环时出错：%r", exc)
+            self._chatroom_worker = None
         if self._chatroom_gateway is not None:
             try:
                 await self._chatroom_gateway.close()

@@ -31,7 +31,7 @@ from .mock_data import (
     _build_segment,
 )
 from .hostinfo import read_bot_config, read_bots
-from .identity import DEFAULT_PLATFORM
+from .identity import DEFAULT_PLATFORM, virtual_group_id
 from .roster import build_roster
 
 # 聊天室子模块自己的版本号（插件总版本见 plugin.py 的 VERSION 常量）
@@ -959,6 +959,102 @@ class ChatroomService:
             )
         return resolved
 
+    async def _real_submit_beat(
+        self,
+        room_id: str,
+        lines: Optional[List[Dict[str, Any]]] = None,
+        script: str = "",
+        speakers: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """real 模式：把这一幕**真的**排成投递任务（跨 Bot 的工作单）。
+
+        流程：
+        1. 解析台词（沿用壳阶段那套：角色要么是页面选好的 member_id，
+           要么能被房间成员名唯一匹配上；**绝不猜**）；
+        2. 写一段（segment）+ 若干消息行进共享账本；
+        3. **每行 × 每个在场 Bot** 排一条投递任务 ——
+           FR-07：同一句台词要递进**每个**在场 Bot 各自的群聊流；
+        4. 点名的 Bot（``speakers``）的那份**在正文前加 ``@显示名``** ——
+           02 文档 8.6 实测：@点名是麦麦**开口**的保证（23s vs 不点名 51s）。
+
+        ⚠️ 投递**身份随任务走**（平台 / 账号 / 昵称）——领单的那个 Bot 进程
+        没有中控的角色登记表，身份不写进任务就会认错人。
+        ⚠️ 任务带**单调序号**（``seq``）——``created_at`` 只有秒级精度，
+        同一秒建的多条任务排序不确定 ⇒ 台词会乱序递。
+        """
+        ledger = self._ledger()
+        if ledger is None:
+            return {"ok": False, "error": "共享账本没开，聊天室暂时不能递话"}
+        # ⚠️ 先同步成员（真名单的显示名 / 状态）—— @点名 用的是**当时的显示名**，
+        #    不同步就会拿旧名字去点名（壳阶段的「雏田」而不是真名单的「日向雏田」）。
+        await self._sync_real_members()
+        await self._refresh_peer_status()
+        room = self._room_by_id(room_id)
+        if room is None:
+            return {"ok": False, "error": f"房间不存在：{room_id}"}
+        resolved = await self._resolve_lines(room, lines, script)
+        if isinstance(resolved, str):
+            return {"ok": False, "error": resolved}
+        if not resolved:
+            return {"ok": False, "error": "这一幕还没有台词"}
+        bots = await self._room_bot_members(room)
+        if not bots:
+            return {"ok": False, "error": "这个房间里还没有麦麦 Bot，先在左边「群员」里加一个"}
+        named = {str(item) for item in (speakers or [])}
+        group_id = virtual_group_id(room_id)
+        pool = self._member_map()
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        segment_id = f"seg_{int(time.time() * 1000)}"
+        messages = [
+            {
+                "message_id": f"{segment_id}_m{index}",
+                "speaker_member_id": line["member_id"],
+                "speaker_name": line["display_name"],
+                "kind": "line",
+                "content": line["text"],
+                "created_at": stamp,
+            }
+            for index, line in enumerate(resolved)
+        ]
+        try:
+            ledger.append_segment(room_id, segment_id, "normal", messages)
+            seq = ledger.next_delivery_seq()
+            queued = 0
+            for line in resolved:
+                for bot in bots:
+                    content = line["text"]
+                    if bot["member_id"] in named:
+                        # 02 文档 8.6：@点名 是开口保证（正文里带 @显示名）
+                        content = f"@{bot['display_name']} {content}"
+                    sender = pool.get(line["member_id"]) or {}
+                    ledger.enqueue_delivery(
+                        delivery_id=f"{segment_id}_d{seq}",
+                        target_bot_id=str(bot.get("bot_id") or ""),
+                        content=content,
+                        room_id=room_id,
+                        segment_id=segment_id,
+                        sender_member_id=line["member_id"],
+                        sender_platform=str(sender.get("platform") or "webui"),
+                        sender_account=str(sender.get("account") or ""),
+                        sender_nickname=line["display_name"],
+                        group_id=group_id,
+                        group_name=str(room.get("name") or ""),
+                        seq=seq,
+                    )
+                    seq += 1
+                    queued += 1
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"写投递任务失败：{exc}"}
+        return {
+            "ok": True,
+            "room_id": room_id,
+            "segment_id": segment_id,
+            "queued": queued,
+            "bots": [str(bot.get("display_name") or "") for bot in bots],
+            "named": sorted(named),
+            "lines": resolved,
+        }
+
     async def shell_submit_beat(
         self,
         room_id: str,
@@ -976,9 +1072,12 @@ class ChatroomService:
 
         返回的内容包括：解析后的台词、本轮的调度策略（显式点名 / 默认随机）、
         seed、每个 Bot 的等待秒数与它要产出的消息行。
-        **真实的递话与收话不在本阶段范围**，这里只是把「未来会发生什么」
-        提前算好交给页面按节奏演出来。
+        **mock 模式**下这里只是把「未来会发生什么」提前算好交给页面按节奏演出来；
+        **real 模式**下会**真的**把台词写进共享账本、排成投递任务，
+        由各 Bot 自己的插件实例领单递进虚拟群（S5）。
         """
+        if await self._data_source() == "real":
+            return await self._real_submit_beat(room_id, lines, script, speakers)
         room = self._room_by_id(room_id)
         if room is None:
             return {"ok": False, "error": f"房间不存在：{room_id}"}
