@@ -125,6 +125,28 @@ def parse_snapshot(path: Path) -> Optional[Dict[str, Any]]:
     }
 
 
+def snapshot_time(path: Path) -> float:
+    """快照的**真实发生时刻**（epoch 秒）。
+
+    ⚠️ 优先用**文件名里的时间戳**，不用 mtime。
+    宿主的命名是 ``{发生时刻:%Y%m%d_%H%M%S_%f}_{请求id}.json``
+    （``request_snapshot.py:691``）⇒ 文件名里的时刻才是"这个错误什么时候发生的"。
+    而 **mtime 会被复制保留**（``shutil.copy2``）⇒ 用 mtime 判新旧会把
+    「新放进来的快照」当成旧的漏掉（实测踩过）。
+    文件名不合规时回退 mtime。
+    """
+    parts = path.name.split("_")
+    if len(parts) >= 2 and len(parts[0]) == 8 and len(parts[1]) >= 6:
+        try:
+            return float(time.mktime(time.strptime(parts[0] + "_" + parts[1][:6], "%Y%m%d_%H%M%S")))
+        except (ValueError, OverflowError, OSError):
+            pass
+    try:
+        return float(path.stat().st_mtime)
+    except OSError:
+        return 0.0
+
+
 def scan_error_dir(
     root: Path,
     *,
@@ -150,7 +172,7 @@ def scan_error_dir(
         try:
             if path.name.endswith(".events.jsonl"):
                 continue
-            if since_ts and path.stat().st_mtime <= since_ts:
+            if since_ts and snapshot_time(path) <= since_ts:
                 continue
         except OSError:
             continue

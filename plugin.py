@@ -866,7 +866,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         worker = mk_chatroom.DeliveryWorker(ledger, pool, self._chatroom_bot_id)
         worker.start()
         self._chatroom_worker = worker
-        self._chatroom_start_error_watcher()
+        await self._chatroom_start_error_watcher()
 
     async def _chatroom_start_error_watcher(self) -> None:
         """起错误扫描循环：把宿主的 429 等硬错误捡起来，写进共享账本。
