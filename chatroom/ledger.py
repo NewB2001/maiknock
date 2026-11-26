@@ -33,12 +33,17 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .mock_data import NARRATOR
+
 #: 投递任务的状态机
 DELIVERY_PENDING = "pending"
 DELIVERY_DELIVERED = "delivered"
 DELIVERY_COLLECTED = "collected"
 DELIVERY_TIMEOUT = "timeout"
 DELIVERY_CANCELLED = "cancelled"
+
+#: 旁白成员的固定 member_id（与 `mock_data.NARRATOR` 同一份真源，别抄字面量）
+NARRATOR_MEMBER_ID = str(NARRATOR["member_id"])
 
 #: 名单用途（上游的两张表）
 LIST_MY_ROLES = "my_roles"
@@ -100,6 +105,13 @@ SCHEMA: Tuple[str, ...] = (
         PRIMARY KEY (list_id, member_id)
     )
     """,
+    # ── 杂项键值（跨重载的小状态，比如「最近使用的角色」）────────────────
+    """
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL DEFAULT ''
+    )
+    """,
     # ── 房间群员（关联表）────────────────────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS room_member (
@@ -131,6 +143,7 @@ SCHEMA: Tuple[str, ...] = (
         speaker_name      TEXT NOT NULL DEFAULT '',
         kind              TEXT NOT NULL DEFAULT 'line',  -- line|reply|narrator|sticker
         content           TEXT NOT NULL DEFAULT '',
+        quote             TEXT NOT NULL DEFAULT '',   -- 被引原文（回复哪句；显示引用块用）
         created_at        TEXT NOT NULL DEFAULT '',
         voided            INTEGER NOT NULL DEFAULT 0
     )
@@ -220,6 +233,9 @@ SCHEMA: Tuple[str, ...] = (
 #: ⚠️ 表结构会随开发演进 ⇒ 必须有迁移，否则老账本会一直缺列。
 #:    格式：{表名: {列名: "列定义"}}
 MIGRATIONS: Dict[str, Dict[str, str]] = {
+    "message": {
+        "quote": "TEXT NOT NULL DEFAULT ''",
+    },
     "delivery": {
         "group_id": "TEXT NOT NULL DEFAULT ''",
         "group_name": "TEXT NOT NULL DEFAULT ''",
@@ -261,6 +277,11 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: Dict[str, str
 def _now() -> str:
     """本地时刻字符串（排序与显示用；不是 epoch）。"""
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _now_minus(seconds: float) -> str:
+    """本地时刻字符串减去 ``seconds`` 秒（宽限期的截止线用）。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - float(seconds)))
 
 
 #: 单个房间 config_json 的**合理上限**（字节）。
@@ -816,6 +837,67 @@ class ChatroomLedger:
                 "UPDATE member SET last_active_at = ? WHERE member_id = ?", (ts, member_id)
             )
 
+    # ── 杂项键值（meta）─────────────────────────────────────────────────
+    # ⚠️ **为什么不用 member.last_active_at 记「最近使用的角色」**：
+    #    persist_state 每次都拿**内存里的成员 dict** 整体覆写 member 表，
+    #    内存 dict 不带 last_active_at ⇒ touch 完一次就被下一次存档抹回 0
+    #    ⇒ 单独一张 meta 表最稳（save_state 的 DELETE 碰不到它）。
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.write() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
+                (str(key), str(value or "")),
+            )
+
+    def get_meta(self, key: str) -> str:
+        with self.read() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (str(key),)).fetchone()
+        return str(row["value"]) if row else ""
+
+    # ── 房间删除（2026-11-26 用户拍板：删除即永远消失，无回收站）─────────
+
+    def delete_room_data(self, room_id: str) -> Dict[str, int]:
+        """**物理删除**一个房间的全部剧情数据（segment/message/turn/delivery/room）。
+
+        ⚠️ **保留还没递完的旁白投递** ——「先发遮蔽旁白、后删数据」的顺序里，
+        告别旁白可能还在队列中 ⇒ 删了它 Bot 就收不到旁白了。
+        它们递出后由 ``timeout_stale_deliveries`` 收口、``cleanup_orphan_deliveries`` 清走。
+        """
+        with self.write() as conn:
+            counts: Dict[str, int] = {}
+            cur = conn.execute("DELETE FROM message WHERE room_id = ?", (room_id,))
+            counts["messages"] = int(cur.rowcount or 0)
+            cur = conn.execute("DELETE FROM segment WHERE room_id = ?", (room_id,))
+            counts["segments"] = int(cur.rowcount or 0)
+            cur = conn.execute("DELETE FROM turn WHERE room_id = ?", (room_id,))
+            counts["turns"] = int(cur.rowcount or 0)
+            cur = conn.execute(
+                "DELETE FROM delivery WHERE room_id = ?"
+                " AND NOT (sender_member_id = ? AND state IN (?, ?))",
+                (room_id, NARRATOR_MEMBER_ID, DELIVERY_PENDING, DELIVERY_DELIVERED),
+            )
+            counts["deliveries"] = int(cur.rowcount or 0)
+            cur = conn.execute("DELETE FROM room_member WHERE room_id = ?", (room_id,))
+            cur = conn.execute("DELETE FROM room WHERE room_id = ?", (room_id,))
+            counts["rooms"] = int(cur.rowcount or 0)
+        return counts
+
+    def cleanup_orphan_deliveries(self) -> int:
+        """清掉「房间已不存在」且已终态的投递行（遮蔽旁白递出后的收尾）。
+
+        ⚠️ 私聊投递的 room_id 是 ``private_*``，不在 room 表里 —— **必须排除**，
+        否则正常私聊任务会被误删。
+        """
+        with self.write() as conn:
+            cur = conn.execute(
+                "DELETE FROM delivery WHERE state IN (?, ?, ?)"
+                " AND room_id NOT LIKE 'private_%'"
+                " AND room_id NOT IN (SELECT room_id FROM room)",
+                (DELIVERY_COLLECTED, DELIVERY_TIMEOUT, DELIVERY_CANCELLED),
+            )
+            return int(cur.rowcount or 0)
+
     # ── 上游名单（我的角色 / 私聊对象）──────────────────────────────────
 
     def list_members_of(self, list_id: str) -> List[Dict[str, Any]]:
@@ -1138,6 +1220,57 @@ class ChatroomLedger:
             return 10 ** 6
         return min(inflight)
 
+    def active_turn_inflight(self, turn_id: str) -> bool:
+        """这一轮还有没有在途投递（pending / delivered）⇒ 判断状态条要不要恢复。
+
+        ⚠️ 用途（2026-11-27）：插件 iframe 被宿主重建后，前端 state 全丢，
+        状态条要能从账本快照恢复。但**只恢复仍在进行中的轮次**——
+        已全部 collected/timeout 的旧轮次不该在重载后冒出一个「已等待」。
+        """
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM delivery WHERE turn_id = ? AND state IN (?, ?) LIMIT 1",
+                (turn_id, DELIVERY_PENDING, DELIVERY_DELIVERED),
+            ).fetchone()
+        return row is not None
+
+    def inflight_valve_groups(self, target_bot_id: str) -> List[str]:
+        """「频率阀门」判定：某 Bot **有台词类投递在途**的群 group_id 列表。
+
+        在途 = state ∈ {pending, delivered}（还没进终态）。
+        ⚠️ **排除两类**（㉚）：
+        - ``turn_id`` 为空 ⇒ 旁白单（拍板：旁白只推进剧情、不引发接话，不开阀）；
+        - ``group_id`` 为空 ⇒ 私聊单（阀门只管聊天室群流，私聊的静默续聊口径未定）。
+        """
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT group_id FROM delivery"
+                " WHERE target_bot_id = ? AND state IN (?, ?)"
+                " AND turn_id != '' AND group_id != ''",
+                (target_bot_id, DELIVERY_PENDING, DELIVERY_DELIVERED),
+            ).fetchall()
+        return [str(r[0]) for r in rows if r[0]]
+
+    def recent_collect_targets(self, target_bot_id: str, within_seconds: float = 1800.0) -> List[Dict[str, Any]]:
+        """「宽限期」内的**已超时**投递（㉚ 实测修复：迟到回复不许丢）。
+
+        **背景**：回读只在「有 delivered 待收」时才读群流（省 RPC 的门槛）；
+        但 Bot 思考可以远超 150 秒（实测回复器一轮 218 秒）——超时一标，
+        门槛关闭，她**迟到的回复就永远进不了时间线**（2026-11-27 实测撞过）。
+        ⇒ 超时后 ``within_seconds`` 秒内，这条单仍算「要盯着的流」，
+        迟到的回复照常入账（归属匹配 ``find_delivery_for_reply`` 不看状态，
+        会自动挂回正确的段；``mark_collected`` 会把行从 timeout 翻回 collected）。
+        """
+        cutoff = _now_minus(within_seconds)
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT * FROM delivery WHERE target_bot_id = ? AND state = ?"
+                " AND delivered_at != '' AND delivered_at >= ?"
+                " ORDER BY seq",
+                (target_bot_id, DELIVERY_TIMEOUT, cutoff),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def claim_delivery(self, delivery_id: str, target_bot_id: str) -> bool:
         """**原子**地把任务从 pending 领走（防两个实例抢同一条）。
 
@@ -1157,6 +1290,28 @@ class ChatroomLedger:
                 "UPDATE delivery SET state = ?, collected_at = ? WHERE delivery_id = ?",
                 (DELIVERY_COLLECTED, _now(), delivery_id),
             )
+
+    def mark_wave_answered(self, turn_id: str, wave: int, target_bot_id: str) -> int:
+        """把这个 Bot 在（本轮 × 本波）里**其余还没收口的投递**一起标 collected。
+
+        ⚠️ **为什么需要**（实测 2026-11-26：串行阵型每过一个波次**固定白等 150 秒**）：
+        波次门控要求上一波**每一条**投递都 collected/timeout 才放行，
+        但 Bot 对一轮多句台词通常**只回一次** —— 没被单独回复的那几条
+        只能干等 150 秒超时兜底 ⇒ 后一波固定慢 2.5 分钟
+        （实测：小樱 15:56:22 就回了，雏田 15:58:33 才领到单）。
+        ⇒ 语义修正：「这一波说完了」= 「这一波里每个 Bot 都开过口」，
+          不是「每条台词各有一条回复」—— 这个 Bot 的回复既然配对到了
+          它这一波的单，它这一波其余的单一起收口。
+        ⚠️ 只动**本 Bot 自己**的单（同波其它 Bot 还得各自开口/各自超时）。
+        """
+        with self.write() as conn:
+            cur = conn.execute(
+                "UPDATE delivery SET state = ?, collected_at = ?"
+                " WHERE turn_id = ? AND wave = ? AND target_bot_id = ? AND state = ?",
+                (DELIVERY_COLLECTED, _now(), str(turn_id), int(wave), target_bot_id,
+                 DELIVERY_DELIVERED),
+            )
+            return int(cur.rowcount or 0)
 
     def mark_timeout(self, delivery_id: str) -> None:
         """超时：点名了却没开口。**只记状态，不产消息行**（FR-09：沉默不进时间线）。"""
@@ -1333,6 +1488,35 @@ class ChatroomLedger:
             row = conn.execute(sql, params).fetchone()
         return str(row[0]) if row else ""
 
+    def reply_quote_candidates(self, target_bot_id: str, room_id: str, limit: int = 20) -> List[str]:
+        """这个 Bot 在这个房间里**可能被引用**的原文候选（剥回复引用壳用）。
+
+        ⚠️ 陷阱 27：回复消息的 ``processed_plain_text`` = 被引原文 + 空格 + 新正文
+        ⇒ 拿「她最近的投递正文（台词/接力前缀）+ 房间最近的消息正文」做
+        **最长前缀匹配**的候选，匹配上就剥掉，聊天室只显示她的新正文。
+        """
+        out: List[str] = []
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT content FROM delivery WHERE target_bot_id = ? AND room_id = ?"
+                " ORDER BY seq DESC LIMIT ?",
+                (target_bot_id, room_id, int(limit)),
+            ).fetchall()
+            out.extend(str(r["content"] or "") for r in rows)
+            rows = conn.execute(
+                "SELECT content FROM message WHERE room_id = ?"
+                " ORDER BY created_at DESC LIMIT ?",
+                (room_id, int(limit)),
+            ).fetchall()
+            out.extend(str(r["content"] or "") for r in rows)
+        seen: set = set()
+        uniq: List[str] = []
+        for c in sorted(out, key=len, reverse=True):
+            if c and c not in seen:
+                seen.add(c)
+                uniq.append(c)
+        return uniq
+
     def find_delivery_for_reply(
         self, target_bot_id: str, room_id: str, reply_at: str = ""
     ) -> Optional[Dict[str, Any]]:
@@ -1400,6 +1584,18 @@ class ChatroomLedger:
         （**只记状态，不产消息行**——沉默绝不进时间线）。
 
         ⚠️ 只动本 Bot 自己的单（别的 Bot 由它们各自的实例管）。
+
+        ⚠️ **旁白与台词同款**（2026-11-27 用户拍板：旁白 = 「我的角色」发的一句话，
+        期待接话）⇒ **旁白单照常按 timeout 收口**，不再特殊对待。
+        原因：collector 的 30 分钟宽限期（``recent_collect_targets``）只认 timeout
+        状态的单——旁白若超窗标 collected，Bot 迟到的回复就永远进不了时间线
+        （㉛ 实测撞过同类问题：回复器一轮 218 秒）。波次门控只要终态，
+        timeout 与 collected 一样放行，故改超时不影响接话节奏。
+
+        ⚠️ **为什么不在「递出成功」当场标 collected**：
+        `pending_collect_targets` 只认 delivered，而采集器**只有它有单时才读群流**
+        ⇒ 当场标 collected 会让采集器提前收工 ⇒ **Bot 的回复收不进来**。
+        所以保留完整的回读窗口（150 秒），只是终点换个状态。
         """
         cutoff = time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - float(older_than_seconds))
@@ -1408,7 +1604,12 @@ class ChatroomLedger:
             cur = conn.execute(
                 "UPDATE delivery SET state = ?"
                 " WHERE target_bot_id = ? AND state = ? AND delivered_at <= ?",
-                (DELIVERY_TIMEOUT, target_bot_id, DELIVERY_DELIVERED, cutoff),
+                (
+                    DELIVERY_TIMEOUT,
+                    target_bot_id,
+                    DELIVERY_DELIVERED,
+                    cutoff,
+                ),
             )
             return int(cur.rowcount or 0)
 
@@ -1567,8 +1768,8 @@ class ChatroomLedger:
         with self.write() as conn:
             cur = conn.execute(
                 "INSERT OR IGNORE INTO message(message_id, segment_id, room_id,"
-                " speaker_member_id, speaker_name, kind, content, created_at, voided)"
-                " VALUES (?,?,?,?,?,?,?,?,0)",
+                " speaker_member_id, speaker_name, kind, content, quote, created_at, voided)"
+                " VALUES (?,?,?,?,?,?,?,?,?,0)",
                 (
                     message_id,
                     segment_id,
@@ -1577,15 +1778,18 @@ class ChatroomLedger:
                     str(message.get("speaker_name") or ""),
                     str(message.get("kind") or "line"),
                     str(message.get("content") or ""),
+                    str(message.get("quote") or ""),
                     str(message.get("created_at") or ""),
                 ),
             )
             if cur.rowcount:
                 return True
-            # 已收过 ⇒ 更新归属（自愈）
+            # 已收过 ⇒ 更新归属（自愈）+ 补写 quote（引用信息是后加的字段）
             conn.execute(
-                "UPDATE message SET segment_id = ?, room_id = ? WHERE message_id = ?",
-                (segment_id, room_id, message_id),
+                "UPDATE message SET segment_id = ?, room_id = ?,"
+                " quote = CASE WHEN ? != '' THEN ? ELSE quote END WHERE message_id = ?",
+                (segment_id, room_id,
+                 str(message.get("quote") or ""), str(message.get("quote") or ""), message_id),
             )
             return False
 
@@ -1607,6 +1811,7 @@ class ChatroomLedger:
             segment_id = str(segment.get("segment_id") or "")
             timeline.append(
                 {
+                    "segment_id": segment_id,
                     "seq": segment.get("seq"),
                     "kind": segment.get("kind") or "normal",
                     "voided": bool(segment.get("voided")),
@@ -1618,6 +1823,7 @@ class ChatroomLedger:
                             "speaker_name": m.get("speaker_name") or "",
                             "kind": m.get("kind") or "line",
                             "content": m.get("content") or "",
+                            "quote": m.get("quote") or "",
                             "time": str(m.get("created_at") or "")[-8:-3],
                         }
                         for m in grouped.get(segment_id, [])
@@ -1693,12 +1899,23 @@ class ChatroomLedger:
                         " VALUES (?,?,?)",
                         (str(room.get("room_id") or ""), str(member_id), index),
                     )
+            # ⚠️ **存过快照的标记**（room 表为空 ≠ 从未存过，见 load_state）
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('has_state', '1')"
+            )
 
     def load_state(self) -> Optional[Dict[str, Any]]:
-        """读回聊天室状态；账本里没有 ⇒ 返回 None（调用方保留出厂假数据）。"""
+        """读回聊天室状态；账本里没有 ⇒ 返回 None（调用方保留出厂假数据）。
+
+        ⚠️ **「房间被删光」也是一份合法状态**（2026-11-26 用户拍板：允许删到零）——
+        不能拿「room 表为空」当「从未存过」的判据，否则删光后一重载，
+        出厂演示房间会被当成首次运行**重新迁回账本**（比不让删还糟）。
+        ⇒ 用 meta 表的 ``has_state`` 标记区分（save_state 落笔时打上）。
+        """
+        has_state = bool(self.get_meta("has_state"))
         with self.read() as conn:
             rooms = [dict(r) for r in conn.execute("SELECT * FROM room").fetchall()]
-            if not rooms:
+            if not rooms and not has_state:
                 return None
             members = [dict(r) for r in conn.execute("SELECT * FROM member").fetchall()]
             room_members = [

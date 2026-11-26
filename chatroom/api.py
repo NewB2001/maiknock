@@ -225,6 +225,11 @@ class ChatroomApiMixin:
         """
         return await self._svc_call("shell_replace_member", room_id, old_member_id, new_member_id)
 
+    @API("shell_clear_active_turn", description="清掉进行中轮次快照（状态条收尾用）", version="1")
+    async def shell_clear_active_turn(self, turn_id: str = "") -> Dict[str, Any]:
+        """本轮结束 / 手动停止时清掉快照，防止重载后冒出旧的「已等待」。"""
+        return await self._svc_call("shell_clear_active_turn", turn_id)
+
     @API("shell_delete_room", description="删除一个剧本房间（假数据）", version="1")
     async def shell_delete_room(self, room_id: str) -> Dict[str, Any]:
         """删掉一个房间。

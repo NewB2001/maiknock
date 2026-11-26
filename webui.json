@@ -415,6 +415,16 @@
               "max_length": 8
             }
           }
+        },
+        "clear_active_turn": {
+          "api": "shell_clear_active_turn",
+          "parameters": {
+            "turn_id": {
+              "type": "string",
+              "required": false,
+              "max_length": 128
+            }
+          }
         }
       }
     }

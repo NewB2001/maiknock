@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from typing import Any
 
-# 这几个子模块**只依赖标准库** ⇒ 直接导入，不走惰性
+# 这几个子模块**只依赖标准库**（talkrules 的 tomlkit 在函数内惰性导入）⇒ 直接导入，不走惰性
 from . import (
     collector,
     errorscan,
@@ -41,12 +41,15 @@ from . import (
     mock_data,
     service,
     splitter_guard,
+    talkrules,
+    talkvalve,
     worker,
 )
 from .gateway import GatewayPool, MaimConnection, build_envelope
 from .identity import session_id_for_group, virtual_group_id
 from .ledger import ChatroomLedger
 from .service import ChatroomService
+from .talkvalve import TalkValve
 from .worker import DeliveryWorker
 
 __all__ = [
@@ -56,6 +59,7 @@ __all__ = [
     "DeliveryWorker",
     "GatewayPool",
     "MaimConnection",
+    "TalkValve",
     "api_mixin",
     "build_envelope",
     "collector",
@@ -69,6 +73,8 @@ __all__ = [
     "service",
     "session_id_for_group",
     "splitter_guard",
+    "talkrules",
+    "talkvalve",
     "virtual_group_id",
     "worker",
 ]

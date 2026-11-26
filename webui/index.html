@@ -591,6 +591,21 @@
     word-break: break-word;
   }
 
+  /* 引用块（2026-11-27）：Bot 回复了哪句，一眼可见；仿宿主聊天的引用观感 */
+  .msg-quote {
+    max-width: 100%;
+    margin: 0 2px 4px;
+    padding: 5px 10px;
+    border-left: 3px solid var(--accent, #6d5bb5);
+    border-radius: 4px 8px 8px 4px;
+    background: rgba(128, 128, 128, 0.12);
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
   /* 麦麦 Bot 的气泡偏紫，我方角色的偏绿 */
   .kind-line .bubble { background: #1d2a1f; border-color: #2f6b4c; }
   .kind-reply .bubble { background: #241f33; border-color: #453a6b; }
@@ -625,6 +640,10 @@
   }
 
   .turnstate b { color: var(--fg); font-weight: 600; }
+  .turnstate .turn-note {
+    color: var(--muted);
+    font-size: 12px;
+  }
 
   .empty {
     color: var(--muted);
@@ -632,6 +651,9 @@
     padding: 40px 20px;
     font-size: 13px;
   }
+
+  /* 空态禁用（2026-11-26 用户拍板）：无房间/无私聊对象时整个「消息发送+剧本」窗口不可交互 */
+  .composer.is-disabled { pointer-events: none; opacity: .55; }
 
   /* ── 段（segment）：一条分隔线 + 这一段的所有消息 ─────────── */
   .segment { position: relative; }
@@ -1256,6 +1278,7 @@
     renderPrivateSpeaker();
     renderPrivate();
     renderPrivateTurnState();
+    updateSubmitButtons();   // 切私聊对象 ⇒ 按新的一对重算禁用
   }
 
   // 切到另一个私聊对象：中间窗口的标题、时间线、剧本窗口、调试面板全跟着切
@@ -1280,6 +1303,7 @@
     var list = $("roomlist");
     list.innerHTML = "";
     $("room-count").textContent = state.rooms.length + " 个";
+    updateComposerDisabled();
     state.rooms.forEach(function (room) {
       var li = document.createElement("li");
       if (room.room_id === state.currentRoomId) { li.className = "is-current"; }
@@ -1447,6 +1471,7 @@
     updateTurnHint();
     renderScriptRows();
     renderTimeline();
+    updateSubmitButtons();   // 切房间 ⇒ 禁用判据按新房间重算
   }
 
   function isUserRole(memberId) {
@@ -2604,7 +2629,16 @@
       var failure = businessError(result);
       if (failure) { showError(failure); return; }
       clearError();
-      await loadRoomTimeline(state.currentRoomId);
+      // ⚠️ 旁白 = 「我的角色」说的一句话（2026-11-27 用户拍板）：
+      //    real 模式后端已建 turn + 排阵 + 开阀投递 ⇒ Bot 会接话 ⇒
+      //    必须跟「发送消息」一样起状态条、轮询账本、按 expected_bots 收尾。
+      //    只 loadRoomTimeline 就返回会让状态条不出现、迟到回复也不刷新。
+      var room = currentRoom();
+      if (room && result && result.stage === "real") {
+        await playBeat(room, result);
+      } else {
+        await loadRoomTimeline(state.currentRoomId);
+      }
       return;
     }
     var narrator = state.narrator || { member_id: "narrator", display_name: "剧情旁白", kind: "narrator", avatar: "📖" };
@@ -2652,6 +2686,15 @@
     var room = currentRoom();
     // 顶栏标题直接显示房间名，不加「群聊 ·」前缀（视图本身已经说明了当前模式）
     $("stage-room-name").textContent = room ? room.name : "群聊";
+
+    // ⚠️ **空态**（2026-11-26 用户拍板）：没有房间 ⇒ 中栏提示 + 右栏窗口禁用
+    if (!room) {
+      var none = document.createElement("div");
+      none.className = "empty";
+      none.textContent = "无可用聊天，请先创建房间。";
+      box.appendChild(none);
+      return;
+    }
 
     var segments = segmentsOf("group");
     if (!segments.length) {
@@ -2833,6 +2876,22 @@
       main.appendChild(head);
     }
 
+    // ⚠️ **引用提示**（2026-11-27）：Bot 回复某人时，账本会存下被引原文
+    //    （collector 剥壳时留下来的 quote）。气泡上方画一个引用块，
+    //    让她「在回哪句」一眼可见。老消息没有 quote ⇒ 不渲染，向后兼容。
+    var quote = String(message.quote || "").trim();
+    if (quote) {
+      var quoteBox = document.createElement("div");
+      quoteBox.className = "msg-quote";
+      quoteBox.textContent = quote;
+      // 超长引用截短展示（悬停看全文），避免一段接力前缀把气泡撑爆
+      if (quote.length > 120) {
+        quoteBox.textContent = quote.slice(0, 120) + "…";
+        quoteBox.title = quote;
+      }
+      main.appendChild(quoteBox);
+    }
+
     var bubble = document.createElement("div");
     bubble.className = "bubble";
     bubble.textContent = message.content;
@@ -2892,9 +2951,12 @@
     if (!segments.length) {
       var empty2 = document.createElement("div");
       empty2.className = "empty";
-      empty2.textContent = peer
-        ? "和「" + peer.display_name + "」还没有聊天记录。"
-        : "还没有私聊线程。";
+      // ⚠️ **空态**（2026-11-26 用户拍板）：没有可用私聊对象 ⇒ 给出明确指引
+      empty2.textContent = !(state.managedBots || []).length
+        ? "无可用聊天，请检查可用的受管 Bot。"
+        : (peer
+          ? "和「" + peer.display_name + "」还没有聊天记录。"
+          : "还没有私聊线程。");
       box.appendChild(empty2);
       return;
     }
@@ -2968,6 +3030,7 @@
   function renderPrivatePeers() {
     var box = $("private-peers");
     box.innerHTML = "";
+    updateComposerDisabled();     // 空态禁用（受管 Bot 变化时要刷新）
     var bots = (state.managedBots || []).map(function (managed) {
       // 补全展示字段：受管名单只有 bot_id / peer_member_id / peer_name
       var full = memberById(managed.peer_member_id) || {};
@@ -3023,14 +3086,53 @@
 
   /* ── 提交一幕（群聊）──────────────────────────────────── */
 
-  // 「开演」「发送」在内容为空时直接禁用（不点就没提示）
+  // ⚠️ **禁用**：没有房间（群聊）/没有可用私聊对象（私聊）时禁用；
+  //    当前归属正在等 Bot 回复时也禁用（加 .is-disabled ⇒ pointer-events:none）。
+  //    ⚠️ 等待期间不整体 pointer-events:none —— 那样连切房间都点不了；
+  //    只让输入框/按钮不可编辑，切换入口保持可点（用户切走就能解锁）。
+  function updateComposerDisabled() {
+    var composer = $("composer");
+    if (composer) {
+      composer.classList.toggle("is-disabled",
+        !(state.rooms || []).length || !!busyRoom());
+    }
+    var composerP = $("composer-private");
+    if (composerP) {
+      composerP.classList.toggle("is-disabled",
+        !(state.managedBots || []).length || !!busyPrivate());
+    }
+  }
+
+  // 「当前窗口归属有没有 Bot 正在回」—— 唯一的禁用判据。
+  // 归属就是当前房间（群聊）或当前「对方 × 我的角色」这一对（私聊）。
+  // 切到哪里，判据就跟着换：锁的是正在等的那个窗口，不是整个页面。
+  function busyRoom() {
+    return state.turn && state.turn.room_id === state.currentRoomId ? state.turn : null;
+  }
+  function busyPrivate() {
+    var t = state.privateTurn;
+    return t && t.peer_member_id === state.currentPeerId
+      && t.my_member_id === state.privateSpeaker ? t : null;
+  }
+
+  // 「开演」「发送」在内容为空时直接禁用（不点就没提示）；
+  // 当前归属正在等回复时也禁用（防手滑再发一条把 Bot 弄乱）。
   function updateSubmitButtons() {
+    updateComposerDisabled();   // 窗口整体禁用态跟按钮状态一起算（同一判据）
     var hasScript = state.scriptRows.some(function (row) { return (row.text || "").trim(); });
     var beatButton = $("submit-beat");
-    if (beatButton) { beatButton.disabled = !hasScript; }
+    var roomBusy = !!busyRoom();
+    if (beatButton) {
+      beatButton.disabled = !hasScript || roomBusy;
+      beatButton.title = roomBusy ? "这个房间正在等 Bot 回复，切到别的房间可以继续写。" : "";
+    }
     var text = $("private-text");
     var sendButton = $("submit-private");
-    if (sendButton) { sendButton.disabled = !text || !text.value.trim(); }
+    var privateBusy = !!busyPrivate();
+    if (sendButton) {
+      sendButton.disabled = !text || !text.value.trim() || privateBusy;
+      sendButton.title = privateBusy ? "这一对正在等对方回复，换个角色或换个对象可以继续发。" : "";
+    }
   }
 
   function collectLines(rows) {
@@ -3046,8 +3148,8 @@
   }
 
   async function submitBeat() {
-    if (state.turn) {
-      showError("上一幕还在演，先等它演完（或点「停止本轮」）。");
+    if (busyRoom()) {
+      showError("这个房间正在等 Bot 回复，切到别的房间可以继续写。");
       return;
     }
     var room = currentRoom();
@@ -3142,6 +3244,7 @@
     $("stop-turn").hidden = false;
     renderTurnState();
     state.elapsedTimer = setInterval(updateElapsed, 250);
+    updateSubmitButtons();   // mock 模式同样锁住这个房间
 
     if (!state.autoReply || !plan.plan || !plan.plan.length) {
       finishTurn(token, "这个房间里没有能接话的 Bot。");
@@ -3193,6 +3296,7 @@
     var targetRoom = room.room_id;
     state.turn = {
       room_id: targetRoom,
+      turn_id: plan.turn_id || "",
       beat_seq: 0,
       strategy: plan.strategy,
       strategy_label: plan.formation_label ? ("调度：" + plan.formation_label) : "等待接话",
@@ -3204,13 +3308,24 @@
       real: true
     };
     $("stop-turn").hidden = false;
-    renderTurnState("已递话，等麦麦接话……");
+    renderTurnState();   // 不传 note：常驻的「已递话…」已按用户要求撤掉，只留策略+已等待
     state.elapsedTimer = setInterval(updateElapsed, 250);
+    updateSubmitButtons();   // 开始等 ⇒ 锁住这个房间的剧本
+    // ⚠️ **本轮该回的 Bot**（2026-11-27 收尾提示）：
+    //    后端按勾选/5%沉默算出来的名单；全回了 ⇒ 正常收尾，
+    //    180s 还有缺 ⇒ 异常提示（重试机制以后再做）。
+    state.turn.expected = plan.expected_bots || [];
+    state.turn.segment_id = plan.segment_id || "";
     await loadRoomTimeline(targetRoom);
     var speed = Math.max(state.speed || 1, 0.1);
-    var deadline = Date.now() + 160000 / speed;
+    // ⚠️ **封顶 600 秒**（原 300 秒，2026-11-27 ㊱ 再放宽）：实测宿主全链路
+    //    （planner 两轮 + 回复器）经常逼近 300s（撞过 272s、248s、225s replyer）——
+    //    前端一停轮询，后端 collector 30 分钟宽限期捞到的迟到回复就永远不刷新出来
+    //    （实测：小樱 23:20:29 回、雏田 23:23:24 回，前端 23:23:02 已收尾 ⇒
+    //      账本里两条都有，页面只显示第一条）。600s 覆盖绝大多数真实思考时长。
+    var deadline = Date.now() + 600000 / speed;
     while (token === state.turnToken && Date.now() < deadline) {
-      await new Promise(function (resolve) { setTimeout(resolve, 3000); });
+      await new Promise(function (resolve) { setTimeout(resolve, 2000); });
       if (token !== state.turnToken) { return; }
       await loadRoomTimeline(targetRoom);
       var segs = state.timeline[targetRoom] || [];
@@ -3218,23 +3333,88 @@
       for (var i = segs.length - 1; i >= 0; i -= 1) {
         if (!segs[i].voided) { last = segs[i]; break; }
       }
-      if (last) {
-        var hasReply = (last.messages || []).some(function (m) { return m.kind === "reply"; });
-        if (hasReply) { break; }
+      // ⚠️ **收尾判定**（2026-11-27）：本轮段里每个「该回的 Bot」都有 reply 才算正常；
+      //    全部到齐就提前结束（不必等满 300s）；180s 还有缺 ⇒ 异常提示。
+      var mine = (segs || []).filter(function (s) {
+        return s.voided ? false : (plan.segment_id ? s.segment_id === plan.segment_id : true);
+      });
+      var replied = {};
+      mine.forEach(function (s) {
+        (s.messages || []).forEach(function (m) {
+          if (m.kind === "reply") { replied[m.speaker_member_id] = true; }
+        });
+      });
+      var expected = state.turn.expected || [];
+      var allReplied = expected.length > 0 && expected.every(function (id) { return replied[id]; });
+      if (allReplied) { break; }
+      // ⚠️ **不再提前 180s 收尾**（2026-11-27 ㊱）：宿主思考实测可达 270s+
+      //    （replyer 225s），180s 判「异常」会把迟到回复误判成没回——
+      //    账本里其实已采集，只是前端停轮询后不再刷新 ⇒ 用户以为「没采集到」。
+      //    现在只在 600s 封顶时按缺口如实提示；中途到齐照常提前结束。
+    }
+    // ⚠️ 600s 封顶收尾：到齐 ⇒ 正常提示；仍有缺 ⇒ 如实提示「部分角色未回复」
+    //    （不再用 180s 那个过早的判据，见上方 pollRealBeat 注释）。
+    var _stillMissing = false;
+    if (state.turn && token === state.turnToken) {
+      var _mineLate = (state.timeline[targetRoom] || []).filter(function (s) {
+        return s.voided ? false : (plan.segment_id ? s.segment_id === plan.segment_id : true);
+      });
+      var _repliedLate = {};
+      _mineLate.forEach(function (s) {
+        (s.messages || []).forEach(function (m) {
+          if (m.kind === "reply") { _repliedLate[m.speaker_member_id] = true; }
+        });
+      });
+      _stillMissing = (state.turn.expected || []).some(function (id) { return !_repliedLate[id]; });
+    }
+    finishTurn(token, token !== state.turnToken ? null
+      : (_stillMissing ? "本轮接话已超时，部分角色未回复；晚到的回复仍会显示。" : "本轮接话已结束，可以开始下一幕。"));
+  }
+
+  /* ── 提交（私聊）──────────────────────────────────────── */
+
+  // ⚠️ iframe 重建后恢复的轮询（2026-11-27）：跟 pollRealBeat 同款等待逻辑，
+  //    但 turn 已从账本快照恢复，不再重新提交。600s 封顶从**原始起点**算
+  //    （started_at 是后端提交时刻），不会因重载而延长等待。
+  async function resumeRealBeat(roomId, turnId) {
+    var token = state.turnToken;
+    var speed = Math.max(state.speed || 1, 0.1);
+    var deadline = (state.turn ? state.turn.started_at : Date.now()) + 600000 / speed;
+    while (token === state.turnToken && Date.now() < deadline) {
+      await new Promise(function (resolve) { setTimeout(resolve, 2000); });
+      if (token !== state.turnToken) { return; }
+      await loadRoomTimeline(roomId);
+      var segs = state.timeline[roomId] || [];
+      var last = null;
+      for (var i = segs.length - 1; i >= 0; i -= 1) {
+        if (!segs[i].voided) { last = segs[i]; break; }
+      }
+      if (last && (last.messages || []).some(function (m) { return m.kind === "reply"; })) {
+        break;
       }
     }
     finishTurn(token, token === state.turnToken ? "本轮结束。" : null);
   }
 
-  /* ── 提交（私聊）──────────────────────────────────────── */
-
   async function submitPrivate() {
-    if (state.privateTurn) {
-      showPrivateError("上一句还在等回复，先等它回（或点「停止本轮」）。");
+    if (busyPrivate()) {
+      showPrivateError("这一对正在等对方回复，换个角色或换个对象可以继续发。");
       return;
     }
-    var thread = currentThread();
-    if (!thread) { showPrivateError("还没有私聊对象。"); return; }
+    // ⚠️ **没聊过的角色对没有线程**：线程是账本里「已发生的私聊」聚合出来的
+    //    （list_private_rooms 只查 private_* 前缀的段），而第一句话还没发出去
+    //    ⇒ 拿「无线程」当发送门槛 = 死锁（实测：清过聊天记录后，所有角色
+    //      都发不出第一句，提示「还没有私聊对象」）。
+    //    ⇒ 真正的门槛是「选没选对象」；无线程时造一个空壳——
+    //      real 模式后端 submit_private 会按同款公式自己建线程（private_<peer>_<speaker>），
+    //      mock 模式用这个 id 演本地动画。
+    if (!state.currentPeerId) { showPrivateError("还没有私聊对象。"); return; }
+    var thread = currentThread() || {
+      thread_id: "private_" + state.currentPeerId + "_" + ($("private-speaker").value || ""),
+      peer_member_id: state.currentPeerId,
+      my_member_id: $("private-speaker").value || "",
+      segments: []
+    };
 
     var text = ($("private-text").value || "").trim();
     if (!text) { showPrivateError("还没写要说什么。"); return; }
@@ -3401,20 +3581,30 @@
     });
   }
 
+  function clearActiveTurn(turnId) {
+    // ⚠️ 非阻塞：本轮收尾不该卡在账本写入上；失败也无所谓
+    //    （后端 bootstrap 有「在途 + 5 分钟」双判据兜底）。
+    if (!turnId) { return; }
+    window.maibot.action("clear_active_turn", { turn_id: turnId }).catch(function () {});
+  }
+
   function finishTurn(token, note) {
     if (token !== state.turnToken) { return; }
     if (state.turn) {
       state.turn.final_elapsed = (Date.now() - state.turn.started_at) * state.speed / 1000;
       state.lastTurn = state.turn;
+      clearActiveTurn(state.turn.turn_id);
     }
     state.turn = null;
     if (state.elapsedTimer) { clearInterval(state.elapsedTimer); state.elapsedTimer = null; }
     $("stop-turn").hidden = true;
     renderTurnState(note || "本轮结束。");
+    updateSubmitButtons();   // 等完了 ⇒ 解锁当前房间
   }
 
   function stopTurn() {
     if (!state.turn) { return; }
+    clearActiveTurn(state.turn.turn_id);
     state.turnToken += 1;
     if (state.elapsedTimer) { clearInterval(state.elapsedTimer); state.elapsedTimer = null; }
     var box = $("timeline");
@@ -3424,6 +3614,7 @@
     state.turn = null;
     $("stop-turn").hidden = true;
     renderTurnState("本轮已手动停止。");
+    updateSubmitButtons();   // 手动停止 ⇒ 解锁
   }
 
   function renderTurnState(note) {
@@ -3434,16 +3625,26 @@
     box.innerHTML = "";
     state.elapsedNode = null;
     if (turn) {
+      // ⚠️ 2026-11-27 用户拍板精简：群聊状态条正常只留「策略 + 已等待」，
+      //    seed / 顺序 / 说明（「已递话，等麦麦接话……」）都撤掉。
+      //    seed 与顺序仍完整存在账本 turn 表里，排障照样能查，只是不占界面。
+      //    「沉默」项保留：FR-09 要求沉默只在调试面板体现，不进时间线。
       addState(box, "策略", turn.strategy_label);
-      addState(box, "seed", turn.seed);
-      addState(box, "顺序", turn.ordered.join(" → ") || "—");
       state.elapsedNode = addState(box, "已等待",
         (turn.final_elapsed !== undefined ? turn.final_elapsed : 0).toFixed(1) + "s");
       if (turn.silenced && turn.silenced.length) {
         addState(box, "沉默（不进时间线）", turn.silenced.join("、"));
       }
     }
-    if (note) { addState(box, "说明", note); }
+    // ⚠️ 收尾提示（㉞）：本轮结束/异常的说明要显示在状态条里 ——
+    //    ㉜ 精简时把「说明」项删了，但那是常驻的「已递话，等麦麦接话……」，
+    //    这里的收尾结论（正常/异常）是用户要的，必须露出来。
+    if (note) {
+      var noteNode = document.createElement("span");
+      noteNode.className = "turn-note";
+      noteNode.textContent = note;
+      box.appendChild(noteNode);
+    }
   }
 
   function updateElapsed() {
@@ -3465,7 +3666,11 @@
     $("stop-private-turn").hidden = false;
     renderPrivateTurnState("已发出，等麦麦回复……");
     state.privateElapsedTimer = setInterval(updatePrivateElapsed, 250);
-    var deadline = Date.now() + 160000 / Math.max(state.speed || 1, 0.1);
+    updateSubmitButtons();   // 开始等 ⇒ 锁住这一对的发送框
+    // ⚠️ **封顶 300 秒**（原 160 秒）+ **2 秒一轮**（原 3 秒）：理由同群聊 pollRealBeat ——
+    //    宿主回复链路（planner+回复器）实测 60~120 秒很常见，160s 封顶会让
+    //    迟到的回复不再自动出现。回显延迟 = 采集器(≤2s) + 本轮询(≤2s) ≈ 4 秒内。
+    var deadline = Date.now() + 300000 / Math.max(state.speed || 1, 0.1);
     while (token === state.privateTurnToken && Date.now() < deadline) {
       state.privateTimeline = {};          // 清缓存 ⇒ 下次 segmentsOf 重建
       await loadPrivateThreads();
@@ -3474,7 +3679,7 @@
       if (last && (last.messages || []).some(function (m) { return m.kind === "reply"; })) {
         break;
       }
-      await new Promise(function (resolve) { setTimeout(resolve, 3000); });
+      await new Promise(function (resolve) { setTimeout(resolve, 2000); });
     }
     finishPrivateTurn(token, token === state.privateTurnToken ? "本轮结束。" : null);
   }
@@ -3490,6 +3695,7 @@
     $("stop-private-turn").hidden = true;
     renderPrivateTurnState(note || "本轮结束。");
     renderPrivatePeers(); // 刚聊过，把对方排到最上面
+    updateSubmitButtons();   // 等完了 ⇒ 解锁这一对
   }
 
   function stopPrivateTurn() {
@@ -3503,6 +3709,7 @@
     state.privateTurn = null;
     $("stop-private-turn").hidden = true;
     renderPrivateTurnState("本轮已手动停止。");
+    updateSubmitButtons();   // 手动停止 ⇒ 解锁这一对
   }
 
   function renderPrivateTurnState(note) {
@@ -3723,6 +3930,7 @@
       renderPrivatePeers(); // 按新角色重新排「最近聊过」的顺序
       renderPrivate();
       renderPrivateTurnState();
+      updateSubmitButtons(); // 换角色 ⇒ 换了一对，禁用跟着重算
     };
     $("submit-beat").onclick = submitBeat;
     $("stop-turn").onclick = stopTurn;
@@ -3753,6 +3961,14 @@
       state.timing = data.timing || {};
       state.memberPool = data.member_pool || [];
       state.myRoles = data.my_roles || [];
+      // ⚠️ **默认选中「最近使用的角色」**（用户拍板：最近操作过谁就默认谁，
+      //    只有最近没操作过任何角色才退回前排第一个）。
+      //    「最近使用」由后端在提交私聊/群聊台词时写进账本 meta 表（跨重载存活），
+      //    bootstrap 带回来。页面内切群聊/私聊标签本来就保留选择，这里只管重载后。
+      var lastUsedRole = String(data.last_used_role || "");
+      if (lastUsedRole && (state.myRoles || []).some(function (m) { return m.member_id === lastUsedRole; })) {
+        state.privateSpeaker = lastUsedRole;
+      }
       state.peers = data.peers || [];
       state.managedBots = data.managed_bots || [];
       state.errors = data.errors || [];
@@ -3771,6 +3987,30 @@
       // 时光机：群聊、私聊各一个面板（共用同一套逻辑）
       state.tmGroup = buildTimeMachine("group", "tm-slot-group");
       state.tmPrivate = buildTimeMachine("private", "tm-slot-private");
+
+      // ⚠️ **恢复「进行中轮次」的状态条**（2026-11-27）：
+      //    宿主切走插件页再回来会**重建 iframe**（实测探针消失）⇒ 前端 state 全丢。
+      //    后端在提交时把快照写进账本 meta，bootstrap 带回（只在轮次仍在途时）。
+      //    恢复 started_ms 作计时起点 ⇒ 「已等待」按墙上时钟继续跳；
+      //    同时重启轮询，迟到的回复仍能被检测到并正常收尾。
+      var activeTurn = data.active_turn || null;
+      if (activeTurn && activeTurn.turn_id && activeTurn.started_ms) {
+        state.turn = {
+          room_id: activeTurn.room_id || state.currentRoomId,
+          turn_id: activeTurn.turn_id,
+          strategy_label: activeTurn.label || "等待接话",
+          started_at: activeTurn.started_ms,
+          silenced: [],
+          ordered: [],
+          real: true,
+          index: 0
+        };
+        state.currentRoomId = state.turn.room_id;
+        $("stop-turn").hidden = false;
+        if (state.elapsedTimer) { clearInterval(state.elapsedTimer); }
+        state.elapsedTimer = setInterval(updateElapsed, 250);
+        resumeRealBeat(state.turn.room_id, activeTurn.turn_id);
+      }
 
       renderRooms();
       renderMembers();
@@ -3791,9 +4031,18 @@
       if (state.currentRoomId) { loadRoomTimeline(state.currentRoomId); }
       // 私聊线程也懒加载（bootstrap 不带）
       loadPrivateThreads();
-      // 轮询上游错误：宿主报错时提示自己冒出来（每 8 秒一次）
+      // 轮询上游错误 + 当前房间时间线（每 8 秒一次）。
+      // ⚠️ 时间线常驻刷新（2026-11-27 ㊱）：等待窗口内由 pollRealBeat 每 2s 拉；
+      //    收尾后改由这里低频兜底 —— 宿主思考可以远超 600s，collector 30 分钟
+      //    宽限期捞到的迟到回复靠它自动显示，不再依赖用户手动切房间/刷新。
+      //    loadRoomTimeline 幂等（按 message_id 去重、失败保留旧内容），重绘安全。
       if (state.errorTimer) { clearInterval(state.errorTimer); }
-      state.errorTimer = setInterval(pollErrors, 8000);
+      state.errorTimer = setInterval(function () {
+        pollErrors();
+        // 等待期由 pollRealBeat 每 2s 拉，这里只兜底「收尾后」的空窗；
+        // 15s 一次避免跟 worker 的插件→宿主 RPC 抢 IPC 通道（实测重叠会超时）。
+        if (!state.turn && state.currentRoomId) { loadRoomTimeline(state.currentRoomId); }
+      }, 8000);
     } catch (error) {
       showError("读取初始假数据失败：" + error.message);
     }

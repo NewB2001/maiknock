@@ -177,6 +177,23 @@ class MaimConnection:
 
     # ---- 连接生命周期 ----
 
+    async def _drop_ws(self, timeout: float = 5.0) -> None:
+        """关掉当前连接并置空（**断线 / 重连路径统一走这里**）。
+
+        ⚠️ 只把 ``_connected`` 置 False **不会释放 socket/fd** ——
+        websockets 的连接对象还握着它。网络抖动频繁时，旧连接会一条条攒下来
+        （report 问题 B 的「断线泄漏」）。
+        ⚠️ ``close()`` 可能等关闭握手 ⇒ 加超时；关不掉也当已丢弃，别把调用方卡住。
+        """
+        ws, self._ws = self._ws, None
+        self._connected = False
+        if ws is None:
+            return
+        try:
+            await asyncio.wait_for(ws.close(), timeout=timeout)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def connect(self) -> bool:
         """建立连接。成功返回 True。
 
@@ -195,6 +212,9 @@ class MaimConnection:
             self._last_error = f"websockets 不可用：{exc}"
             self._log.error("[聊天室] Bot %s 无法连接：%s", self.bot_id[:12], self._last_error)
             return False
+        # 上一次断线留下的旧连接（_connected=False 但 _ws 还在）⇒ 先关掉再重连
+        if self._ws is not None:
+            await self._drop_ws()
         try:
             self._ws = await websockets.connect(
                 self.endpoint(),
@@ -220,13 +240,7 @@ class MaimConnection:
         task, self._keepalive_task = self._keepalive_task, None
         if task is not None and not task.done():
             task.cancel()
-        ws, self._ws = self._ws, None
-        self._connected = False
-        if ws is not None:
-            try:
-                await ws.close()
-            except Exception:  # noqa: BLE001
-                pass
+        await self._drop_ws()
 
     # ---- 保活（心跳）---------------------------------------------------
 
@@ -302,7 +316,9 @@ class MaimConnection:
         except Exception as exc:  # noqa: BLE001
             self._last_error = f"{type(exc).__name__}: {exc}"
             self._log.warning("[聊天室] 递给 Bot %s 失败：%s", self.bot_id[:12], self._last_error)
-            self._connected = False
+            # ⚠️ 发送失败 = 这条连接已经不能用 ⇒ 关掉再置空（别只置 _connected，
+            #    否则旧 socket 没人释放，保活重连时又覆盖一次 ⇒ 句柄泄漏）
+            await self._drop_ws()
             return False
         self._log.info(
             "[聊天室] 已递给 Bot %s：%s", self.bot_id[:12], (text or "")[:40]
@@ -320,7 +336,8 @@ class MaimConnection:
             await asyncio.wait_for(pong, timeout=10)
         except Exception as exc:  # noqa: BLE001
             self._last_error = f"{type(exc).__name__}: {exc}"
-            self._connected = False
+            # ⚠️ 心跳失败同理：关掉旧连接，交给保活循环重建（否则句柄泄漏）
+            await self._drop_ws()
             return False
         return True
 

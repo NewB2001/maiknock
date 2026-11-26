@@ -367,7 +367,7 @@ except Exception as _sg_exc:  # noqa: BLE001
     mk_style_guard = None
     logger.error("[MaiKnock] F4 风格守卫模块 style_guard.py 加载失败，F4 功能不可用：%r", _sg_exc)
 
-# F5 功能 A 字数配置：纯逻辑模块 reply_length.py（软约束，无硬截断）
+# F5 功能 A 字数配置：纯逻辑模块 reply_length.py（全文口径+硬上限措辞，无代码截断）
 # ⚠️ 按文件路径加载（裸 import 会 ImportError，踩坑 66）；R6-29：加载失败必须可见
 mk_reply_length = None
 try:  # pragma: no cover - 加载失败只降级 F5，不阻断插件其余功能
@@ -565,9 +565,9 @@ class ReplyLengthConfig(PluginConfigBase):
         "自由",
     ] = Field(
         default="简短（60-200字）",
-        description="选一个档位决定麦麦一条回复的大致篇幅。简短=60到200字，适中=100到400字，"
-        "详细=150到600字，自由=不限制、麦麦自己决定。这是大致范围、不是硬性截断，自然表达优先。"
-        "字数只算说出口的话，【】内心和（）动作不算",
+        description="选一个档位决定麦麦一条回复的篇幅。字数按全文算（含【】内心和（）动作），"
+        "上限是硬性的。简短=60到200字，适中=100到400字，"
+        "详细=150到600字，自由=不限制、麦麦自己决定。",
         json_schema_extra={"label": "回复篇幅（一句话选档位）"})
 
 
@@ -745,6 +745,8 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 回读器（把自己群流里的 Bot 回复收进共享账本，chatroom/collector.py）
         self._chatroom_collector = None
         self._chatroom_collector_task = None
+        # 「活人感阀门」（㉚）：平时关（查看频率 0，不自言自语），递台词前开
+        self._chatroom_valve = None
         # 房间虚拟群 session_id 的**快照**（{session_id: room_id}）
         # ⚠️ 由后台回读循环刷新 ⇒ **分段守卫的 Hook 只读这个** ——
         #    Hook 是同步的（宿主在等它返回）⇒ 不能在里面读账本（同步 SQLite 读会阻塞事件循环）
@@ -838,6 +840,10 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             return
         self._chatroom_bot_id = str(me.get("bot_id") or "")
         self._chatroom_bot_name = str(me.get("name") or "")
+        # 自己 Bot 的工作目录（算自己那份 bot_config.toml 的路径用）
+        self._chatroom_self_directory = str(me.get("directory") or ".")
+        # 上次同步过「静默关闭规则」的房间集合（变了才重写配置）
+        self._chatroom_synced_room_ids: Optional[frozenset] = None
 
         cfg = await self._chatroom_config()
         logger.info(
@@ -933,9 +939,18 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         if not delivery_enabled:
             logger.info("[MaiKnock][聊天室] 递送开关未开，不起投递循环")
             return
-        worker = mk_chatroom.DeliveryWorker(ledger, pool, self._chatroom_bot_id)
+        if self._chatroom_valve is None:
+            async def _valve_call(name: str, **args):
+                return await self.ctx.call_capability(name, **args)
+            self._chatroom_valve = mk_chatroom.TalkValve(_valve_call, log=logger)
+        worker = mk_chatroom.DeliveryWorker(
+            ledger, pool, self._chatroom_bot_id,
+            valve=self._chatroom_valve,
+            rpc_allowed=lambda: getattr(self, "_chatroom_api_busy", 0) == 0,
+        )
         worker.start()
         self._chatroom_worker = worker
+        logger.info("[MaiKnock][聊天室] 频率阀门已挂到投递循环（递台词前开阀，空闲由回读循环关阀）")
         # ⚠️ **先把 session_id 快照填上** —— 分段守卫的 Hook 靠它判别，
         #    而后台回读循环要等 5 秒才跑第一轮 ⇒ 不预热的话
         #    **插件重载后的第一条聊天消息不会被保护**（会被拆成多个气泡）。
@@ -997,7 +1012,10 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             return
         while True:
             try:
-                await asyncio.sleep(5.0)
+                # ⚠️ **2 秒一轮**（原 5 秒）：回复的回显延迟 = 本轮间隔 + 页面轮询间隔，
+                #    5 秒时用户可感知明显滞后（实测反馈「回显很慢」）。
+                #    只在有投递待收时才发 RPC（poll 里有门槛），空转成本很低。
+                await asyncio.sleep(2.0)
                 # ⚠️⚠️ **组件调用进行中 ⇒ 跳过这一轮回读**：
                 #    回读要发「插件→宿主」的 RPC（message.get_recent），
                 #    与宿主→插件的组件调用**抢同一条 IPC 通道** ⇒ 重叠就死锁
@@ -1008,6 +1026,22 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 if sessions:
                     collector.set_sessions(sessions)
                     await collector.poll()
+                # ⚠️ **阀门收口**（㉚）：聊天室管的全部会话里，没有在途台词投递的 ⇒ 关阀
+                #    （查看频率回 0，自说自话不再触发）。必须传**全集**——否则插件重载后
+                #    阀门不知道有哪些会话，宿主侧乘数停在默认 1.0，自言自语关不掉。
+                #    旁白单/私聊单不算在途（见 ledger.inflight_valve_groups）；
+                #    私聊流不在房间会话全集里 ⇒ 天然不受阀门管。
+                #    跟回读共用同一段 api_busy 保护，不会与宿主→插件的调用抢通道。
+                valve = self._chatroom_valve
+                if valve is not None and self._chatroom_ledger is not None and self._chatroom_bot_id:
+                    try:
+                        groups = await self._chatroom_ledger.run(
+                            self._chatroom_ledger.inflight_valve_groups, self._chatroom_bot_id
+                        )
+                        open_sessions = {mk_chatroom.session_id_for_group(g) for g in groups if g}
+                        await valve.sweep(sessions.keys(), open_sessions)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("[聊天室] 阀门收口失败：%r", exc)
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # noqa: BLE001
@@ -1044,6 +1078,29 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             out[mk_chatroom.session_id_for_group(group_id)] = room_id
         # ⚠️ **刷新快照**（Hook 只能读这个，不能碰账本）
         self._chatroom_sessions_cache = dict(out)
+        # ⚠️ **维护 bot_config 的提及触发配置**（房间集合变了才写文件）：
+        #    ㉚ 起不再写「查看频率=0」规则（那会把整条流焊死，实测两个 Bot 全哑巴），
+        #    改为清掉历史写过的静音规则 + 确保 mentioned_bot_reply=true；
+        #    「平时闭嘴、递话才开口」由频率阀门（talkvalve）在运行时拧。
+        #    文件 IO 挪线程（bot_config 是 600ms 热重载，改完即生效）。
+        try:
+            room_ids = frozenset(out.values())
+            if room_ids != getattr(self, "_chatroom_synced_room_ids", None):
+                self._chatroom_synced_room_ids = room_ids
+                if self._chatroom_workspace is not None:
+                    cfg_path = mk_chatroom.hostinfo.bot_config_path(
+                        self._chatroom_workspace, self._chatroom_self_directory
+                    )
+                    changed = await asyncio.to_thread(
+                        mk_chatroom.talkrules.ensure_talk_config, cfg_path
+                    )
+                    if changed:
+                        logger.info(
+                            "[MaiKnock][聊天室] 已清理 bot_config 的静音规则并确保提及触发（%d 个房间）：%s",
+                            len(room_ids), cfg_path,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MaiKnock][聊天室] 同步提及触发配置失败：%r", exc)
         return out
 
     def _chatroom_room_sessions(self) -> Dict[str, str]:
@@ -3123,8 +3180,9 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
     # F5 功能 A 回复字数配置（软约束；无硬截断）
     #
     # 只挂一个 hook：before_model_request 注入字数契约到 items 末尾。
-    # 契约文案自带「约等于、自然表达优先」，没有代码层截断——用户拍板
-    # 「字数上限是尽量约等于，不是死规矩」，硬切会切碎小说体语义片段。
+    # 契约没有代码层截断，但上限措辞是硬性的——2026-11-26 用户拍板改口径：
+    # 字数按全文算（含【】（）），硬上限；旧口径「只算台词、尽量约等于」导致
+    # 合同合规但用户看着 300+ 字，形同虚设。
     #
     # ⚠️ 返回协议一律 {"action":"continue","modified_kwargs":{...}}；
     #    before hook 必须复制**整份** kwargs 再改 items（只回 {"items":...} 会丢

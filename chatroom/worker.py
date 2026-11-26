@@ -45,6 +45,8 @@ class DeliveryWorker:
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         log: Optional[logging.Logger] = None,
+        valve: Any = None,
+        rpc_allowed: Optional[Any] = None,
     ) -> None:
         self._ledger = ledger
         self._gateway = gateway
@@ -55,6 +57,13 @@ class DeliveryWorker:
         self._stopping = False
         self._task: Optional[asyncio.Task] = None
         self._delivered = 0
+        # ⚠️ **频率阀门**（㉚）：递台词前必须先开阀，否则消息进流时查看频率为 0，
+        #    会被宿主「静默接收」吞掉（2026-11-26 实测两个 Bot 全哑巴）。
+        #    旁白（turn_id 为空）**不开阀**——拍板：旁白只推进剧情、不引发接话。
+        self._valve = valve
+        # ⚠️ **RPC 闸门**：阀门下发是「插件→宿主」的 RPC，与宿主→插件的组件调用
+        #    抢同一条 IPC 通道 ⇒ 组件调用进行中时不递话（下轮再试，单在 pending 丢不了）。
+        self._rpc_allowed = rpc_allowed
 
     # ---- 统计 ----
 
@@ -83,13 +92,26 @@ class DeliveryWorker:
             return 0
         task: Dict[str, Any] = pendings[0]
         delivery_id = str(task.get("delivery_id") or "")
+        raw_group_id = str(task.get("group_id") or "")
+        is_line = bool(str(task.get("turn_id") or ""))
+        # ⚠️ **开阀要在抢占之前**：开阀失败就这轮不领（单还在 pending，下轮再试），
+        #    避免「领了单、开阀失败、话递出去被吞」的窗口。
+        if self._valve is not None and raw_group_id and is_line:
+            if self._rpc_allowed is not None and not self._rpc_allowed():
+                return 0
+            try:
+                opened = await self._valve.ensure_group(raw_group_id, True)
+            except Exception as exc:  # noqa: BLE001
+                opened = False
+                self._log.warning("[聊天室] 开阀异常（Bot %s）：%r", self._bot_id[:12], exc)
+            if not opened:
+                return 0
         # ⚠️ 抢占是**原子**的（条件 UPDATE）⇒ 两个实例不会递同一条
         if not self._ledger.claim_delivery(delivery_id, self._bot_id):
             return 0
         content = str(task.get("content") or "")
         # ⚠️ **group_id 为空 ⇒ 私聊**（宿主按 group_info 是否为 None 分私聊/群聊）。
         #    群聊任务一定带 group_id；只有私聊任务留空 ⇒ 传 None 让信封不带 group_info。
-        raw_group_id = str(task.get("group_id") or "")
         send_group_id = raw_group_id if raw_group_id else None
         try:
             ok = await self._gateway.send_text(

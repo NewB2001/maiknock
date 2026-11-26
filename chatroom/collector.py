@@ -139,16 +139,29 @@ class ReplyCollector:
         self._sessions = dict(sessions or {})
 
     async def _fetch(self, session_id: str) -> List[Dict[str, Any]]:
-        """读一条群流的最近消息（**直连能力**，绕开 SDK 那层不带 hours 的封装）。"""
+        """读一条群流的最近消息（**直连能力**，绕开 SDK 那层不带 hours 的封装）。
+
+        ⚠️ **必须带超时**（实测 2026-11-26：一次 get_recent 卡了 114 秒才返回，
+        期间整个回读循环被拖住 ⇒ 回复迟迟进不了账本）。超时就放弃这一轮，
+        下一轮（2 秒后）再来 —— 反正消息还在宿主库里，丢不了。
+        """
         self.rpc_idle.clear()
         try:
-            result = await self._ctx.call_capability(
-                "message.get_recent",
-                chat_id=session_id,
-                limit=self._limit,
-                hours=self._hours,
-                filter_mai=False,   # ⚠️ 必须 False：过滤掉麦麦就认不出她的回复了
+            result = await asyncio.wait_for(
+                self._ctx.call_capability(
+                    "message.get_recent",
+                    chat_id=session_id,
+                    limit=self._limit,
+                    hours=self._hours,
+                    filter_mai=False,   # ⚠️ 必须 False：过滤掉麦麦就认不出她的回复了
+                ),
+                timeout=15.0,
             )
+        except asyncio.TimeoutError:
+            self._log.warning(
+                "[聊天室] 回读 %s：宿主 15 秒没响应，本轮放弃（下一轮再取）", session_id[:12]
+            )
+            return []
         except Exception as exc:  # noqa: BLE001
             self._log.warning("[聊天室] 回读失败（session=%s）：%r", session_id[:12], exc)
             return []
@@ -158,6 +171,27 @@ class ReplyCollector:
             messages = result.get("messages")
             return messages if isinstance(messages, list) else []
         return result if isinstance(result, list) else []
+
+    @staticmethod
+    def strip_quoted_prefix(text: str, quotes: List[str]) -> tuple:
+        """剥掉回复消息开头的**被引原文**，返回 ``(新正文, 被引原文)``。
+
+        陷阱 27：``processed_plain_text`` = 被引原文 + 空格 + 新正文 ——
+        聊天流里引用是壳，账本里是拼在一起的。
+        ⇒ 用「她可能引用的原文」做**最长前缀匹配**剥离，只留新正文，
+        **同时把剥掉的原文返回**（2026-11-27 用户要引用提示：存进 message.quote，
+        前端气泡上显示「回复了哪句」，不再像以前那样直接丢掉）。
+        匹配不上就不动（宁可不剥也不能误伤正文），被引原文返回空串。
+        """
+        text = str(text or "")
+        best = ""
+        for quote in quotes or []:
+            q = str(quote or "")
+            if q and text.startswith(q) and len(q) > len(best):
+                best = q
+        if best:
+            return text[len(best):].strip(), best.strip()
+        return text, ""
 
     def _member_id_for(self, account: str) -> str:
         """发言人的成员 id（要能与成员登记表对上，页面才能认出人）。
@@ -190,13 +224,24 @@ class ReplyCollector:
         except Exception as exc:  # noqa: BLE001
             self._log.warning("[聊天室] 查待收投递失败：%r", exc)
             return 0
-        if not pending:
+        # ⚠️ **宽限期**（㉛，2026-11-27 实测）：Bot 思考可以远超 150 秒（回复器
+        #    实测一轮 218 秒）——超时一标、门槛一关，她**迟到的回复就永远
+        #    进不了时间线**。⇒ 超时后 30 分钟内的单仍算「要盯着的流」，
+        #    迟到的回复照常入账（归属匹配不看状态，自动挂回正确的段）。
+        try:
+            grace = await self._ledger.run(
+                self._ledger.recent_collect_targets, self._bot_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("[聊天室] 查宽限期投递失败：%r", exc)
+            grace = []
+        if not pending and not grace:
             return 0
         # ⚠️ **私聊回读**：待收投递里若有私聊单（group_id 为空、room 是 private_），
         #    它所在的群流其实是「专属私聊流」``md5(webui_<发言人账号>_private)``。
         #    这些 session 不在房间表里 ⇒ 从待收投递里派生出来一起采。
         sessions = dict(self._sessions)
-        for row in pending:
+        for row in list(pending) + list(grace):
             is_private = (
                 str(row.get("group_id") or "") == ""
                 and str(row.get("room_id") or "").startswith("private_")
@@ -233,6 +278,7 @@ class ReplyCollector:
                 text = message_text(message)
                 if not text:
                     continue
+                quoted = ""     # 被引原文（剥壳时填；存进 message.quote 给前端画引用块）
                 # 归属段：这条回复回应的是**哪一段**的投递
                 # ⚠️ 用 find_delivery_for_reply（多返回 turn_id / wave）⇒
                 #    S8 的接力要用「这条回复属于哪一轮、哪个波次」
@@ -242,6 +288,20 @@ class ReplyCollector:
                     room_id=room_id,
                     reply_at=message_time(message),
                 )
+                # ⚠️ **剥引用壳**（陷阱 27）：回复消息的 processed_plain_text =
+                #    被引原文 + 空格 + 新正文 —— 不剥的话，接力前缀和被引台词
+                #    会整段拼进聊天室的消息里（实测症状：雏田的回复带着
+                #    「这期间 春野樱 说：…」和整段被引原文）。
+                if kind == "bot":
+                    quotes = [str((reply_delivery or {}).get("content") or "")]
+                    quotes.extend(
+                        await self._ledger.run(
+                            self._ledger.reply_quote_candidates, self._bot_id, room_id
+                        )
+                    )
+                    text, quoted = self.strip_quoted_prefix(text, quotes)
+                    if not text:
+                        continue        # 剥完只剩引用 ⇒ 没有新正文可收
                 segment_id = str((reply_delivery or {}).get("segment_id") or "")
                 if not segment_id:
                     # 没有对应的投递（可能是历史消息）⇒ 挂到房间的"未归属"段
@@ -262,6 +322,7 @@ class ReplyCollector:
                         "speaker_name": nickname or member_id,
                         "kind": "reply",
                         "content": text,
+                        "quote": quoted,
                         "created_at": message_time(message),
                     },
                 )
@@ -300,6 +361,17 @@ class ReplyCollector:
                         await self._ledger.run(
                             self._ledger.mark_collected, reply_delivery_id
                         )
+                        # ⚠️ **波次收口**（实测：串行阵型每过一个波次白等 150 秒）——
+                        #    这个 Bot 开口了 ⇒ 它这一波其余没被单独回复的单一起收口，
+                        #    别让它们熬满 150 秒超时才放行下一波。
+                        _turn = str((reply_delivery or {}).get("turn_id") or "")
+                        if _turn:
+                            await self._ledger.run(
+                                self._ledger.mark_wave_answered,
+                                _turn,
+                                int((reply_delivery or {}).get("wave") or 0),
+                                self._bot_id,
+                            )
         # ⚠️ **超时兜底**：递出去一直不回的投递要标超时，否则波次门控会卡死整轮。
         try:
             await self._ledger.run(
@@ -307,6 +379,12 @@ class ReplyCollector:
                 self._bot_id,
                 150.0,
             )
+        except Exception:  # noqa: BLE001
+            pass
+        # ⚠️ **孤儿投递收尾**：被删房间的遮蔽旁白递出并终态后，把行清掉
+        #    （用户拍板：删除房间的数据永远消失，不残留）。
+        try:
+            await self._ledger.run(self._ledger.cleanup_orphan_deliveries)
         except Exception:  # noqa: BLE001
             pass
         return collected

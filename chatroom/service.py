@@ -65,6 +65,15 @@ class ChatroomService:
         self._my_role_order: List[str] = [
             member["member_id"] for member in MEMBER_POOL if member.get("kind") == "user_role"
         ]
+        # 「最近使用的角色」—— 私聊窗口默认选中它（用户拍板：默认选最近操作的，
+        # 只有最近没操作过任何角色才选前排）。iframe 沙箱没有 localStorage，
+        # 跨重载只能记在共享账本的 meta 表里（提交台词时顺手写入，见 _real_submit_*）。
+        self._last_used_role: str = ""
+
+        # 删房间的遮蔽旁白文案（用户拍板「先发旁白、后删除」；想改口径只动这里）
+        self._room_delete_narration: str = (
+            "（这段剧情到此为止：此前发生的事已成为过往，不必再提起。）"
+        )
         # 「私聊对象」是另一个上游名单（Bot 群员）。
         # 层级：**我的角色 / 私聊对象（上游） → 房间群员（下游）**，
         # 下游只能用上游已经有的角色。
@@ -136,6 +145,10 @@ class ChatroomService:
             self._members = {str(m.get("member_id")): dict(m) for m in (state.get("members") or [])}
             self._my_role_order = list(state.get("my_role_order") or [])
             self._peer_order = list(state.get("peer_order") or [])
+            # 「最近使用的角色」存在 meta 表（save_state 碰不到它）
+            self._last_used_role = str(
+                await self._alread(ledger.get_meta, "last_used_role") or ""
+            )
             return True
         # ⚠️ 第一次写账本（迁移）必须在「按真实名单清理完假 Bot」**之后**做
         #    —— 否则账本里会存下一份带假 Bot 的出厂数据。
@@ -169,6 +182,124 @@ class ChatroomService:
             return
 
     # ---- 真实名单（real 模式）-------------------------------------------
+
+    async def shell_clear_active_turn(self, turn_id: str = "") -> Dict[str, Any]:
+        """清掉「进行中轮次」快照（前端本轮结束 / 手动停止时调）。
+
+        ⚠️ 只在快照的 turn_id 与请求一致时才清 —— 防止上一轮的迟到清理
+        把新一轮刚写的快照误删。传空串则无条件清（兜底）。
+        """
+        ledger = self._ledger()
+        if ledger is None:
+            return {"ok": True}
+        try:
+            import json as _json
+            raw = str(await self._alread(ledger.get_meta, "active_turn") or "")
+            if turn_id and raw:
+                snap = _json.loads(raw)
+                if str(snap.get("turn_id") or "") != str(turn_id):
+                    return {"ok": True}     # 新一轮已顶上 ⇒ 不动
+            await self._alread(ledger.set_meta, "active_turn", "")
+            return {"ok": True}
+        except Exception:  # noqa: BLE001
+            return {"ok": True}
+
+    async def _next_turn_seed(self) -> int:
+        """取下一轮的 seed —— **counter 存账本 meta，跨插件重载不重置**。
+
+        ⚠️ 为什么必须持久化（2026-11-27 实测 bug）：``self._turn_counter`` 是
+        内存态，宿主改 .py 就重载插件 ⇒ counter 归零到初值 2 ⇒
+        ``next_seed(2, 1)`` 每轮都算出同一个 seed（实测连续 4 轮 128486）
+        ⇒ 阵型/5% 掷骰全被钉死，「随机」名存实亡。
+        ⇒ 改为每次从 meta 读、自增后写回（WAL + 短事务，开销可忽略）。
+
+        ⚠️ 返回 ``(seed, counter)``，调用方还能拿 counter 做 beat_seq。
+        """
+        ledger = self._ledger()
+        counter = self._turn_counter
+        if ledger is not None:
+            try:
+                raw = str(await self._alread(ledger.get_meta, "turn_counter") or "")
+                if raw.strip().isdigit():
+                    counter = int(raw)
+                else:
+                    # ⚠️ 首次使用（老账本没有这个键）：用** epoch 秒**起头，
+                    #    绝不能从 2 开始 —— 那会算出跟历史轮次一样的 seed
+                    #    （连续几轮 128486 就是这么来的）。epoch 单调增长，
+                    #    跨重载/跨版本都不会撞车。
+                    counter = max(self._turn_counter, int(time.time()))
+            except Exception:  # noqa: BLE001
+                pass
+        counter += 1
+        self._turn_counter = counter        # 内存也同步（账本暂时不可用时接着用）
+        if ledger is not None:
+            try:
+                await self._alread(ledger.set_meta, "turn_counter", str(counter))
+            except Exception:  # noqa: BLE001
+                pass
+        room_count = len(self._rooms)
+        return formation.next_seed(counter, room_count)
+
+    async def _set_active_turn(self, turn_id: str, room_id: str, label: str) -> None:
+        """记下「正在进行的轮次」快照（状态条跨 iframe 重建恢复用）。
+
+        ⚠️ 为什么用账本 meta：插件页是 sandbox iframe（opaque origin），
+        localStorage 不可用；宿主切走插件页再回来会**重建 iframe**
+        （实测探针消失）⇒ 前端 state 全丢。只有账本能跨这个存活。
+        """
+        ledger = self._ledger()
+        if ledger is None:
+            return
+        try:
+            import json as _json
+            await self._alread(
+                ledger.set_meta,
+                "active_turn",
+                _json.dumps({
+                    "turn_id": turn_id,
+                    "room_id": room_id,
+                    "label": label,
+                    "started_ms": int(time.time() * 1000),
+                }, ensure_ascii=False),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _active_turn_snapshot(self) -> Dict[str, Any]:
+        """读回进行中的轮次快照。**只在它真的还在途、且没过期时**返回。
+
+        ⚠️ 轮次结束后不清 meta（前端结束/停止时会调 action 清）——
+        这里再按「在途 + 5 分钟过期」双判据兜底，
+        防止遗留快照在重载后冒出一个早已结束的「已等待」。
+        """
+        ledger = self._ledger()
+        if ledger is None:
+            return {}
+        try:
+            import json as _json
+            raw = str(await self._alread(ledger.get_meta, "active_turn") or "")
+            if not raw:
+                return {}
+            snap = _json.loads(raw)
+            if not isinstance(snap, dict):
+                return {}
+            turn_id = str(snap.get("turn_id") or "")
+            if not turn_id:
+                return {}
+            inflight = bool(await self._alread(ledger.active_turn_inflight, turn_id))
+            if not inflight:
+                return {}
+            started = float(snap.get("started_ms") or 0)
+            if started <= 0 or (time.time() * 1000 - started) > 5 * 60 * 1000:
+                return {}
+            return {
+                "turn_id": turn_id,
+                "room_id": str(snap.get("room_id") or ""),
+                "label": str(snap.get("label") or "等待接话"),
+                "started_ms": started,
+            }
+        except Exception:  # noqa: BLE001
+            return {}
 
     async def _alread(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         """**异步读账本**（把同步的 SQLite 读挪到线程里）。
@@ -428,6 +559,12 @@ class ChatroomService:
             "peers": self._peer_list(),
             "managed_bots": await self._managed_bot_list(),
             "narrator": NARRATOR,
+            # 「最近使用的角色」⇒ 私聊窗口默认选中它（无记录时前端选前排第一个）
+            "last_used_role": str(getattr(self, "_last_used_role", "") or ""),
+            # ⚠️ **进行中的轮次快照**（状态条跨 iframe 重建恢复）：
+            #    宿主切走插件页再回来会重建 iframe ⇒ 前端 state 全丢。
+            #    只在轮次仍在途、未过期时带回（否则空字典）。
+            "active_turn": await self._active_turn_snapshot(),
             "errors": await self._chatroom_errors(),
             "rooms": self._rooms,
             # ⚠️ **只带第一个房间的时间线** —— 全部房间的完整正文会撑爆宿主
@@ -788,7 +925,11 @@ class ChatroomService:
             return {"ok": False, "error": "房间名不能为空"}
         self._room_counter += 1
         room = {
-            "room_id": f"room_mock_{self._room_counter:03d}",
+            # ⚠️ **id 用毫秒时间戳**（2026-11-26）：原来是「递增号」——
+            #    用户「删了全部重来」+ 重载后计数器归零，新房间会撞上已删房间的
+            #    旧 id ⇒ 账本里那份旧房间的 segment/message 还在 ⇒ **旧剧情诈尸**。
+            #    时间戳永不重复。
+            "room_id": f"room_mock_{int(time.time() * 1000)}",
             "name": clean,
             "mode": "stage",
             "created_at": time.strftime("%Y-%m-%d %H:%M"),
@@ -878,21 +1019,74 @@ class ChatroomService:
         }
 
     async def shell_delete_room(self, room_id: str) -> Dict[str, Any]:
-        """删掉一个房间。
+        """删掉一个房间 —— **先发遮蔽旁白，后物理删数据**（2026-11-26 用户拍板）。
 
-        房间删了之后，时间线里那些发言也跟着没（房间的存档本来就是房间自己的）。
-        至少要留一个房间 —— 全删了页面就没舞台了。
+        拍板两点：
+        - 允许删到零（壳阶段「至少留一个」的守卫已撤，空态见前端提示）；
+        - **删除即永远消失**（用户明确不要回收站）：房间的 segment/message/turn
+          一并**物理删**。删除前先给**所有在场 Bot** 发一条遮蔽旁白（剧情翻篇）——
+          实际顺序 = 先入队旁白投递 → 后删房间数据；旁白投递行保留到递出终态
+          （``timeout_stale_deliveries`` 收口），再由回读循环的
+          ``cleanup_orphan_deliveries`` 清走 ⇒ 账本里不留残骸。
         """
         room = self._room_by_id(room_id)
         if room is None:
             return {"ok": False, "error": f"房间不存在：{room_id}"}
-        if len(self._rooms) <= 1:
-            return {"ok": False, "error": "至少要留一个房间"}
+        ledger = self._ledger()
+        narration_sent = 0
+        purged: Dict[str, int] = {}
+        if await self._data_source() == "real" and ledger is not None:
+            bots = await self._room_bot_members(room)
+            if bots:
+                # ── ① 先给所有在场 Bot 入队遮蔽旁白 ──
+                segment_id = f"seg_del_{int(time.time() * 1000)}"
+                narrator_member = dict(NARRATOR)
+                group_id = virtual_group_id(room_id)
+                group_name = str(room.get("name") or "")
+                farewell_text = self._room_delete_narration
+
+                def _enqueue_farewell() -> int:
+                    """所有账本写集中在一个同步函数里，由 ledger.run 挪到线程。"""
+                    seq = ledger.next_delivery_seq()
+                    queued = 0
+                    for bot in bots:
+                        ledger.enqueue_delivery(
+                            delivery_id=f"{segment_id}_d{seq}",
+                            target_bot_id=str(bot.get("bot_id") or ""),
+                            content=farewell_text,
+                            room_id=room_id,
+                            segment_id=segment_id,
+                            sender_member_id=str(narrator_member["member_id"]),
+                            sender_platform=str(narrator_member.get("platform") or "webui"),
+                            sender_account=str(narrator_member.get("account") or "g1_narrator"),
+                            sender_nickname=str(narrator_member["display_name"]),
+                            group_id=group_id,
+                            group_name=group_name,
+                            seq=seq,
+                            # 遮蔽旁白同剧情旁白：不建轮次、不分波
+                            turn_id="",
+                            wave=0,
+                        )
+                        seq += 1
+                        queued += 1
+                    return queued
+
+                try:
+                    narration_sent = await ledger.run(_enqueue_farewell)
+                except Exception as exc:  # noqa: BLE001
+                    return {"ok": False, "error": f"发遮蔽旁白失败（房间未删）：{exc}"}
+            # ── ② 后物理删房间数据（旁白投递行保留到递出终态）──
+            try:
+                purged = await ledger.run(ledger.delete_room_data, room_id)
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": f"删除房间数据失败：{exc}"}
         self._rooms = [item for item in self._rooms if item["room_id"] != room_id]
         return {
             "ok": True,
             "rooms": self._rooms,
             "deleted": room,
+            "narration_sent": narration_sent,
+            "purged": purged,
             "member_pool": [await self._resolve_member(item) for item in self._member_pool()],
         }
 
@@ -1363,6 +1557,143 @@ class ChatroomService:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "acked": count}
 
+    # ---- real 模式：排阵 + 建轮 + 投递（台词与旁白共用）-------------------
+
+    async def _plan_and_enqueue_real(
+        self,
+        *,
+        ledger: Any,
+        room: Dict[str, Any],
+        segment_id: str,
+        stamp: str,
+        lines: List[Dict[str, Any]],
+        bots: List[Dict[str, Any]],
+        member_wave_source: List[str],
+        named_in_room: List[str],
+        segment_kind: str,
+        message_kind: str,
+        use_mention: bool,
+        mention_name_of: Any = None,
+    ) -> Dict[str, Any]:
+        """把「一行一条发言」排成一轮并投递 —— **台词与旁白共用这一套**。
+
+        为什么要共用（2026-11-27 时光机哑巴修复）：旁白原本不走建轮/开阀，
+        导致 worker 判定 `turn_id` 为空 ⇒ 不开阀 ⇒ 宿主频率 0 时旁白被静默吞掉。
+        用户拍板「旁白 = 我的角色发的一条消息」⇒ 接话走默认语义
+        （5% 沉默掷骰 + 阵型随机、不带 @）⇒ 两种发送必须同一套排阵代码，
+        否则以后改默认语义只改了一边又会漂移。
+
+        :param lines: 已解析的发言行，每项含 ``member_id`` / ``display_name`` /
+              ``text`` / ``platform`` / ``account``（**身份随任务走**）
+        :param member_wave_source: 递话候选的 member_id 全集（旁白=在场 Bot，台词同）
+        :param named_in_room: 显式点名的 member_id（旁白恒空 ⇒ 默认语义）
+        :param use_mention: 是否给勾选者正文加 ``@显示名``（旁白恒 False）
+        :param mention_name_of: 可选，按 member_id 取显示名的函数
+        :returns: 排阵/建轮结果（seed / turn_id / expected_bots / waves ...）
+        """
+        # ① 排阵：默认语义 = 先 5% 沉默掷骰（全中重掷）再抽阵型（50/30/20）。
+        #    有勾选才走导演制（指定串行 + 藏 @）—— 与剧本窗口「啥也不勾」同款。
+        seed = await self._next_turn_seed()
+        rng = random.Random(seed)
+        rand_candidates = (
+            list(member_wave_source)
+            if named_in_room
+            else formation.apply_silence_roll(rng, member_wave_source)
+        )
+        plan = formation.plan_formation(seed, rand_candidates, named_in_room)
+        allowed_speakers = set(rand_candidates)
+        member_wave: Dict[str, int] = {}
+        for wave_index, wave_members in enumerate(plan.waves):
+            for member_id in wave_members:
+                member_wave.setdefault(member_id, wave_index)
+
+        # ② ③ 写段 + 建轮 + 投递 —— 集中在一个同步函数里由 ledger.run 挪到线程执行。
+        #    ⚠️ 同步 SQLite 写直接放在事件循环上会阻塞插件（实测：查询全超时）。
+        turn_id = f"turn_{segment_id}"
+        messages = [
+            {
+                "message_id": f"{segment_id}_m{index}",
+                "speaker_member_id": line["member_id"],
+                "speaker_name": line["display_name"],
+                "kind": message_kind,
+                "content": line["text"],
+                "created_at": stamp,
+            }
+            for index, line in enumerate(lines)
+        ]
+        group_id = virtual_group_id(str(room["room_id"]))
+
+        def _do() -> int:
+            ledger.append_segment(room["room_id"], segment_id, segment_kind, messages)
+            ledger.save_turn(
+                {
+                    "turn_id": turn_id,
+                    "room_id": room["room_id"],
+                    "segment_id": segment_id,
+                    "seed": plan.seed,
+                    "strategy": plan.strategy,
+                    "formation": plan.formation,
+                    "plan": plan.to_dict(),
+                    "state": "open",
+                    "created_at": stamp,
+                }
+            )
+            seq = ledger.next_delivery_seq()
+            queued = 0
+            for line in lines:
+                for bot in bots:
+                    bot_member_id = str(bot.get("member_id") or "")
+                    if bot_member_id not in member_wave or bot_member_id not in allowed_speakers:
+                        continue
+                    use_at = bool(use_mention and bot_member_id in named_in_room)
+                    content = line["text"]
+                    if use_at and mention_name_of is not None:
+                        content = f"@{mention_name_of(bot_member_id)} {content}"
+                    ledger.enqueue_delivery(
+                        delivery_id=f"{segment_id}_d{seq}",
+                        target_bot_id=str(bot.get("bot_id") or ""),
+                        content=content,
+                        room_id=str(room["room_id"]),
+                        segment_id=segment_id,
+                        sender_member_id=str(line["member_id"]),
+                        sender_platform=str(line.get("platform") or DEFAULT_PLATFORM),
+                        sender_account=str(line.get("account") or ""),
+                        sender_nickname=str(line["display_name"]),
+                        group_id=group_id,
+                        group_name=str(room.get("name") or ""),
+                        seq=seq,
+                        turn_id=turn_id,
+                        wave=int(member_wave.get(bot_member_id, 0)),
+                    )
+                    seq += 1
+                    queued += 1
+            return queued
+
+        queued = await ledger.run(_do)
+
+        # ④ 进行中轮次快照（状态条跨 iframe 重建恢复用）
+        await self._set_active_turn(turn_id, str(room["room_id"]), "调度：" + plan.label)
+        return {
+            "ok": True,
+            "stage": "real",
+            "room_id": str(room["room_id"]),
+            "turn_id": turn_id,
+            "segment_id": segment_id,
+            "queued": queued,
+            "seed": plan.seed,
+            "strategy": plan.strategy,
+            "formation": plan.formation,
+            "formation_label": plan.label,
+            "waves": [list(w) for w in plan.waves],
+            "named": sorted(named_in_room),
+            "expected_bots": [
+                str(bot.get("member_id") or "")
+                for bot in bots
+                if str(bot.get("member_id") or "") in member_wave
+                and str(bot.get("member_id") or "") in allowed_speakers
+            ],
+        }
+
     async def _real_submit_beat(
         self,
         room_id: str,
@@ -1405,101 +1736,48 @@ class ChatroomService:
         if not bots:
             return {"ok": False, "error": "这个房间里还没有麦麦 Bot，先在左边「群员」里加一个"}
         named = {str(item) for item in (speakers or [])}
-        group_id = virtual_group_id(room_id)
         pool = self._member_map()
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         segment_id = f"seg_{int(time.time() * 1000)}"
-
-        # ── 排阵型（S8）：谁接话、按什么次序/分波 ─────────────────────
-        # ⚠️ **seed 必须存档**：随机轮次的阵型是掷骰子定的；不存就无法复现/重演
-        self._turn_counter += 1
-        seed = formation.next_seed(self._turn_counter, len(self._rooms))
-        bot_member_ids = [str(bot.get("member_id") or "") for bot in bots]
-        named_in_room = [m for m in named if m in bot_member_ids]
-        plan = formation.plan_formation(seed, bot_member_ids, named_in_room)
-        # member_id → 波号（同一个人可能只在一波里）
-        member_wave = {}
-        for wave_index, wave_members in enumerate(plan.waves):
-            for member_id in wave_members:
-                member_wave.setdefault(member_id, wave_index)
-
-        messages = [
-            {
-                "message_id": f"{segment_id}_m{index}",
-                "speaker_member_id": line["member_id"],
-                "speaker_name": line["display_name"],
-                "kind": "line",
-                "content": line["text"],
-                "created_at": stamp,
-            }
-            for index, line in enumerate(resolved)
-        ]
-        turn_id = f"turn_{segment_id}"
-        try:
-            ledger.append_segment(room_id, segment_id, "normal", messages)
-            # 存这一轮（seed + 阵型 + 分波计划）—— 重演与调试都靠它
-            ledger.save_turn(
+        # ⚠️ 身份随任务走（平台/账号/昵称）—— 领单的 Bot 进程没有中控的角色表。
+        #    台词发言人用当时真名单里的身份，不写死 webui。
+        enriched = []
+        for line in resolved:
+            sender = pool.get(str(line["member_id"])) or {}
+            enriched.append(
                 {
-                    "turn_id": turn_id,
-                    "room_id": room_id,
-                    "segment_id": segment_id,
-                    "seed": plan.seed,
-                    "strategy": plan.strategy,
-                    "formation": plan.formation,
-                    "plan": plan.to_dict(),
-                    "state": "open",
-                    "created_at": stamp,
+                    "member_id": line["member_id"],
+                    "display_name": line["display_name"],
+                    "text": line["text"],
+                    "platform": sender.get("platform") or DEFAULT_PLATFORM,
+                    "account": sender.get("account") or "",
                 }
             )
-            seq = ledger.next_delivery_seq()
-            queued = 0
-            for line in resolved:
-                for bot in bots:
-                    bot_member_id = str(bot.get("member_id") or "")
-                    # 只给「本轮接话名单」里的 Bot 排任务；不在阵型里的不打扰
-                    if bot_member_id not in member_wave:
-                        continue
-                    content = line["text"]
-                    if bot["member_id"] in named:
-                        # 02 文档 8.6：@点名 是开口保证（正文里带 @显示名）
-                        content = f"@{bot['display_name']} {content}"
-                    sender = pool.get(line["member_id"]) or {}
-                    ledger.enqueue_delivery(
-                        delivery_id=f"{segment_id}_d{seq}",
-                        target_bot_id=str(bot.get("bot_id") or ""),
-                        content=content,
-                        room_id=room_id,
-                        segment_id=segment_id,
-                        sender_member_id=line["member_id"],
-                        sender_platform=str(sender.get("platform") or "webui"),
-                        sender_account=str(sender.get("account") or ""),
-                        sender_nickname=line["display_name"],
-                        group_id=group_id,
-                        group_name=str(room.get("name") or ""),
-                        seq=seq,
-                        turn_id=turn_id,
-                        wave=int(member_wave.get(bot_member_id, 0)),
-                    )
-                    seq += 1
-                    queued += 1
+        try:
+            result = await self._plan_and_enqueue_real(
+                ledger=ledger,
+                room=room,
+                segment_id=segment_id,
+                stamp=stamp,
+                lines=enriched,
+                bots=bots,
+                member_wave_source=[str(bot.get("member_id") or "") for bot in bots],
+                named_in_room=[m for m in named if m in {str(b.get("member_id") or "") for b in bots}],
+                segment_kind="normal",
+                message_kind="line",
+                use_mention=True,
+                mention_name_of=lambda member_id: str(
+                    (pool.get(member_id) or {}).get("display_name") or member_id
+                ),
+            )
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"写投递任务失败：{exc}"}
-        return {
-            "ok": True,
-            "stage": "real",          # 前端据此走「轮询账本」而不是本地假动画
-            "room_id": room_id,
-            "segment_id": segment_id,
-            "queued": queued,
-            "bots": [str(bot.get("display_name") or "") for bot in bots],
-            "named": sorted(named),
-            "lines": resolved,
-            # 调度信息（调试面板/日志用；**界面不显示阵型选项**）
-            "seed": plan.seed,
-            "strategy": plan.strategy,
-            "formation": plan.formation,
-            "formation_label": plan.label,
-            "waves": [list(w) for w in plan.waves],
-        }
+        # ⚠️ 记「最近使用的角色」（私聊窗口默认选中它；见 __init__ 注释）
+        self._last_used_role = str(resolved[0]["member_id"])
+        ledger.set_meta("last_used_role", self._last_used_role)
+        result["bots"] = [str(bot.get("display_name") or "") for bot in bots]
+        result["lines"] = resolved
+        return result
 
     async def shell_submit_narrator(
         self,
@@ -1516,7 +1794,10 @@ class ChatroomService:
         用户写什么旁白就说什么（不生成精妙叙事）。
 
         mock 模式：返回 ok，由前端本地插剧情段（壳阶段一直这么演）。
-        real 模式：写一段（kind=plot）+ 每行 × 每个在场 Bot 一条投递（sender=旁白）。
+        real 模式：段类型仍是 ``plot``、发言人仍是固定身份旁白，但**接话机制
+        与「发送消息」完全同一套**（2026-11-27 用户拍板）——
+        旁白 = 「我的角色」说的一句话，走默认语义（5% 沉默掷骰 + 阵型随机、
+        不带 @），建 turn + wave ⇒ worker 开阀 ⇒ Bot 会接话。
         """
         if await self._data_source() != "real":
             return {"ok": True, "mode": "mock"}
@@ -1544,65 +1825,41 @@ class ChatroomService:
             return {"ok": False, "error": "至少写一条剧情事件"}
 
         narrator_member = dict(NARRATOR)
-        group_id = virtual_group_id(room_id)
-        group_name = str(room.get("name") or "")
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         segment_id = f"seg_{int(time.time() * 1000)}"
-        messages = [
+        # ⚠️ 旁白身份**永久固定**：平台/账号/昵称都从 NARRATOR 取，不查真名单
+        #    （改了会裂成两张名片）。它现在被当成「我的角色」的一句话 ⇒ 必须
+        #    跟台词走同一套排阵/建轮/投递，才不会again出现「不开阀⇒静默吞掉」。
+        lines_for_plan = [
             {
-                "message_id": f"{segment_id}_n{index}",
-                "speaker_member_id": str(narrator_member["member_id"]),
-                "speaker_name": str(narrator_member["display_name"]),
-                "kind": "narrator",
-                "content": text,
-                "created_at": stamp,
+                "member_id": str(narrator_member["member_id"]),
+                "display_name": str(narrator_member["display_name"]),
+                "text": text,
+                "platform": str(narrator_member.get("platform") or DEFAULT_PLATFORM),
+                "account": str(narrator_member.get("account") or "g1_narrator"),
             }
-            for index, text in enumerate(texts)
+            for text in texts
         ]
-
-        def _do() -> int:
-            """所有账本写操作**集中在一个同步函数里**，由 ledger.run 挪到线程执行。
-
-            ⚠️ 同步 SQLite 写放在事件循环上会阻塞插件（实测踩过：查询全超时）。
-            """
-            ledger.append_segment(room_id, segment_id, "plot", messages)
-            seq = ledger.next_delivery_seq()
-            queued = 0
-            for text in texts:
-                for bot in bots:
-                    ledger.enqueue_delivery(
-                        delivery_id=f"{segment_id}_d{seq}",
-                        target_bot_id=str(bot.get("bot_id") or ""),
-                        content=text,
-                        room_id=room_id,
-                        segment_id=segment_id,
-                        sender_member_id=str(narrator_member["member_id"]),
-                        sender_platform=str(narrator_member.get("platform") or "webui"),
-                        sender_account=str(narrator_member.get("account") or "g1_narrator"),
-                        sender_nickname=str(narrator_member["display_name"]),
-                        group_id=group_id,
-                        group_name=group_name,
-                        seq=seq,
-                        # 旁白不是「接话」⇒ 不建 turn、不分波（wave 0，无门控）
-                        turn_id="",
-                        wave=0,
-                    )
-                    seq += 1
-                    queued += 1
-            return queued
-
         try:
-            queued = await ledger.run(_do)
+            result = await self._plan_and_enqueue_real(
+                ledger=ledger,
+                room=room,
+                segment_id=segment_id,
+                stamp=stamp,
+                lines=lines_for_plan,
+                bots=bots,
+                member_wave_source=[str(bot.get("member_id") or "") for bot in bots],
+                # 旁白没有「勾选谁接话」的入口 ⇒ 恒空 ⇒ 默认语义
+                named_in_room=[],
+                segment_kind="plot",
+                message_kind="narrator",
+                use_mention=False,
+            )
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"写旁白投递失败：{exc}"}
-        return {
-            "ok": True,
-            "stage": "real",
-            "room_id": room_id,
-            "segment_id": segment_id,
-            "queued": queued,
-            "texts": texts,
-        }
+        result["texts"] = texts
+        result["bots"] = [str(bot.get("display_name") or "") for bot in bots]
+        return result
 
     async def shell_submit_beat(
         self,
@@ -1637,8 +1894,7 @@ class ChatroomService:
         if not resolved:
             return {"ok": False, "error": "这一幕还没有台词"}
 
-        self._turn_counter += 1
-        seed = self._turn_counter * 7919 + len(self._rooms) * 104729
+        seed = await self._next_turn_seed()   # counter 持久化，见 _next_turn_seed
         rng = random.Random(seed)
 
         # 接话候选 = **这个房间里的**麦麦 Bot（不是全局所有 Bot）
@@ -2029,6 +2285,9 @@ class ChatroomService:
 
         def _do() -> int:
             ledger.append_segment(thread_id, segment_id, "normal", messages)
+            # ⚠️ 记「最近使用的角色」（私聊窗口默认选中它；见 __init__ 注释）
+            self._last_used_role = str(speaker["member_id"])
+            ledger.set_meta("last_used_role", self._last_used_role)
             seq = ledger.next_delivery_seq()
             queued = 0
             for line in resolved:

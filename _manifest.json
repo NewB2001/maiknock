@@ -38,6 +38,8 @@
     "chat.get_private_streams",
     "chat.get_group_streams",
     "chat.open_session",
+    "frequency.set_adjust",
+    "frequency.get_adjust",
     "config.get_plugin"
   ],
   "i18n": {

@@ -17,6 +17,9 @@
 
 ⚠️ **「全串行是硬需求」是误解，已收回**（用户澄清）：
 三种阵型**都要有**，随机挑，**全程无 UI 阵型选项**。
+⚠️ **2026-11-27 用户拍板加权**：三种不再等概率 ——
+复合 50% / 并行 30% / 串行 20%（串行让后答 Bot 干等，体感慢）；
+两 Bot 的复合恒 1 波（真并行），避免退化成串行。
 
 ⚠️ **并行阵型与限流的关系**（08 §3.5.5）：
 并行时两个 Bot 同时递 = 8+ 个并发请求 ⇒ 会撞上游限流。
@@ -48,6 +51,17 @@ FORMATION_COMPOSITE = "composite"
 
 #: 全部阵型（随机时从中挑）
 ALL_FORMATIONS = (FORMATION_SERIAL, FORMATION_PARALLEL, FORMATION_COMPOSITE)
+
+#: ★ 随机权重（2026-11-27 用户拍板）：合流为主、并行次之、串行最小。
+#:    原因：等概率时「逐个接话」的实际占比≈50%（串行 1/3 + 复合在两 Bot 时
+#:    有一半概率随机切成每人一波 = 行为退化成串行）⇒ 第二个 Bot 总要等前面的
+#:    思考完（实测宿主单轮 planner+replyer 可达 3 分钟）。
+#:    改权重 + 两 Bot 复合恒 1 波后，「实际逐个接话」降到 ~20%。
+FORMATION_WEIGHTS: Dict[str, int] = {
+    FORMATION_COMPOSITE: 50,    # 串并合流（主流）
+    FORMATION_PARALLEL: 30,     # 并行
+    FORMATION_SERIAL: 20,       # 随机串行（最小）
+}
 
 #: 阵型的中文标签（给日志与调试面板看；**界面上不出现阵型选项**）
 FORMATION_LABELS = {
@@ -115,11 +129,50 @@ class FormationPlan:
 
 
 def pick_formation(rng: random.Random) -> str:
-    """随机挑一个阵型。
+    """按权重随机挑一个阵型（2026-11-27 用户拍板）。
 
-    ⚠️ **三种等概率** —— 没有理由偏袒哪一个（用户明确要求「三种都要有，随机挑」）。
+    ★ 不再等概率 —— 用户要求「串并合流为主、并行次之、随机串行最小」
+    （串行让后答 Bot 干等，体感很慢）。权重见 ``FORMATION_WEIGHTS``：
+    复合 50% / 并行 30% / 串行 20%。
+
+    ⚠️ 用 ``rng.choices`` 而不是手写累计概率：同一 seed 仍必得同一结果
+    （``random.Random`` 的采样序列可复现），FR-05 / FR-14 的重演契约不破。
     """
-    return rng.choice(list(ALL_FORMATIONS))
+    names = list(FORMATION_WEIGHTS)
+    weights = [FORMATION_WEIGHTS[n] for n in names]
+    return rng.choices(names, weights=weights, k=1)[0]
+
+
+#: 无勾选轮次里，单个 Bot「这轮不发言」的概率（2026-11-27 用户拍板 5%）
+DEFAULT_SILENCE_RATE = 0.05
+
+
+def apply_silence_roll(
+    rng: random.Random,
+    candidates: Sequence[str],
+    rate: float = DEFAULT_SILENCE_RATE,
+) -> List[str]:
+    """无勾选轮次：先挨个掷「不发言」骰子，再返回留下来的接话者。
+
+    ⚠️ 用户口径（2026-11-27）：
+    - 每个 Bot 独立按 ``rate`` 概率沉默（不递话 ⇒ 它根本没看见这轮台词）；
+    - **全军覆没则重掷**（递归重试，直到至少留一个）——绝不允许整轮没人说话；
+    - 留下来的才参与后面的三种阵型随机。
+
+    ⚠️ 重演可复现：rng 是同一 seed 建立的，重掷消耗它的序列，
+    同一 seed 必得同一结果（FR-05）。
+    """
+    items = [str(x) for x in (candidates or []) if str(x)]
+    if not items:
+        return []
+    rate = max(0.0, min(1.0, float(rate)))
+    while True:
+        kept = [m for m in items if rng.random() >= rate]
+        if kept:
+            return kept
+        # 全军覆没 ⇒ 重掷（rate=1.0 的病态输入会死循环，兜底留第一个）
+        if rate >= 1.0:
+            return [items[0]]
 
 
 def split_into_waves(rng: random.Random, speakers: Sequence[str]) -> List[List[str]]:
@@ -133,6 +186,12 @@ def split_into_waves(rng: random.Random, speakers: Sequence[str]) -> List[List[s
         return []
     if len(items) == 1:
         return [[items[0]]]
+    # ★ 两 Bot 时恒 1 波（2026-11-27 用户拍板）：
+    #    原来的 randint(1,2) 有一半概率切成每人一波 ⇒ 行为跟纯串行完全一样，
+    #    导致「名义复合 33% + 退化一半 = 实际逐个接话 50%」的体感。
+    #    两 Bot 就两个，合流 = 一起说，分波没有中间形态。
+    if len(items) == 2:
+        return [items]
     rng.shuffle(items)
     wave_count = rng.randint(1, len(items))
     # 随机切点（保证每波至少一个）
