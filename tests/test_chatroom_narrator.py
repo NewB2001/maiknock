@@ -70,6 +70,27 @@ def main() -> int:
     check("消息 kind=narrator", m["kind"] == "narrator")
     check("member_id=narrator", m["speaker_member_id"] == "narrator")
 
+    print("== 6. ★ 时光机 = mk 命令翻译器 ==")
+    # 锚点 2026-11-27 00:57:53 本地时间
+    import time as _t
+    anchor = _t.mktime(_t.strptime("2026-11-27 00:57:53", "%Y-%m-%d %H:%M:%S"))
+    cmds = narrator.build_mk_lines(["夜深之后，大家都回家了"], anchor, 2, "时")
+    check("选 2h ⇒ /mk set 目标时刻", cmds[0].startswith("/mk set 2026-11-27 02:57:53 "), cmds[0])
+    check("剧情跟在命令后", "夜深之后，大家都回家了" in cmds[0], cmds[0])
+    cmds_plain = narrator.build_mk_lines(["夜深之后"], anchor, 0, "")
+    check("不选时间 ⇒ /mk hi", cmds_plain[0].startswith("/mk hi "), cmds_plain[0])
+    cmds_empty = narrator.build_mk_lines([], anchor, 2, "时")
+    check("剧情空 ⇒ 仍发命令", cmds_empty == ["/mk set 2026-11-27 02:57:53"], cmds_empty)
+    cmds_day = narrator.build_mk_lines(["三天后"], anchor, 3, "日")
+    check("3 日 ⇒ 加 3 天", cmds_day[0].startswith("/mk set 2026-11-30 00:57:53 "), cmds_day[0])
+    check("年/月单位不被接受", narrator.duration_seconds(2, "年") == 0.0)
+    back = narrator.build_mk_lines(["回到过去"], anchor, 3, "时", "back")
+    check("★ 后退 ⇒ /mk back 3h", back == ["/mk back 3h 回到过去"], back)
+    back_d = narrator.build_mk_lines(["回到过去"], anchor, 2, "日", "back")
+    check("后退 2 日 ⇒ /mk back 2d", back_d[0].startswith("/mk back 2d "), back_d[0])
+    fwd = narrator.build_mk_lines(["去未来"], anchor, 3, "时", "forward")
+    check("前进 ⇒ /mk set 绝对时刻", fwd[0].startswith("/mk set 2026-11-27 03:57:53 "), fwd[0])
+
     print()
     if FAILED:
         print(f"FAILED {len(FAILED)}: {FAILED}")

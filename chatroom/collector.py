@@ -265,6 +265,13 @@ class ReplyCollector:
                     continue
                 if message.get("is_command") or message.get("is_notify"):
                     continue        # 命令/通知不是剧情
+                # ⚠️ 跳过 F2 剧情时间的「种子消息」（2026-11-27）：
+                #    add/back/set 带剧情提示词时，插件先投一条「（剧情时间已更新）」
+                #    给 Planner 当 reply_target，否则它报「没有可回复的真实消息」。
+                #    这条是机制用的占位，不是 Bot 台词 —— 不能当 reply 收进账本，
+                #    否则前端会把它当「她回了」提前收尾，还显示成鹦鹉学舌的假台词。
+                if message_text(message) == "（剧情时间已更新）":
+                    continue
                 kind, account, nickname = classify_message(message)
                 if kind != "bot":
                     continue        # 只收 Bot 的回复（我方角色的话是"递出去"的，不回读）

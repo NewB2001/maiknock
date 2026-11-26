@@ -18,6 +18,9 @@
         "bootstrap": {
           "api": "shell_bootstrap"
         },
+        "story_now": {
+          "api": "shell_story_now"
+        },
         "errors": {
           "api": "shell_errors"
         },
@@ -388,6 +391,48 @@
             }
           }
         },
+        "submit_narrator_private": {
+          "api": "shell_submit_narrator_private",
+          "parameters": {
+            "peer_member_id": {
+              "type": "string",
+              "required": true,
+              "max_length": 64
+            },
+            "my_member_id": {
+              "type": "string",
+              "required": false,
+              "max_length": 64
+            },
+            "lines": {
+              "type": "array",
+              "required": false,
+              "max_items": 200,
+              "items": {
+                "type": "string",
+                "max_length": 4000
+              }
+            },
+            "number": {
+              "type": "integer",
+              "required": false
+            },
+            "unit": {
+              "type": "string",
+              "required": false,
+              "max_length": 8
+            },
+            "anchor_ts": {
+              "type": "number",
+              "required": false
+            },
+            "direction": {
+              "type": "string",
+              "required": false,
+              "max_length": 16
+            }
+          }
+        },
         "submit_narrator": {
           "api": "shell_submit_narrator",
           "parameters": {
@@ -413,6 +458,15 @@
               "type": "string",
               "required": false,
               "max_length": 8
+            },
+            "anchor_ts": {
+              "type": "number",
+              "required": false
+            },
+            "direction": {
+              "type": "string",
+              "required": false,
+              "max_length": 16
             }
           }
         },

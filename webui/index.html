@@ -654,6 +654,8 @@
 
   /* 空态禁用（2026-11-26 用户拍板）：无房间/无私聊对象时整个「消息发送+剧本」窗口不可交互 */
   .composer.is-disabled { pointer-events: none; opacity: .55; }
+  /* 等待 Bot 回复：只让当前窗口的输入变灰，切换入口照常可点 */
+  .script-rows.is-readonly, .script[readonly] { opacity: .5; }
 
   /* ── 段（segment）：一条分隔线 + 这一段的所有消息 ─────────── */
   .segment { position: relative; }
@@ -803,6 +805,15 @@
     color: var(--fg);
   }
   .tm-number { width: 92px; }
+  .tm-direction { max-width: 76px; }
+  .tm-anchor {
+    align-self: center;
+    font-size: 12px;
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .tm-plot {
     width: 100%;
     min-height: 90px;
@@ -1279,6 +1290,10 @@
     renderPrivate();
     renderPrivateTurnState();
     updateSubmitButtons();   // 切私聊对象 ⇒ 按新的一对重算禁用
+    // ⚠️ 切回来时重拉线程列表（2026-11-27）：这一对的 segments 可能在切走期间
+    //    才由 collector 写进账本（比如 mk 命令的迟到回复），本地 privateThreads
+    //    还是旧的 ⇒ 会显示「还没有聊天记录」。重拉一次即可（失败保留旧内容）。
+    loadPrivateThreads();
   }
 
   // 切到另一个私聊对象：中间窗口的标题、时间线、剧本窗口、调试面板全跟着切
@@ -2365,7 +2380,13 @@
     // 拉私聊线程列表；失败时不影响群聊
     try {
       var data = await window.maibot.query("private_threads");
-      state.privateThreads = (data && data.private_threads) || [];
+      var fresh = (data && data.private_threads) || [];
+      // ⚠️ 先清 segmentsOf 的缓存再写线程列表（2026-11-27）：
+      //    页面切走再回来 iframe 重建时，renderPrivate() 可能在线程列表到达前
+      //    就用空 threads 建过缓存 ⇒ 不清的话「还没有聊天记录」会一直显示，
+      //    直到用户手动刷新/再发一条消息（实测 bug）。
+      state.privateTimeline = {};
+      state.privateThreads = fresh;
       renderPrivatePeers();
       renderPrivate();
     } catch (error) {
@@ -2554,6 +2575,17 @@
 
     var row = document.createElement("div");
     row.className = "tm-row";
+    // ⚠️ 方向下拉放在数字框前面（2026-11-27 用户要求）：前进=mk set（跳到未来），
+    //    后退=mk back（回到过去，藏掉那段时间=永久失忆）。默认前进。
+    var direction = document.createElement("select");
+    direction.className = "tm-direction";
+    [["forward", "前进"], ["back", "后退"]].forEach(function (pair) {
+      var option = document.createElement("option");
+      option.value = pair[0];
+      option.textContent = pair[1];
+      direction.appendChild(option);
+    });
+    row.appendChild(direction);
     var number = document.createElement("input");
     number.type = "text";
     number.inputMode = "numeric";
@@ -2567,14 +2599,28 @@
     row.appendChild(number);
     var unit = document.createElement("select");
     unit.className = "tm-unit";
-    ["时", "分", "秒", "年", "月", "日"].forEach(function (item) {
+    // ⚠️ 只保留 /mk 支持的 d/h/m/s（年/月无精确长度，已删除）；
+    //    首个空选项 ⇒ 默认「不选时间」= 发给 Bot 的正文是 /mk hi（自由脑补当前时间）。
+    var empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "（不选）";
+    unit.appendChild(empty);
+    ["日", "时", "分", "秒"].forEach(function (item) {
       var option = document.createElement("option");
       option.value = item;
       option.textContent = item;
       unit.appendChild(option);
     });
     row.appendChild(unit);
+    // ⚠️ 锚点 = /mk now 的当前剧情时间（时光机跳时间的出发点）。
+    //    放在单位右边，打开时光机时才拉（不去污染 bootstrap 体积）。
+    var anchor = document.createElement("span");
+    anchor.className = "tm-anchor muted";
+    anchor.title = "当前剧情线（/mk now 的时间）。相对时间以此为起点。";
+    anchor.textContent = "当前剧情线：读取中…";
+    row.appendChild(anchor);
     panel.appendChild(row);
+    panel.anchorNode = anchor;
 
     var plot = document.createElement("textarea");
     plot.className = "tm-plot";
@@ -2583,14 +2629,16 @@
 
     var hint = document.createElement("div");
     hint.className = "tm-hint";
-    hint.textContent = "不写的话Bot角色就会自行脑补，剧情容易失控！";
+    hint.textContent = "不指定时间=默认当前时间（发 /mk hi，Bot 自由脑补）；选时间则按当前剧情线推算跳转。剧情可不写，让 Bot 自由发挥。";
     panel.appendChild(hint);
 
     var generate = document.createElement("button");
     generate.type = "button";
     generate.className = "maibot-button maibot-button-primary";
     generate.textContent = "生成剧情";
-    generate.onclick = function () { generatePlot(scope, number.value, unit.value, plot.value); };
+    generate.onclick = function () {
+      generatePlot(scope, number.value, unit.value, plot.value, panel, direction.value);
+    };
     panel.appendChild(generate);
 
     slot.appendChild(panel);
@@ -2598,16 +2646,51 @@
     return panel;
   }
 
-  async function generatePlot(scope, numberText, unit, plotText) {
+  async function generatePlot(scope, numberText, unit, plotText, panel, direction) {
     var amount = parseInt(numberText, 10);
-    if (!amount || amount <= 0) {
-      showError("先填一个大于 0 的数字");
+    // ⚠️ 时间和剧情都可以空（2026-11-27 用户拍板）：
+    //    不选时间 ⇒ 后端拼 /mk hi；剧情空 ⇒ 命令后面不写正文，Bot 自由脑补。
+    //    只有「选了单位却没填数字」才算填错。
+    if (unit && (!amount || amount <= 0)) {
+      showError("选了时间单位就填一个大于 0 的数字；不选时间直接生成即可。");
       return;
     }
     var lines = (plotText || "").split(/\r?\n/).map(function (line) { return line.trim(); })
       .filter(function (line) { return line.length > 0; });
-    if (!lines.length) {
-      showError("至少写一条剧情事件");
+    // ⚠️ 私聊时光机（2026-11-27）：私聊不是真一对一，是「我 + Bot + 旁白」三人小群。
+    //    后端把剧情翻成 mk 命令投进这条私聊流，命令真执行、Bot 就着剧情说台词 ⇒
+    //    跟私聊「发送消息」一样走 pollPrivateReal 轮询回传，不再本地插假段。
+    if (scope === "private" && state.stage === "real" && state.currentPeerId) {
+      var pr;
+      try {
+        pr = await window.maibot.action("submit_narrator_private", {
+          peer_member_id: state.currentPeerId,
+          my_member_id: state.privateSpeaker,
+          lines: lines,
+          number: amount || 0,
+          unit: unit || "",
+          anchor_ts: panel && panel.anchorTs ? panel.anchorTs : 0,
+          direction: direction || "forward"
+        });
+      } catch (error) {
+        showError("生成剧情失败：" + (error && error.message ? error.message : error));
+        return;
+      }
+      var pf = businessError(pr);
+      if (pf) { showError(pf); return; }
+      clearError();
+      if (panel) { panel.hidden = true; state.tmOpen = null; }
+      if (pr && pr.stage === "real") {
+        await loadPrivateThreads();
+        var thread = currentThread();
+        if (thread) {
+          await pollPrivateReal(thread, pr, ++state.privateTurnToken);
+        } else {
+          await loadPrivateThreads();
+        }
+      } else {
+        await loadPrivateThreads();
+      }
       return;
     }
     // ⚠️ **真模式**：旁白要真的投进虚拟群（固定身份「剧情旁白」），
@@ -2619,8 +2702,10 @@
         result = await window.maibot.action("submit_narrator", {
           room_id: state.currentRoomId,
           lines: lines,
-          number: amount,
-          unit: unit
+          number: amount || 0,
+          unit: unit || "",
+          anchor_ts: panel && panel.anchorTs ? panel.anchorTs : 0,
+          direction: direction || "forward"
         });
       } catch (error) {
         showError("生成剧情失败：" + (error && error.message ? error.message : error));
@@ -2629,10 +2714,10 @@
       var failure = businessError(result);
       if (failure) { showError(failure); return; }
       clearError();
-      // ⚠️ 旁白 = 「我的角色」说的一句话（2026-11-27 用户拍板）：
-      //    real 模式后端已建 turn + 排阵 + 开阀投递 ⇒ Bot 会接话 ⇒
-      //    必须跟「发送消息」一样起状态条、轮询账本、按 expected_bots 收尾。
-      //    只 loadRoomTimeline 就返回会让状态条不出现、迟到回复也不刷新。
+      // ⚠️ 生成成功 ⇒ 收起时光机面板（等于再点一次按钮），别让它常驻挡住聊天窗口。
+      if (panel) { panel.hidden = true; state.tmOpen = null; }
+      // ⚠️ 旁白 = 翻译后的 mk 命令，投递走建轮/开阀 ⇒ Bot 会接话 ⇒
+      //    跟「发送消息」一样起状态条、停止本轮、轮询账本、按 expected_bots 收尾。
       var room = currentRoom();
       if (room && result && result.stage === "real") {
         await playBeat(room, result);
@@ -2677,6 +2762,22 @@
       if (state.tmPrivate) { state.tmPrivate.hidden = true; }
       panel.hidden = false;
       state.tmOpen = scope;
+      loadStoryAnchor(panel);   // 打开时读一次「当前剧情线」
+    }
+  }
+
+  // 读 /mk now 的当前剧情时间，显示在时光机的时间下拉框右边。
+  async function loadStoryAnchor(panel) {
+    if (!panel || !panel.anchorNode) { return; }
+    try {
+      var data = await window.maibot.query("story_now");
+      var data = await window.maibot.query("story_now");
+      panel.anchorTs = data && data.story_ts ? Number(data.story_ts) : 0;
+      panel.anchorNode.textContent = data && data.story_now
+        ? "当前剧情线：" + data.story_now
+        : "当前剧情线：（读不到）";
+    } catch (error) {
+      panel.anchorNode.textContent = "当前剧情线：（读不到）";
     }
   }
   function renderTimeline(keepScroll) {
@@ -3086,20 +3187,18 @@
 
   /* ── 提交一幕（群聊）──────────────────────────────────── */
 
-  // ⚠️ **禁用**：没有房间（群聊）/没有可用私聊对象（私聊）时禁用；
-  //    当前归属正在等 Bot 回复时也禁用（加 .is-disabled ⇒ pointer-events:none）。
-  //    ⚠️ 等待期间不整体 pointer-events:none —— 那样连切房间都点不了；
-  //    只让输入框/按钮不可编辑，切换入口保持可点（用户切走就能解锁）。
+  // ⚠️ **空态禁用**：没有房间/没有私聊对象时，整个窗口禁用。
+  // ⚠️ 等待 Bot 回复**不在这里禁整块** —— 那样会把窗口里所有点击都挡死，
+  //    连切出去都做不到（用户报过「一处等回复、处处禁用」）。
+  //    等待只锁「输入框 + 发送按钮」，并由 updateSubmitButtons 统一管。
   function updateComposerDisabled() {
     var composer = $("composer");
     if (composer) {
-      composer.classList.toggle("is-disabled",
-        !(state.rooms || []).length || !!busyRoom());
+      composer.classList.toggle("is-disabled", !(state.rooms || []).length);
     }
     var composerP = $("composer-private");
     if (composerP) {
-      composerP.classList.toggle("is-disabled",
-        !(state.managedBots || []).length || !!busyPrivate());
+      composerP.classList.toggle("is-disabled", !(state.managedBots || []).length);
     }
   }
 
@@ -3126,9 +3225,25 @@
       beatButton.disabled = !hasScript || roomBusy;
       beatButton.title = roomBusy ? "这个房间正在等 Bot 回复，切到别的房间可以继续写。" : "";
     }
+    // 群聊：只读锁输入行，不锁整个窗口（切换入口始终可点）
+    var rows = $("script-rows");
+    if (rows) {
+      rows.classList.toggle("is-readonly", roomBusy);
+      var inputs = rows.querySelectorAll("input,textarea,select,button");
+      for (var i = 0; i < inputs.length; i += 1) {
+        inputs[i].readOnly = !!roomBusy && inputs[i].tagName !== "SELECT"
+          && inputs[i].tagName !== "BUTTON";
+        inputs[i].disabled = !!roomBusy && (inputs[i].tagName === "SELECT"
+          || inputs[i].tagName === "BUTTON");
+      }
+    }
     var text = $("private-text");
     var sendButton = $("submit-private");
     var privateBusy = !!busyPrivate();
+    if (text) {
+      text.readOnly = privateBusy;
+      text.title = privateBusy ? "这一对正在等对方回复，换个角色或换个对象可以继续发。" : "";
+    }
     if (sendButton) {
       sendButton.disabled = !text || !text.value.trim() || privateBusy;
       sendButton.title = privateBusy ? "这一对正在等对方回复，换个角色或换个对象可以继续发。" : "";
@@ -3676,7 +3791,12 @@
       await loadPrivateThreads();
       var segs = segmentsOf("private");
       var last = segs.length ? segs[segs.length - 1] : null;
-      if (last && (last.messages || []).some(function (m) { return m.kind === "reply"; })) {
+      // ⚠️ 只把「真正的角色台词」当回复：排除 F2 种子消息（插件投的中性占位，
+      //    collector 通常已跳过它，这里再兜一道，避免它提前收尾）。
+      var hasRealReply = !!(last && (last.messages || []).some(function (m) {
+        return m.kind === "reply" && m.content !== "（剧情时间已更新）";
+      }));
+      if (hasRealReply) {
         break;
       }
       await new Promise(function (resolve) { setTimeout(resolve, 2000); });

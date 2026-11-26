@@ -86,6 +86,40 @@ class ChatroomApiMixin:
         """一次性拉取页面需要的全部初始假数据。"""
         return await self._svc_call("shell_bootstrap", )
 
+    @API("shell_story_now", description="时光机锚点：读取 /mk now 的当前剧情时间", version="1")
+    async def shell_story_now(self) -> Dict[str, Any]:
+        """时光机的「当前剧情线」锚点。
+
+        ⚠️ 直接读麦麦敲门自己的时间线状态（``_load_timeline``）—— 与用户敲
+        ``/mk now`` 看到的故事时间**同源**，不是另存一份。
+        未启用（MODE_OFF）时故事时间=现实时间，照常返回一个可用锚点。
+        """
+        import sys as _sys
+        import time as _time
+        try:
+            # plugin.py 已按文件路径加载好 timeline 模块并注册进 sys.modules
+            # （见 plugin.py 顶部加载逻辑）—— 复用同一份，避免第二份状态口径。
+            _tl = _sys.modules.get("maiknock_timeline")
+            state = self._load_timeline()          # type: ignore[attr-defined]
+            if state is not None and _tl is not None:
+                now = _time.time()
+                return {
+                    "ok": True,
+                    "story_now": _tl.format_story_ts(state, now),
+                    "story_ts": float(state.story_now(now)),
+                    "mode": str(getattr(state, "mode", "") or ""),
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"读剧情时间失败：{exc}"}
+        # 时间线模块没就绪 ⇒ 退回现实时间当锚点（时光机仍可用）
+        return {
+            "ok": False,
+            "story_now": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "story_ts": float(_time.time()),
+            "mode": "",
+            "error": "剧情时间线模块未就绪，暂用现实时间",
+        }
+
     @API("shell_ack_errors", description="确认已看到的上游错误（不再重复提示）", version="1")
     async def shell_ack_errors(self, report_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """把错误标记为「用户已看到」。
@@ -250,16 +284,27 @@ class ChatroomApiMixin:
         """
         return await self._svc_call("shell_truncate_from", room_id, cutoff_seq)
 
+    @API("shell_submit_narrator_private", description="私聊时光机：把剧情翻成 mk 命令投进私聊三人小群", version="1")
+    async def shell_submit_narrator_private(
+        self, peer_member_id: str, my_member_id: str = "", lines: Optional[List[str]] = None,
+        number: int = 0, unit: str = "", anchor_ts: float = 0.0, direction: str = "forward",
+    ) -> Dict[str, Any]:
+        return await self._svc_call(
+            "shell_submit_narrator_private", peer_member_id, my_member_id,
+            lines or [], number, unit, anchor_ts, direction,
+        )
+
     @API("shell_submit_narrator", description="时光机「生成剧情」：把剧情事件做成旁白投进虚拟群", version="1")
     async def shell_submit_narrator(
-        self, room_id: str, lines: Optional[List[str]] = None, number: int = 0, unit: str = ""
+        self, room_id: str, lines: Optional[List[str]] = None, number: int = 0,
+        unit: str = "", anchor_ts: float = 0.0, direction: str = "forward",
     ) -> Dict[str, Any]:
         """生成一段旁白（固定身份「剧情旁白」）并投进虚拟群。
 
         ⚠️ 时间单位只变成「三天后」这类**相对表述**，**绝不写绝对日期**（R6-18）。
         ⚠️ 旁白**占一个普通段位**，可被「回到此处」截断（FR-17）。
         """
-        return await self._svc_call("shell_submit_narrator", room_id, lines or [], number, unit)
+        return await self._svc_call("shell_submit_narrator", room_id, lines or [], number, unit, anchor_ts, direction)
 
     @API(
         "shell_update_member",

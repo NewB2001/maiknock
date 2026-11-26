@@ -15,7 +15,16 @@
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional
+
+#: 时光机时间单位 → 秒（只保留 /mk 支持的 d/h/m/s，年/月无精确长度，已删除）
+_UNIT_SECONDS = {
+    "日": 86400.0, "d": 86400.0,
+    "时": 3600.0, "h": 3600.0,
+    "分": 60.0, "m": 60.0,
+    "秒": 1.0, "s": 1.0,
+}
 
 #: 单位 → 中文量词（拼进相对表述时用；`日` 说成 `天` 更自然）
 _UNIT_WORD = {
@@ -84,9 +93,67 @@ def build_narrator_texts(
     if not clean:
         return []
     phrase = relative_phrase(number, unit)
-    if phrase:
+    # ⚠️ 用户正文若已带同样的相对表述（如自己写了「两小时后，…」），
+    #    不再重复加前缀（2026-11-27 实测：时光机显示「两小时后，两小时后，…」）。
+    #    用户写的正文原样保留，只是不叠加自动前缀。
+    if phrase and clean and not clean[0].startswith(phrase):
         clean = [f"{phrase}，{clean[0]}"] + clean[1:]
     return clean
+
+
+def duration_seconds(number: Any, unit: str) -> float:
+    """把「数字 + 单位」换成秒。单位只认 日/时/分/秒（或 d/h/m/s）。
+
+    年/月没有精确长度，时光机已删除这两个单位（对齐 /mk 的 d/h/m/s）。
+    非法输入返回 0（= 不选时间）。
+    """
+    try:
+        amount = float(number)
+    except (TypeError, ValueError):
+        return 0.0
+    factor = _UNIT_SECONDS.get(str(unit or "").strip().lower())
+    return amount * factor if factor else 0.0
+
+
+def build_mk_lines(
+    lines: Optional[List[str]],
+    anchor_ts: float,
+    number: Any = 0,
+    unit: str = "",
+    direction: str = "forward",
+) -> List[str]:
+    """时光机 = mk 命令的翻译器：把剧情翻成 /mk 命令正文。
+
+    - 选了时间（数字+单位）：
+      * 前进 ⇒ 锚点（故事现在）+ 相对时长算出目标时刻，
+        用 `/mk set YYYY-MM-DD HH:MM:SS <剧情>`（/mk set 支持的第一种写法）；
+      * 后退 ⇒ 用 `/mk back <幅度><单位> <剧情>`（幅度用 /mk 原生 d/h/m/s 写法）。
+    - 没选时间 ⇒ `/mk hi <剧情>`（群发打招呼，Bot 自由脑补当前时间）。
+    - 剧情可以空 ⇒ 命令后面不带正文，Bot 自己发挥。
+
+    ⚠️ 时间用**锚点**（/mk now 的故事时间）推算，不是真实时钟 ⇒ 回退态下也正确。
+    ⚠️ 多个剧情事件 ⇒ 每条各翻一条命令（跟原来「一行一条旁白」一致）。
+    """
+    clean = [str(line).strip() for line in (lines or []) if str(line).strip()]
+    # 剧情可以空：空着就发一条纯命令，让 Bot 自由脑补
+    bodies = clean or [""]
+    delta = duration_seconds(number, unit)
+    prefix = ""
+    if delta > 0:
+        if str(direction or "forward").strip().lower() in ("back", "backward", "后退"):
+            # /mk back 的幅度写法：d/h/m/s（中文单位换算回去）
+            token = str(unit or "").strip()
+            zh_to_mk = {"日": "d", "时": "h", "分": "m", "秒": "s"}
+            unit_mk = zh_to_mk.get(token, token.lower())
+            amount_text = str(int(number)) if float(number).is_integer() else str(number)
+            prefix = f"/mk back {amount_text}{unit_mk} "
+        else:
+            target = float(anchor_ts) + delta
+            target_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(target))
+            prefix = f"/mk set {target_text} "
+    else:
+        prefix = "/mk hi "
+    return [f"{prefix}{body}".rstrip() for body in bodies]
 
 
 def build_narrator_segment(texts: List[str], narrator: Dict[str, Any]) -> Dict[str, Any]:

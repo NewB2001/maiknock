@@ -1574,6 +1574,7 @@ class ChatroomService:
         message_kind: str,
         use_mention: bool,
         mention_name_of: Any = None,
+        deliver_texts: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """把「一行一条发言」排成一轮并投递 —— **台词与旁白共用这一套**。
 
@@ -1640,13 +1641,16 @@ class ChatroomService:
             )
             seq = ledger.next_delivery_seq()
             queued = 0
-            for line in lines:
+            for index, line in enumerate(lines):
+                # ⚠️ 时光机：段里展示剧情原文，递给 Bot 的却是拼好的 mk 命令
+                #    （deliver_texts 由调用方给；台词入口不给 ⇒ 沿用 line["text"]）。
+                body = str(deliver_texts[index]) if deliver_texts and index < len(deliver_texts) else line["text"]
                 for bot in bots:
                     bot_member_id = str(bot.get("member_id") or "")
                     if bot_member_id not in member_wave or bot_member_id not in allowed_speakers:
                         continue
                     use_at = bool(use_mention and bot_member_id in named_in_room)
-                    content = line["text"]
+                    content = body
                     if use_at and mention_name_of is not None:
                         content = f"@{mention_name_of(bot_member_id)} {content}"
                     ledger.enqueue_delivery(
@@ -1779,12 +1783,130 @@ class ChatroomService:
         result["lines"] = resolved
         return result
 
+    async def _real_submit_narrator_private(
+        self,
+        peer_member_id: str,
+        my_member_id: str = "",
+        lines: Optional[List[str]] = None,
+        number: int = 0,
+        unit: str = "",
+        anchor_ts: float = 0.0,
+        direction: str = "forward",
+    ) -> Dict[str, Any]:
+        """私聊时光机：把剧情翻成 mk 命令，投进「我 × 对方 Bot」那条专属私聊流。
+
+        私聊不是真的一对一，而是「我的角色 + Bot + 剧情旁白」三人小群。
+        旁白借**我的角色账号**进流（session 由发言人账号算，必须和当前线程一致），
+        显示名仍是「剧情旁白」；命令正文由 narrator.build_mk_lines 拼好。
+        走普通私聊投递（不带 @、不建 turn，与私聊 mk 命令同款）⇒ Bot 收到命令、
+        真执行、就着剧情说台词，台词由 collector 收回这条私聊线程。
+        """
+        if await self._data_source() != "real":
+            return {"ok": True, "mode": "mock"}
+        ledger = self._ledger()
+        if ledger is None:
+            return {"ok": False, "error": "共享账本没开，聊天室暂时不能生成剧情"}
+        await self._sync_real_members()
+        pool = self._member_map()
+        peer = pool.get(peer_member_id)
+        if peer is None or peer.get("kind") != "bot" or not str(peer.get("bot_id") or ""):
+            return {"ok": False, "error": f"私聊对象不可用：{peer_member_id}"}
+        speaker_id = str(my_member_id or "").strip() or str(self._last_used_role or "")
+        speaker = pool.get(speaker_id)
+        if speaker is None or speaker.get("kind") != "user_role":
+            return {"ok": False, "error": f"我的角色不可用：{speaker_id}"}
+        speaker_account = str(speaker.get("account") or "")
+        if not speaker_account:
+            return {"ok": False, "error": "我的角色没有账号（平台身份缺失）"}
+
+        clean_lines = [str(x).strip() for x in (lines or []) if str(x).strip()]
+        anchor = float(anchor_ts or 0.0) or time.time()
+        command_texts = narrator.build_mk_lines(clean_lines, anchor, number, unit, direction)
+        display_texts = narrator.build_narrator_texts(clean_lines, number, unit) or [""]
+        narrator_member = dict(NARRATOR)
+
+        thread_id = f"private_{peer_member_id}_{speaker_id}"
+        session_id = session_id_for_private(speaker_account, str(speaker.get("platform") or DEFAULT_PLATFORM))
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        segment_id = f"seg_{int(time.time() * 1000)}"
+        messages = [
+            {
+                "message_id": f"{segment_id}_n{index}",
+                "speaker_member_id": narrator_member["member_id"],
+                "speaker_name": narrator_member["display_name"],
+                "kind": "narrator",
+                "content": text,
+                "created_at": stamp,
+            }
+            for index, text in enumerate(display_texts)
+        ]
+
+        def _do() -> int:
+            ledger.append_segment(thread_id, segment_id, "plot", messages)
+            seq = ledger.next_delivery_seq()
+            for text in command_texts:
+                ledger.enqueue_delivery(
+                    delivery_id=f"{segment_id}_d{seq}",
+                    target_bot_id=str(peer.get("bot_id") or ""),
+                    content=text,
+                    room_id=thread_id,
+                    segment_id=segment_id,
+                    # 借我的角色账号进流（session 才能对上当前私聊线程）
+                    sender_member_id=speaker_id,
+                    sender_platform=str(speaker.get("platform") or DEFAULT_PLATFORM),
+                    sender_account=speaker_account,
+                    sender_nickname=str(narrator_member["display_name"]),
+                    group_id="",
+                    group_name="",
+                    seq=seq,
+                    turn_id="",
+                    wave=0,
+                )
+                seq += 1
+            return len(command_texts)
+
+        try:
+            queued = await ledger.run(_do)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"写私聊旁白投递失败：{exc}"}
+        return {
+            "ok": True,
+            "stage": "real",
+            "thread_id": thread_id,
+            "session_id": session_id,
+            "peer_member_id": str(peer.get("member_id") or ""),
+            "peer_name": str(peer.get("display_name") or ""),
+            "my_member_id": speaker_id,
+            "my_name": str(speaker.get("display_name") or ""),
+            "segment_id": segment_id,
+            "queued": queued,
+            "texts": display_texts,
+            "commands": command_texts,
+        }
+
+    async def shell_submit_narrator_private(
+        self,
+        peer_member_id: str,
+        my_member_id: str = "",
+        lines: Optional[List[str]] = None,
+        number: int = 0,
+        unit: str = "",
+        anchor_ts: float = 0.0,
+        direction: str = "forward",
+    ) -> Dict[str, Any]:
+        """私聊时光机 action 转发。"""
+        return await self._real_submit_narrator_private(
+            peer_member_id, my_member_id, lines, number, unit, anchor_ts, direction
+        )
+
     async def shell_submit_narrator(
         self,
         room_id: str,
         lines: Optional[List[str]] = None,
         number: int = 0,
         unit: str = "",
+        anchor_ts: float = 0.0,
+        direction: str = "forward",
     ) -> Dict[str, Any]:
         """时光机「生成剧情」：把逐条剧情事件做成**旁白**投进虚拟群（S10）。
 
@@ -1794,14 +1916,15 @@ class ChatroomService:
         用户写什么旁白就说什么（不生成精妙叙事）。
 
         mock 模式：返回 ok，由前端本地插剧情段（壳阶段一直这么演）。
-        real 模式：段类型仍是 ``plot``、发言人仍是固定身份旁白，但**接话机制
-        与「发送消息」完全同一套**（2026-11-27 用户拍板）——
-        旁白 = 「我的角色」说的一句话，走默认语义（5% 沉默掷骰 + 阵型随机、
-        不带 @），建 turn + wave ⇒ worker 开阀 ⇒ Bot 会接话。
+        real 模式：**时光机 = mk 命令在聊天室里的翻译器**（2026-11-27 用户拍板）——
+        段里展示的仍是用户写的剧情，但**投递给 Bot 的正文是拼好的 mk 命令**：
+        选时间 ⇒ `/mk set <锚点+相对时长算出时刻> <剧情>`；不选 ⇒ `/mk hi <剧情>`。
+        命令会被宿主真实执行（改剧情时间），回执由插件侧按旁白身份静默；
+        Bot 照常接话。接话机制与「发送消息」完全同一套。
         """
         if await self._data_source() != "real":
             return {"ok": True, "mode": "mock"}
-        return await self._real_submit_narrator(room_id, lines, number, unit)
+        return await self._real_submit_narrator(room_id, lines, number, unit, anchor_ts, direction)
 
     async def _real_submit_narrator(
         self,
@@ -1809,6 +1932,8 @@ class ChatroomService:
         lines: Optional[List[str]] = None,
         number: int = 0,
         unit: str = "",
+        anchor_ts: float = 0.0,
+        direction: str = "forward",
     ) -> Dict[str, Any]:
         ledger = self._ledger()
         if ledger is None:
@@ -1820,9 +1945,16 @@ class ChatroomService:
         bots = await self._room_bot_members(room)
         if not bots:
             return {"ok": False, "error": "这个房间里还没有麦麦 Bot，先加一个"}
+        # ⚠️ 时光机 = mk 命令翻译器：页面时间线展示用户写的剧情原文，
+        #    但投递给 Bot 的正文是拼好的 /mk 命令（会被宿主真实执行）。
         texts = narrator.build_narrator_texts(lines, number, unit)
+        # 剧情可以空（用户懒得写 ⇒ Bot 自由脑补）⇒ 命令照发
+        clean_lines = [str(x).strip() for x in (lines or []) if str(x).strip()]
         if not texts:
-            return {"ok": False, "error": "至少写一条剧情事件"}
+            texts = [""]   # 段里留一条空行占位，与命令条数对齐
+        # 锚点缺失时用真实时间兜底（时光机前端总会传 /mk now 的 story_ts）
+        anchor = float(anchor_ts or 0.0) or time.time()
+        command_texts = narrator.build_mk_lines(clean_lines, anchor, number, unit, direction)
 
         narrator_member = dict(NARRATOR)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1854,6 +1986,7 @@ class ChatroomService:
                 segment_kind="plot",
                 message_kind="narrator",
                 use_mention=False,
+                deliver_texts=command_texts,   # ★ 段里是剧情原文，投递给 Bot 的是 mk 命令
             )
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"写旁白投递失败：{exc}"}

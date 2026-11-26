@@ -1512,16 +1512,20 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 自动绑定（0.2.3）：私聊里敲任何 /mk 命令 ⇒ 该流自动成为「麦麦主动找你」的目标，
         # 不再有手动绑定命令（PM 2026-11-23 拍板：能删的命令就删）。
         # 校验失败（拿不到私聊清单/不是私聊流）一律静默跳过，绝不挡命令。
-        bind_note = await self._auto_bind(stream_id, platform, user_id)
-
+        # ⚠️ 时光机群发的命令（g1_narrator）不参与绑定——它是虚拟群，不是私聊。
+        bind_note = ""
         parts = text.split(maxsplit=2)  # ["/mk", 子命令, 其余]
         sub = parts[1].lower() if len(parts) >= 2 else ""
         rest = parts[2].strip() if len(parts) >= 3 else ""
+        # ⚠️ now 是纯读取：跳过 auto_bind（不写 bindings.json）
+        _is_now = sub == "now"
+        if str(user_id or "") != "g1_narrator" and not _is_now:
+            bind_note = await self._auto_bind(stream_id, platform, user_id)
 
         if sub == "hi":
             reply = await self._cmd_hi(rest, stream_id)
         elif sub in ("now", "add", "back", "set"):
-            reply = await self._cmd_timeline(sub, rest)
+            reply = await self._cmd_timeline(sub, rest, stream_id, user_id)
         else:
             reply = (
                 "麦麦敲门命令：\n"
@@ -1532,7 +1536,14 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 "/mk hi 马上过来给我讲讲今天的事 —— 让麦麦立刻主动开口（hi 后面直接写想让她做的事）"
             )
 
-        if bind_note:
+        # ⚠️ 时光机群发的 mk 命令（旁白身份 g1_narrator）：命令**照常执行**
+        #    （上面 _cmd_hi/_cmd_timeline 已经跑完了），但**不投递回执**——
+        #    否则「【MaiKnock】回退 2160 小时完成」那种回执会顶着 Bot 名片
+        #    进聊天室时间线，盖掉正常剧情台词（2026-11-27 用户拍板）。
+        #    用户在私聊手敲 /mk 仍是普通 user_id ⇒ 回执照常，习惯不变。
+        from_chatroom_narrator = str(user_id or "") == "g1_narrator"
+
+        if bind_note and not from_chatroom_narrator:
             reply = bind_note + "\n" + reply
 
         # 回复统一带【MaiKnock】前缀（审计 13:24 第 15 条加固）：回读排除规则
@@ -1540,6 +1551,27 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 敲 now/add/back/set/hi 会被误判成麦麦开口
         if not reply.startswith("【MaiKnock"):
             reply = f"【MaiKnock】{reply}"
+
+        if from_chatroom_narrator:
+            logger.info("[MaiKnock] 时光机 mk 命令已执行，静默回执：%s", text[:60])
+            return True, "", True
+
+        # ⚠️ 2026-11-27 用户拍板：add/back/set/hi **成功时不投递回执**——
+        #    那种「【MaiKnock】推进 1.00 小时完成…」顶着 Bot 名片进聊天流，
+        #    既干扰剧情台词又和「在群里查时间用 /mk now」的口径冲突。
+        #    now 是纯查询，结果必须回显（用户靠它看当前剧情时间）。
+        #    参数错误/失败仍回显（否则用户不知道自己敲错了）。
+        # 成功回执的特征：_cmd_timeline 的「…完成。」/_cmd_hi 的「触发成功！」；
+        # 参数错误/失败（「用法：…」「无法解析…」「失败：…」）仍回显给用户。
+        _success_reply = (
+            reply.startswith("【MaiKnock】")
+            and ("完成。" in reply or "触发成功！" in reply)
+            and "失败" not in reply
+        )
+        _quiet_on_success = sub in ("add", "back", "set", "hi") and _success_reply
+        if _quiet_on_success:
+            logger.info("[MaiKnock] %s 命令已执行，静默回执：%s", sub, text[:60])
+            return True, "", True
 
         # B-4：回复经 ctx.send.text 系统直发（不过 LLM），命令本身拦截不进聊天管线
         # F2/P9：改走 _send_text 统一出口，回退生效时对正文做绝对日期脱敏
@@ -2354,7 +2386,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
 
 
 
-    async def _cmd_timeline(self, sub: str, rest: str) -> str:
+    async def _cmd_timeline(self, sub: str, rest: str, stream_id: str = "", user_id_hint: str = "") -> str:
         """F2 剧情时间线四命令：now 查看 / add 推进 / back 回退 / set 设定。
 
         - ``/mk now``                          查看麦麦理解中的剧情时间（唯一入口）
@@ -2379,7 +2411,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 状态已落盘、命令无回复。⇒ ①幅度上限前置校验；②**先渲染成功再写盘**。
         _MAX_OFFSET_SEC = 100.0 * 365.25 * 86400.0
 
-        def _apply(new_state, action: str, narrative: str = "") -> str:
+        async def _apply(new_state, action: str, narrative: str = "") -> str:
             # R6-18：剧情提示词不得含绝对日期（否则回退后麦麦能读出今天几号）
             try:
                 new_state = tl.apply_narrative(new_state, narrative)
@@ -2402,7 +2434,37 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 new_state.boundary_ts, new_state.hidden_until_ts,
                 "有" if new_state.narrative else "无",
             )
-            return f"{action}完成。\n" + desc
+            # ⚠️ add/back/set **带剧情提示词 ⇒ 让麦麦就着提示词立刻开口**（2026-11-27
+            #    用户拍板：回到最初设计——命令自带提示词直接说话，不用再补一句普通消息）。
+            #    now 不触发（只查看）；hi 本来就是主动开口，不走这里。
+            #    没带提示词 ⇒ 只改时间、不开口（老行为）。
+            prompt = str(narrative or "").strip()
+            if prompt and stream_id:
+                # ⚠️ Planner 的 reply_target_message 取自聊天历史里最后一条
+                #    「非通知 SessionBackedMessage」。聊天室投递的命令消息被宿主
+                #    标 is_command ⇒ 不被当 target ⇒ 报「没有可回复的真实消息」
+                #    （实测：聊天室私聊发 /mk add 1h xxx，思考报错、投递 timeout）。
+                #    ⇒ 命令执行后先投一条**普通消息**当 target，再触发主动开口。
+                #    真人手敲 WebUI 私聊时 user_id 是 internal_account:*，其命令消息
+                #    自己就是 target（/mk hi 一直好好的）⇒ 不发种子消息，避免复述。
+                # 种子消息就用中性标记（不是剧情原文）——collector 按这个精确文本
+                # 跳过它（不当 Bot 台词、不进账本、不触发前端收尾），
+                # 但它仍是流里一条真实消息 ⇒ Planner 有 reply_target。
+                seed_sent = True
+                if str(user_id_hint or "").startswith("user.") or str(user_id_hint or "").startswith("g1_narrator"):
+                    seed_sent = await self._send_text("（剧情时间已更新）", stream_id)
+                    if not seed_sent:
+                        return f"{action}完成。\n{desc}（种子消息投递失败）"
+                intent = (
+                    "请现在主动向用户发起一条消息：自然地打个招呼并开启一个新话题。"
+                    f"话头：{prompt}"
+                )
+                ok, msg = await self._do_proactive_trigger(
+                    stream_id, intent, "MaiKnock F2 剧情提示词触发", 0, set(), manual=True
+                )
+                if not ok:
+                    logger.warning("[MaiKnock] 剧情提示词主动开口失败：%s", msg)
+                return f"{action}完成。\n{desc}"
 
         text = (rest or "").strip()
 
@@ -2425,7 +2487,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 new_state = tl.plan_forward(state, now, delta)
             except ValueError as exc:
                 return f"推进失败：{exc}"
-            return _apply(new_state, f"推进 {delta / 3600.0:.2f} 小时", narrative)
+            return await _apply(new_state, f"推进 {delta / 3600.0:.2f} 小时", narrative)
 
         # ---- /mk back 10h [剧情提示词] ----
         if sub == "back":
@@ -2441,7 +2503,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 new_state = tl.plan_backward(state, now, -delta)
             except ValueError as exc:
                 return f"回退失败：{exc}"
-            return _apply(new_state, f"回退 {delta / 3600.0:.2f} 小时", narrative)
+            return await _apply(new_state, f"回退 {delta / 3600.0:.2f} 小时", narrative)
 
         # ---- /mk set 09:00 [剧情提示词] ----
         if sub == "set":
@@ -2461,7 +2523,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 new_state = tl.plan_set_story_time(state, now, target)
             except ValueError as exc:
                 return f"设定失败：{exc}"
-            return _apply(new_state, "设定故事时间", narrative)
+            return await _apply(new_state, "设定故事时间", narrative)
 
         # 无兜底分支：handle_mk 的分发只把 now/add/back/set 传进来，
         # 「未知的子命令」永远不可达（0.2.3 测试报告 F-07：死代码已删）

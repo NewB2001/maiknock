@@ -147,16 +147,21 @@ check("回退时现实时间脱敏", "2026-11-21" not in desc or True)
 print(desc)
 
 print()
-print("=== 13. R6-20：故事时间仍在未来时回退 → 报错中止，不写盘 ===")
+print("=== 13. 2026-11-27 拍板：未来态照样能 back（只改偏移，不建隐藏区间）===")
 fwd = tl.plan_forward(s, NOW, 3 * DAY)
 check("forward 3d 后 mode=forward", fwd.mode == tl.MODE_FORWARD, fwd.mode)
-try:
-    tl.plan_backward(fwd, NOW, -DAY)
-    check("未来时回退应抛 ValueError", False, "未抛错")
-except ValueError as exc:
-    check("未来时回退抛 ValueError", True)
-    check("报错文案含「还在未来」", "还在未来" in str(exc), str(exc))
-    check("报错文案含 /mk now 指引", "/mk now" in str(exc), str(exc))
+back_future = tl.plan_backward(fwd, NOW, -DAY)
+check("未来态 back 成功（不抛错）", back_future.offset_sec == 2 * DAY, back_future.offset_sec)
+check("未来态 back 后仍是 forward", back_future.mode == tl.MODE_FORWARD, back_future.mode)
+check("未来态 back 不建隐藏区间",
+      back_future.boundary_ts is None and back_future.hidden_until_ts is None,
+      (back_future.boundary_ts, back_future.hidden_until_ts))
+check("未来态 back 保留叙事声明", back_future.declaration == fwd.declaration)
+# 仍然回退到过去（offset<0）时必须照常建隐藏区间（永久失忆语义）
+back_past = tl.plan_backward(s, NOW, -DAY)
+check("回退到过去照常建隐藏区间",
+      back_past.boundary_ts is not None and back_past.hidden_until_ts is not None,
+      (back_past.boundary_ts, back_past.hidden_until_ts))
 
 print()
 print("=== 14. R6-20：mode 口径与 forward/set 一致 ===")

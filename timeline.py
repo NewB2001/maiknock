@@ -240,14 +240,17 @@ def plan_backward(state: TimelineState, real_now: float, delta_sec: float) -> Ti
     new_boundary = float(real_now) + new_offset
     new_until = float(real_now)
 
-    # 故事时间仍在未来 ⇒ 没有「过去的一段时间」可藏（R6-20）。
-    # 直接报错中止，不写盘，避免生成倒挂的空区间。
+    # ⚠️ 未来态回退（2026-11-27 用户拍板）：故事时间领先现实时照样能 back——
+    #    「难道要身在过去或当下才能穿越回过去？」⇒ 删掉旧的拒绝。
+    #    口径与 plan_set_story_time 一致：目标仍在未来 ⇒ 没有真实消息可藏，
+    #    **只改偏移，不建隐藏区间**（不产生倒挂区间），声明/历史沿用现状。
     if new_offset > 0:
-        raise ValueError(
-            "故事时间还在未来（领先 "
-            f"{new_offset / 3600.0:.2f} 小时），没有可回退的时间段；"
-            "请先用 /mk now 回到现实时间，再回退。"
-        )
+        return replace(state, mode=MODE_FORWARD, offset_sec=new_offset,
+                       declaration=state.declaration,
+                       declaration_history=state.declaration_history,
+                       narrative=state.narrative,
+                       boundary_ts=state.boundary_ts,
+                       hidden_until_ts=state.hidden_until_ts)
 
     if state.has_hidden_window():
         assert state.boundary_ts is not None and state.hidden_until_ts is not None
