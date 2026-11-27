@@ -348,6 +348,10 @@
   button.avatar:hover { border-color: var(--primary); }
   button.avatar:disabled { cursor: default; opacity: .85; }
   button.avatar:disabled:hover { border-color: transparent; }
+  /* ⚠️ 只读头像（2026-11-28）：群员窗口里我方角色不可点，但要保留 title 提示
+     ⇒ 不能真 disabled（disabled 按钮不显示 hover title），用 class 模拟视觉 */
+  button.avatar.avatar-readonly { cursor: default; }
+  button.avatar.avatar-readonly:hover { border-color: transparent; }
 
   .member-text { flex: 1; min-width: 0; }
   .member-name { font-size: 13px; }
@@ -590,6 +594,18 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
+
+  /* 表情包（2026-11-28）：图片气泡去掉文字内边距，图片本身限制尺寸 */
+  .bubble.is-sticker { padding: 4px; background: transparent; border-color: transparent; }
+  .sticker-img {
+    display: block;
+    max-width: 160px;
+    max-height: 160px;
+    object-fit: contain;
+    border-radius: 8px;
+    cursor: zoom-in;
+  }
+  .voice-player { display: block; width: 240px; max-width: 100%; height: 34px; margin: 4px 0; }
 
   /* 引用块（2026-11-27）：Bot 回复了哪句，一眼可见；仿宿主聊天的引用观感 */
   .msg-quote {
@@ -1698,12 +1714,18 @@
     avatar.type = "button";
     avatar.className = "avatar" + (isBot ? " is-bot" : "");
     fillAvatar(avatar, member.avatar, member.display_name.slice(0, 1));
-    if (member.editable) {
-      avatar.title = "点击上传头像";
-      avatar.onclick = function () { pickAvatarImage(member.member_id); };
+    // ⚠️ 用 kind 判定，不用 member.editable —— 账本 member 表**没有 editable 列**，
+    //    从账本恢复的角色 editable=undefined ⇒ 会被误当 Bot（2026-11-28 实测踩过）。
+    var isMine = member.kind === "user_role";
+    if (isMine) {
+      // ⚠️ 2026-11-28 用户拍板：群员窗口里我方角色**只读**——
+      //    头像/名字的编辑入口只在「私聊 - 我的角色」面板，这里只给指路提示，
+      //    不加 onclick（用 readonly class 消掉可点的视觉，但保留 hover title）。
+      avatar.title = "可前往 私聊 - 我的角色 设置";
+      avatar.classList.add("avatar-readonly");
     } else {
-      // 状态不再单独占一列（太占地方），挪到头像的悬停提示里
-      avatar.title = "Bot 群员的头像来自它自己的配置\n" + statusDetail(member);
+      // ⚠️ Bot 头像提示删除（2026-11-28 用户拍板）：不显示任何 title
+      //    （状态也不再塞这里，避免悬浮弹出一坨）。
       avatar.disabled = true;
     }
     li.appendChild(avatar);
@@ -1711,30 +1733,18 @@
     var text = document.createElement("div");
     text.className = "member-text";
 
-    if (state.editingName === member.member_id && member.editable) {
-      var nameInput = document.createElement("input");
-      nameInput.className = "name-edit";
-      nameInput.value = member.display_name;
-      nameInput.onkeydown = function (event) {
-        if (event.key === "Enter") { event.preventDefault(); saveName(member.member_id, nameInput.value); }
-        if (event.key === "Escape") { state.editingName = null; renderMembers(); }
-      };
-      nameInput.onblur = function () { saveName(member.member_id, nameInput.value); };
-      text.appendChild(nameInput);
-      setTimeout(function () { nameInput.focus(); nameInput.select(); }, 0);
+    // ⚠️ 群员窗口里所有人**只读**（2026-11-28）：我方角色编辑入口只在
+    //    「私聊 - 我的角色」面板 ⇒ 不再有 inline name 编辑模式、不加 onclick。
+    var name = document.createElement("div");
+    name.className = "member-name";
+    name.textContent = member.display_name;
+    if (isMine) {
+      name.title = "可前往 私聊 - 我的角色 设置";
     } else {
-      var name = document.createElement("div");
-      name.className = "member-name" + (member.editable ? " is-editable" : "");
-      name.textContent = member.display_name;
-      if (member.editable) {
-        name.title = "点击改名字";
-        name.onclick = function () { state.editingName = member.member_id; renderMembers(); };
-      } else {
-        // Bot 的身份信息不单独占一行，挪到名字的悬停提示里
-        name.title = member.persona_label + " · " + (member.bot_name || "未登记 Bot");
-      }
-      text.appendChild(name);
+      // ⚠️ Bot 名不再暴露（2026-11-28）：原来的「麦麦一号（Bot名）」换成省略号
+      name.title = member.persona_label + " · …";
     }
+    text.appendChild(name);
 
     if (isBot) {
       // Bot 行多一行身份：人格标签 · Bot 名（我方角色只显示名字）
@@ -3047,7 +3057,56 @@
 
     var bubble = document.createElement("div");
     bubble.className = "bubble";
-    bubble.textContent = message.content;
+    // ⚠️ 表情包（2026-11-28）：Bot 回表情包时，宿主正文只有「[表情包: 标签]」
+    //    这种给 LLM 看的情感标签；真图片在 message.emoji_data（data URI）。
+    //    有图就画 <img>，加载失败回落文本；点图在新窗口放大看。
+    var sticker = String(message.emoji_data || "");
+    if (sticker.indexOf("data:image/") === 0) {
+      bubble.classList.add("is-sticker");
+      var pic = document.createElement("img");
+      pic.className = "sticker-img";
+      pic.alt = "表情包";
+      pic.title = "点一下放大";
+      pic.src = sticker;
+      pic.addEventListener("error", function () {
+        bubble.innerHTML = "";
+        bubble.classList.remove("is-sticker");
+        bubble.textContent = message.content;
+      });
+      pic.addEventListener("click", function () {
+        window.open(sticker, "_blank");
+      });
+      bubble.appendChild(pic);
+    } else {
+      bubble.textContent = message.content;
+    }
+    // ⚠️ 语音（2026-11-28）：消息带 voice_id ⇒ 加一个播放器。
+    //    音频不在页面数据里（会撑爆加载）：点播放时现取（shell_voice API）。
+    var voiceId = String(message.voice_id || "");
+    if (voiceId) {
+      var player = document.createElement("audio");
+      player.className = "voice-player";
+      player.controls = true;
+      player.preload = "none";
+      player.title = "麦麦的语音";
+      var loaded = false;
+      player.addEventListener("play", function () {
+        if (loaded) { return; }
+        loaded = true;
+        window.maibot.query("voice", { voice_id: voiceId }).then(function (res) {
+          if (res && res.ok && res.data_uri) {
+            player.src = res.data_uri;
+            player.play().catch(function () {});
+          } else {
+            var fail = document.createElement("span");
+            fail.textContent = "（语音加载失败，请看文字）";
+            bubble.appendChild(fail);
+            loaded = false;
+          }
+        }).catch(function () { loaded = false; });
+      });
+      main.appendChild(player);
+    }
     main.appendChild(bubble);
 
     row.appendChild(main);

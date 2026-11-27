@@ -31,6 +31,7 @@ from typing import Any
 
 # 这几个子模块**只依赖标准库**（talkrules 的 tomlkit 在函数内惰性导入）⇒ 直接导入，不走惰性
 from . import (
+    botavatar,
     collector,
     errorscan,
     export,

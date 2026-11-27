@@ -998,8 +998,11 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         if not bool((cfg.get("collect") or {}).get("enabled", True)):
             logger.info("[MaiKnock][聊天室] 回收开关未开，不起回读循环")
             return
+        # ⚠️ instance_root：语音二进制被宿主清空时按 hash 去 data/voices 找原件
+        _instance_root = getattr(getattr(self.ctx, "paths", None), "data_dir", None)
         collector = mk_chatroom.collector.ReplyCollector(
-            self.ctx, self._chatroom_ledger, self._chatroom_bot_id
+            self.ctx, self._chatroom_ledger, self._chatroom_bot_id,
+            instance_root=_instance_root,
         )
         self._chatroom_collector = collector
         self._chatroom_collector_task = asyncio.create_task(self._chatroom_collector_loop())
@@ -1199,6 +1202,16 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
             status = "gateway_off"
         elif style_fixed is False:
             status = "style_unfixed"
+        # ⚠️ 读本实例的 Bot 专属头像（data/avatar/internal/webui_bot_*.png）⇒
+        #    写进共享账本，让中控/页面能看到**别的 Bot** 的头像
+        #    （头像 uuid 只存在设置它的浏览器 localStorage 里，无法从 bot_id 推导 URL）。
+        avatar = ""
+        try:
+            instance_root = getattr(getattr(self.ctx, "paths", None), "data_dir", None)
+            if instance_root is not None:
+                avatar = mk_chatroom.botavatar.load_bot_avatar(Path(instance_root)) or ""
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[MaiKnock][聊天室] 读 Bot 头像失败（回落默认）：%r", exc)
         try:
             ledger.set_bot_status(
                 self._chatroom_bot_id,
@@ -1207,6 +1220,7 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
                 detail=detail,
                 handshake_ok=handshake_ok,
                 style_fixed=style_fixed,
+                avatar=avatar,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[MaiKnock][聊天室] 写接入状态失败：%r", exc)

@@ -27,8 +27,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .identity import DEFAULT_PLATFORM, session_id_for_private, virtual_group_id
@@ -93,6 +95,98 @@ def message_text(message: Dict[str, Any]) -> str:
     return ""
 
 
+def image_mime_of_base64(encoded: str) -> str:
+    """按 base64 头几个字符识别图片格式（webp/png/jpeg/gif）。"""
+    if encoded.startswith("UklGR"):        # "RIFF" base64 ⇒ WebP
+        return "image/webp"
+    if encoded.startswith("iVBOR"):        # PNG
+        return "image/png"
+    if encoded.startswith("/9j/"):         # JPEG
+        return "image/jpeg"
+    if encoded.startswith("R0lGOD"):       # GIF
+        return "image/gif"
+    return "image/webp"                    # 兜底：宿主缩略图默认 webp
+
+
+def emoji_data_uri(message: Dict[str, Any]) -> Optional[str]:
+    """从宿主消息里提取**表情包或图片**的 data URI（2026-11-28）。
+
+    宿主把表情包/图片存成 ``is_emoji=1`` / ``is_picture=1``，
+    ``processed_plain_text`` 只有描述文字（给 LLM 看的），真正的图片在
+    ``raw_message`` 的 ``{"type":"emoji"|"image", "binary_data_base64":"..."}``
+    （``include_binary_data=True`` 时才有）。
+
+    ⚠️ 函数名保留 emoji_data_uri（历史兼容），但**同时认图片**。
+    返回 ``data:image/<type>;base64,...``；没有图片数据 ⇒ None。
+    """
+    if not (bool(message.get("is_emoji")) or bool(message.get("is_picture"))):
+        return None
+    raw = message.get("raw_message")
+    if not isinstance(raw, list):
+        return None
+    for component in raw:
+        if not isinstance(component, dict):
+            continue
+        if component.get("type") not in ("emoji", "image"):
+            continue
+        encoded = component.get("binary_data_base64")
+        if not isinstance(encoded, str) or not encoded:
+            continue
+        return f"data:{image_mime_of_base64(encoded)};base64,{encoded}"
+    return None
+
+
+def voice_data_uri(message: Dict[str, Any], instance_root: Optional[Path] = None) -> Optional[str]:
+    """从宿主消息里提取**语音音频**的 data URI（2026-11-28）。
+
+    麦麦用 reply_voice 工具发语音 ⇒ raw_message 里有
+    ``{"type":"voice", "hash":"...", "data":"[语音: 文字]", "binary_data_base64":"..."}``。
+    宿主处理时可能清空 binary_data（跟表情包同款）⇒ 这时用 hash 去
+    ``<实例根>/data/voices/<hash>.*`` 找原件（collector 的 instance_root）。
+
+    返回 ``data:audio/<type>;base64,...``；没有音频 ⇒ None（只留文字兜底）。
+    """
+    raw = message.get("raw_message")
+    if not isinstance(raw, list):
+        return None
+    voice = next(
+        (c for c in raw if isinstance(c, dict) and c.get("type") == "voice"), None
+    )
+    if voice is None:
+        return None
+    encoded = voice.get("binary_data_base64")
+    if isinstance(encoded, str) and encoded:
+        # 识别音频格式（mp3/wav/ogg/m4a）
+        if encoded.startswith("SUQz"):        # "ID3" ⇒ MP3
+            mime = "audio/mpeg"
+        elif encoded.startswith("UklGR"):     # RIFF ⇒ WAV
+            mime = "audio/wav"
+        elif encoded.startswith("T2dnSw"):    # "OggS" ⇒ OGG
+            mime = "audio/ogg"
+        else:
+            mime = "audio/mpeg"              # 兜底MP3（MaiBot TTS 默认输出）
+        return f"data:{mime};base64,{encoded}"
+    # 二进制被清空 ⇒ 用 hash 去实例根找文件
+    voice_hash = str(voice.get("hash") or "")
+    if voice_hash and instance_root:
+        try:
+            voice_dir = Path(instance_root) / "data" / "voices"
+            for path in voice_dir.iterdir():
+                if path.is_file() and path.name.startswith(voice_hash):
+                    data = path.read_bytes()
+                    if not data:
+                        return None
+                    suffix = path.suffix.lower()
+                    mime = {
+                        ".mp3": "audio/mpeg", ".wav": "audio/wav",
+                        ".ogg": "audio/ogg", ".m4a": "audio/mp4",
+                    }.get(suffix, "audio/mpeg")
+                    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        except OSError:
+            pass
+    return None
+
+
 def message_time(message: Dict[str, Any]) -> str:
     """取消息时刻（``YYYY-MM-DD HH:MM:SS``）。
 
@@ -119,10 +213,13 @@ class ReplyCollector:
         hours: float = 6.0,
         limit: int = 100,
         log: Optional[logging.Logger] = None,
+        instance_root: Optional[Path] = None,
     ) -> None:
         self._ctx = ctx
         self._ledger = ledger
         self._bot_id = str(bot_id)
+        #: 实例根（语音二进制被清空时按 hash 去 data/voices 找原件）
+        self._instance_root = Path(instance_root) if instance_root else None
         #: {session_id: room_id} —— 哪些群流要采
         self._sessions = dict(sessions or {})
         self._hours = float(hours)
@@ -259,6 +356,9 @@ class ReplyCollector:
                     limit=self._limit,
                     hours=self._hours,
                     filter_mai=False,   # ⚠️ 必须 False：过滤掉麦麦就认不出她的回复了
+                    # ⚠️ 表情包要带图片二进制（2026-11-28）：否则 processed_plain_text
+                    #    只有「[表情包: 害羞,萌系]」这种情感标签，聊天室显示不出图。
+                    include_binary_data=True,
                 ),
                 timeout=15.0,
             )
@@ -445,6 +545,10 @@ class ReplyCollector:
                 # ⚠️ **写账本必须挪到线程里**：SQLite 写是**同步**的，
                 #    跨进程抢锁时会阻塞插件的**事件循环** ⇒ 宿主调不动组件接口
                 #    ⇒ 页面的查询全部超时（实测踩过：bootstrap / errors / timeline 全挂）。
+                # ⚠️ 表情包（2026-11-28）：kind 仍保持 "reply"（前端靠它判断 Bot
+                #    回了没 ⇒ 收尾判定不能坏），另加 emoji_data 让前端画图片而不是
+                #    「[表情包: 害羞,萌系]」这种给 LLM 看的情感标签。
+                sticker_data = emoji_data_uri(message)
                 written = await self._ledger.run(
                     self._ledger.append_message,
                     {
@@ -457,8 +561,21 @@ class ReplyCollector:
                         "content": text,
                         "quote": quoted,
                         "created_at": message_time(message),
+                        "emoji_data": sticker_data or "",
                     },
                 )
+                # ⚠️ 语音（2026-11-28）：音频本体存 voice_blob 表、消息只挂 voice_id，
+                #    前端点播放时按需取（不进 bootstrap，多大都能听）。
+                #    每次 poll 都尝试 ⇒ 老消息被重新扫到时也能补上语音。
+                voice_uri = voice_data_uri(message, self._instance_root)
+                if voice_uri:
+                    voice_id = f"voice_{message_id}"
+                    await self._ledger.run(
+                        self._ledger.save_voice, voice_id, voice_uri
+                    )
+                    await self._ledger.run(
+                        self._ledger.attach_voice, message_id, voice_id
+                    )
                 if written:
                     collected += 1
                     self._collected += 1

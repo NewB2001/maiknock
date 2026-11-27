@@ -474,6 +474,17 @@ class ChatroomService:
         persona = str(cfg.get("personality") or "")
         if persona:
             profile["persona_label"] = persona[:24]
+        # ⚠️ Bot 头像（2026-11-28）：各实例自报进共享账本的 bot_status.avatar。
+        #    这里从账本读**所有 Bot** 的头像（本实例读不到别的实例磁盘文件），
+        #    id 对不上就是没有头像 ⇒ _resolve_member 保留兜底 emoji。
+        ledger = self._ledger()
+        if ledger is not None:
+            try:
+                status = await self._alread(ledger.get_bot_status, bot_id)
+                if status and status.get("avatar"):
+                    profile["avatar"] = str(status["avatar"])
+            except Exception:  # noqa: BLE001
+                pass
         return profile or None
 
     async def _resolve_member(self, member: Dict[str, Any]) -> Dict[str, Any]:

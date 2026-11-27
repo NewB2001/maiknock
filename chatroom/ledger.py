@@ -144,6 +144,8 @@ SCHEMA: Tuple[str, ...] = (
         kind              TEXT NOT NULL DEFAULT 'line',  -- line|reply|narrator|sticker
         content           TEXT NOT NULL DEFAULT '',
         quote             TEXT NOT NULL DEFAULT '',   -- 被引原文（回复哪句；显示引用块用）
+        emoji_data        TEXT NOT NULL DEFAULT '',   -- 表情包/图片 data URI（kind 仍 reply）
+        voice_id          TEXT NOT NULL DEFAULT '',   -- 语音附件 id（音频在 voice_blob 表）
         created_at        TEXT NOT NULL DEFAULT '',
         voided            INTEGER NOT NULL DEFAULT 0
     )
@@ -151,6 +153,13 @@ SCHEMA: Tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_message_segment ON message(segment_id)",
     "CREATE INDEX IF NOT EXISTS idx_message_room ON message(room_id)",
     # ── 投递任务（跨 Bot 的工作单）───────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS voice_blob (
+        voice_id    TEXT PRIMARY KEY,
+        data_uri    TEXT NOT NULL DEFAULT '',  -- data:audio/...;base64,...
+        created_at  TEXT NOT NULL DEFAULT ''
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS delivery (
         delivery_id      TEXT PRIMARY KEY,
@@ -209,7 +218,8 @@ SCHEMA: Tuple[str, ...] = (
         detail       TEXT NOT NULL DEFAULT '',
         handshake_ok INTEGER,                 -- 1/0/NULL（NULL = 还没上报）
         style_fixed  INTEGER,                 -- 1/0/NULL
-        updated_at   TEXT NOT NULL DEFAULT ''
+        updated_at   TEXT NOT NULL DEFAULT '',
+        avatar       TEXT NOT NULL DEFAULT '' -- Bot 头像 data URI（各实例自报）
     )
     """,
     # ── 轮次（turn）—— 调度计划与 seed 的存档 ─────────────────────────
@@ -235,6 +245,17 @@ SCHEMA: Tuple[str, ...] = (
 MIGRATIONS: Dict[str, Dict[str, str]] = {
     "message": {
         "quote": "TEXT NOT NULL DEFAULT ''",
+        # ⚠️ 表情包图片 data URI（2026-11-28）：Bot 回复表情包时，
+        #    processed_plain_text 只有情感标签 ⇒ 另存图片让前端画出来。
+        "emoji_data": "TEXT NOT NULL DEFAULT ''",
+        # ⚠️ 语音附件 id（2026-11-28）：音频本体存 voice_blob 表，按需 API 取，
+        #    timeline 只带这个 id（不能把音频塞进 bootstrap）。
+        "voice_id": "TEXT NOT NULL DEFAULT ''",
+    },
+    "bot_status": {
+        # ⚠️ Bot 头像 data URI（2026-11-28）：各 Bot 实例把自己的头像写进共享账本，
+        #    中控 bootstrap 读全部 ⇒ 前端能看到二号头像（一号读不到二号的磁盘文件）。
+        "avatar": "TEXT NOT NULL DEFAULT ''",
     },
     "delivery": {
         "group_id": "TEXT NOT NULL DEFAULT ''",
@@ -1378,6 +1399,7 @@ class ChatroomLedger:
         detail: str = "",
         handshake_ok: Optional[bool] = None,
         style_fixed: Optional[bool] = None,
+        avatar: str = "",
     ) -> None:
         """登记**本实例**的接入状态。
 
@@ -1387,15 +1409,17 @@ class ChatroomLedger:
         with self.write() as conn:
             conn.execute(
                 "INSERT INTO bot_status(bot_id, name, status, detail, handshake_ok,"
-                " style_fixed, updated_at) VALUES (?,?,?,?,?,?,?)"
+                " style_fixed, updated_at, avatar) VALUES (?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(bot_id) DO UPDATE SET name=excluded.name, status=excluded.status,"
                 " detail=excluded.detail, handshake_ok=excluded.handshake_ok,"
-                " style_fixed=excluded.style_fixed, updated_at=excluded.updated_at",
+                " style_fixed=excluded.style_fixed, updated_at=excluded.updated_at,"
+                # ⚠️ 传空 avatar **不覆盖**已有值（本次没读到头像≠用户删了头像）
+                " avatar=CASE WHEN excluded.avatar='' THEN bot_status.avatar ELSE excluded.avatar END",
                 (
                     str(bot_id), str(name), str(status), str(detail),
                     None if handshake_ok is None else int(bool(handshake_ok)),
                     None if style_fixed is None else int(bool(style_fixed)),
-                    _now(),
+                    _now(), str(avatar or ""),
                 ),
             )
 
@@ -1760,6 +1784,36 @@ class ChatroomLedger:
 
     # ── 消息（S6 回读落库）───────────────────────────────────────────
 
+    def save_voice(self, voice_id: str, data_uri: str) -> bool:
+        """存一份语音音频（按 id 去重）。返回 True = 新增。"""
+        if not voice_id or not data_uri:
+            return False
+        with self.write() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO voice_blob(voice_id, data_uri, created_at)"
+                " VALUES (?,?,?)",
+                (str(voice_id), str(data_uri), _now()),
+            )
+        return bool(cur.rowcount)
+
+    def get_voice(self, voice_id: str) -> Optional[str]:
+        """按需取语音 data URI（前端点播放时才调，不进 bootstrap）。"""
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT data_uri FROM voice_blob WHERE voice_id = ?", (str(voice_id),)
+            ).fetchone()
+        return str(row["data_uri"]) if row else None
+
+    def attach_voice(self, message_id: str, voice_id: str) -> None:
+        """把语音 id 挂到一条消息上（声音本体在 voice_blob 表）。"""
+        if not message_id or not voice_id:
+            return
+        with self.write() as conn:
+            conn.execute(
+                "UPDATE message SET voice_id = ? WHERE message_id = ?",
+                (str(voice_id), str(message_id)),
+            )
+
     def append_message(self, message: Dict[str, Any]) -> bool:
         """追加一条消息行。**按 message_id 去重**（同一群消息只收一次）。
 
@@ -1775,10 +1829,11 @@ class ChatroomLedger:
         segment_id = str(message.get("segment_id") or "")
         room_id = str(message.get("room_id") or "")
         with self.write() as conn:
+            emoji_data = str(message.get("emoji_data") or "")
             cur = conn.execute(
                 "INSERT OR IGNORE INTO message(message_id, segment_id, room_id,"
-                " speaker_member_id, speaker_name, kind, content, quote, created_at, voided)"
-                " VALUES (?,?,?,?,?,?,?,?,?,0)",
+                " speaker_member_id, speaker_name, kind, content, quote, emoji_data,"
+                " created_at, voided) VALUES (?,?,?,?,?,?,?,?,?,?,0)",
                 (
                     message_id,
                     segment_id,
@@ -1788,17 +1843,21 @@ class ChatroomLedger:
                     str(message.get("kind") or "line"),
                     str(message.get("content") or ""),
                     str(message.get("quote") or ""),
+                    emoji_data,
                     str(message.get("created_at") or ""),
                 ),
             )
             if cur.rowcount:
                 return True
-            # 已收过 ⇒ 更新归属（自愈）+ 补写 quote（引用信息是后加的字段）
+            # 已收过 ⇒ 更新归属（自愈）+ 补写 quote / emoji_data（后加的字段）
             conn.execute(
                 "UPDATE message SET segment_id = ?, room_id = ?,"
-                " quote = CASE WHEN ? != '' THEN ? ELSE quote END WHERE message_id = ?",
+                " quote = CASE WHEN ? != '' THEN ? ELSE quote END,"
+                " emoji_data = CASE WHEN ? != '' THEN ? ELSE emoji_data END"
+                " WHERE message_id = ?",
                 (segment_id, room_id,
-                 str(message.get("quote") or ""), str(message.get("quote") or ""), message_id),
+                 str(message.get("quote") or ""), str(message.get("quote") or ""),
+                 emoji_data, emoji_data, message_id),
             )
             return False
 
@@ -1833,6 +1892,9 @@ class ChatroomLedger:
                             "kind": m.get("kind") or "line",
                             "content": m.get("content") or "",
                             "quote": m.get("quote") or "",
+                            # ⚠️ 表情包图片（2026-11-28）：前端据此渲染图片而非情感标签
+                            "emoji_data": m.get("emoji_data") or "",
+                            "voice_id": m.get("voice_id") or "",
                             "time": str(m.get("created_at") or "")[-8:-3],
                         }
                         for m in grouped.get(segment_id, [])

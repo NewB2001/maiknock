@@ -401,3 +401,25 @@ class ChatroomApiMixin:
         """
         return await self._svc_call("shell_submit_private", peer_member_id, lines=lines, script=script)
 
+    @API(
+        "shell_voice",
+        description="按需取一条消息的语音音频（点播放时才调，不进 bootstrap）",
+        version="1",
+    )
+    async def shell_voice(self, voice_id: str) -> Dict[str, Any]:
+        """取语音 data URI（2026-11-28）。
+
+        ⚠️ 音频本体存 voice_blob 表、timeline 只带 voice_id ⇒ 页面点播放时才调这里，
+        再大的语音也不会撑爆 bootstrap（512 KiB 上限）。
+        """
+        ledger = getattr(self, "_chatroom_ledger", None)
+        if ledger is None:
+            return {"ok": False, "error": "账本未开"}
+        try:
+            data_uri = await ledger.run(ledger.get_voice, voice_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        if not data_uri:
+            return {"ok": False, "error": "没有这条语音"}
+        return {"ok": True, "data_uri": data_uri}
+
