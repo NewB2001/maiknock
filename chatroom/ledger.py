@@ -1091,6 +1091,15 @@ class ChatroomLedger:
 
     # ── 投递任务 ────────────────────────────────────────────────────────
 
+    def has_delivery_prefix(self, prefix: str) -> bool:
+        """是否存在以 ``prefix`` 开头的投递任务（幂等预检，避免 UNIQUE 冲突刷日志）。"""
+        with self.read() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM delivery WHERE delivery_id LIKE ? LIMIT 1",
+                (str(prefix) + "%",),
+            ).fetchone()
+        return row is not None
+
     def enqueue_delivery(
         self,
         delivery_id: str,

@@ -31,7 +31,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .identity import session_id_for_private
+from .identity import DEFAULT_PLATFORM, session_id_for_private, virtual_group_id
 
 _log = logging.getLogger("plugin.maiknock.webui_companion")
 
@@ -40,6 +40,13 @@ USER_ACCOUNT_PREFIX = "user."
 
 #: Bot 的账号前缀（`bot.<bot_id>`）
 BOT_ACCOUNT_PREFIX = "bot."
+
+#: ⚠️ 「别的 Bot 的台词」账号前缀（`peer.<bot_id>`）——2026-11-28 串台修复：
+#:    collector 收到本 Bot 回复后，把回复广播给房间其他 Bot，让它们在自己的
+#:    群流里沉淀成历史消息（否则每个 Bot 永远只看得见自己说的话）。
+#:    用独立前缀而非 bot./user.，让它**不被当成本 Bot 的回复认领**，
+#:    但前端能认出来显示成群友台词。
+PEER_ACCOUNT_PREFIX = "peer."
 
 #: ⚠️ **宿主给「Bot 自己发的消息」用的账号是字面量 ``self``**（不是 ``bot.<id>``）
 #:    —— 实测（2026-11-26）：一号在群里的回复 ``user_id='self'``、``account_id='self'``、
@@ -51,8 +58,9 @@ def classify_message(message: Dict[str, Any]) -> Tuple[str, str, str]:
     """认一条消息 ⇒ (类别, 账号, 昵称)。
 
     类别：
-    - ``bot``    —— Bot 的回复（账号以 ``bot.`` 开头）
+    - ``bot``    —— 本 Bot 的回复（``self`` / 账号以 ``bot.`` 开头）
     - ``user``  —— 我方角色（账号以 ``user.`` 开头）
+    - ``peer``  —— **别的 Bot 的台词**（账号以 ``peer.`` 开头，广播来的历史消息）
     - ``other`` —— 其它（旁白、未知来源）
     """
     info = message.get("message_info") if isinstance(message.get("message_info"), dict) else {}
@@ -63,6 +71,8 @@ def classify_message(message: Dict[str, Any]) -> Tuple[str, str, str]:
         return "bot", account, nickname
     if account.startswith(USER_ACCOUNT_PREFIX):
         return "user", account, nickname
+    if account.startswith(PEER_ACCOUNT_PREFIX):
+        return "peer", account, nickname
     return "other", account, nickname
 
 
@@ -137,6 +147,101 @@ class ReplyCollector:
     def set_sessions(self, sessions: Dict[str, str]) -> None:
         """更新要采的群流（房间会增删 ⇒ 要能变）。"""
         self._sessions = dict(sessions or {})
+
+    async def _broadcast_peer_reply(
+        self, *, room_id: str, message_id: str, text: str, nickname: str
+    ) -> int:
+        """把**本 Bot 的回复**广播给房间里的其他 Bot（2026-11-28 串台修复）。
+
+        ⚠️ **为什么需要**：每个 Bot 实例只有自己群流的副本——小樱回的话只进
+        小樱实例的库，雏田实例的库里永远没有 ⇒ 雏田的 Planner **永远**
+        看不见小樱说过什么（不是「同轮并行看不见」，是历史也完全没有）。
+        ⇒ 收到回复后，往账本给其他 Bot 各排一条**纯历史投递**，
+        由目标 Bot 自己的 worker 用自己的 gateway 投进它自己的群流，
+        沉淀成 `user_id=peer.<bot_id>` 的历史消息（Planner 下次就能读到）。
+
+        ⚠️ 用 `peer.` 前缀（不是 bot./self）⇒ 对方的 collector 认成 peer 类，
+        **不会当自己的回复认领**（不推进波次/不标 collected）。
+        ⚠️ delivery_id 由 message_id + target_bot_id 拼成固定值 ⇒ 幂等，
+        重复 poll 不会重复广播。
+        """
+        if not room_id or not message_id or not text:
+            return 0
+        # ⚠️ 幂等**先查再写**：重复 poll 不该靠 UNIQUE 冲突兜底——
+        #    那会在每次重复时打一条 IntegrityError warning（刷屏）。
+        try:
+            already = await self._ledger.run(
+                lambda: self._ledger.has_delivery_prefix(f"peer_{message_id}_")
+            )
+            if already:
+                return 0
+        except Exception:  # noqa: BLE001
+            pass   # 没这个接口就退回 UNIQUE 兜底（老版本兼容）
+
+        def _do() -> int:
+            room = self._ledger.get_room(room_id) or {}
+            members = self._ledger.list_room_members(room_id) or []
+            peers = [
+                m for m in members
+                if str(m.get("kind") or "") == "bot"
+                and str(m.get("bot_id") or "") != self._bot_id
+                and str(m.get("bot_id") or "")
+            ]
+            if not peers:
+                return 0
+            group_id = str(room.get("group_id") or "") or virtual_group_id(room_id)
+            seq = self._ledger.next_delivery_seq()
+            sender_account = f"{PEER_ACCOUNT_PREFIX}{self._bot_id}"
+            count = 0
+            for peer in peers:
+                target = str(peer.get("bot_id") or "")
+                delivery_id = f"peer_{message_id}_{target}"
+                self._ledger.enqueue_delivery(
+                    delivery_id=delivery_id,
+                    target_bot_id=target,
+                    content=text,
+                    room_id=room_id,
+                    segment_id="",
+                    sender_member_id=str(peer.get("member_id") or ""),
+                    sender_platform=DEFAULT_PLATFORM,
+                    sender_account=sender_account,
+                    sender_nickname=str(nickname or ""),
+                    group_id=group_id,
+                    group_name=str(room.get("name") or ""),
+                    seq=seq,
+                    turn_id="",   # 不参与接话门控/回复采集，只是历史消息
+                    wave=0,
+                )
+                seq += 1
+                count += 1
+            # ⚠️ 账本只写**一条**（共享账本/前端时间线只显示一份）——
+            #    按 message_id 去重，重复 poll 不会重复显示。
+            #    gateway 投递给每个 Bot 是各自实例群流的事（Planner 历史）。
+            if count:
+                self._ledger.append_message({
+                    "message_id": f"peer_msg_{message_id}",
+                    "segment_id": "",
+                    "room_id": room_id,
+                    "speaker_member_id": sender_account,
+                    "speaker_name": str(nickname or ""),
+                    "kind": "peer",
+                    "content": text,
+                    "quote": "",
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            return count
+
+        try:
+            count = await self._ledger.run(_do)
+            if count:
+                self._log.info(
+                    "[聊天室] 已广播对方台词给 %d 个 Bot（room=%s，%s：%s）",
+                    count, room_id, nickname, text[:30],
+                )
+            return count
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("[聊天室] 广播对方台词失败（room=%s）：%r", room_id, exc)
+            return 0
 
     async def _fetch(self, session_id: str) -> List[Dict[str, Any]]:
         """读一条群流的最近消息（**直连能力**，绕开 SDK 那层不带 hours 的封装）。
@@ -273,6 +378,27 @@ class ReplyCollector:
                 if message_text(message) == "（剧情时间已更新）":
                     continue
                 kind, account, nickname = classify_message(message)
+                # ⚠️ **别的 Bot 的台词（peer.）**：只写账本给前端显示，**不当回复认领**
+                #    （不找归属投递/不标 collected/不接力）——否则会污染波次门控。
+                if kind == "peer":
+                    peer_id = str(message.get("message_id") or "")
+                    peer_text = message_text(message)
+                    if peer_id and peer_text:
+                        await self._ledger.run(
+                            self._ledger.append_message,
+                            {
+                                "message_id": peer_id,
+                                "segment_id": "",
+                                "room_id": room_id,
+                                "speaker_member_id": account,
+                                "speaker_name": nickname or account,
+                                "kind": "peer",
+                                "content": peer_text,
+                                "quote": "",
+                                "created_at": message_time(message),
+                            },
+                        )
+                    continue
                 if kind != "bot":
                     continue        # 只收 Bot 的回复（我方角色的话是"递出去"的，不回读）
                 message_id = str(message.get("message_id") or "")
@@ -358,6 +484,15 @@ class ReplyCollector:
                                 "[聊天室] 已接力给后续波次（轮=%s，本波=%d，影响 %d 条）：%s",
                                 turn_id[:16], wave, relayed, text[:30],
                             )
+                    # ⚠️ **广播给房间其他 Bot**（2026-11-28 串台修复）：
+                    #    让对方实例也把这句台词收进自己的群流 ⇒ 它的 Planner
+                    #    以后能看见「春野樱说过什么」。用 peer. 账号 ⇒ 对方 collector
+                    #    不会当自己的回复认领；turn_id="" ⇒ 不参与接话/波次。
+                    #    失败只记日志，不影响本条回复的正常回收。
+                    await self._broadcast_peer_reply(
+                        room_id=room_id, message_id=message_id,
+                        text=text, nickname=nickname or member_id,
+                    )
                     # ── 精确标记这一条投递为已收回 ──
                     # ⚠️⚠️ **原来是「本 Bot 收到任何回复就把所有 delivered 都标 collected」
                     #    ⇒ 会在 Bot 还没真回复时**提前推进波次门控**（实测踩过：

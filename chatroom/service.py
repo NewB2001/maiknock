@@ -148,12 +148,28 @@ class ChatroomService:
         if state:
             self._rooms = list(state.get("rooms") or [])
             self._members = {str(m.get("member_id")): dict(m) for m in (state.get("members") or [])}
+            # ⚠️ 账号迁移（2026-11-27）：旧代码建的自建角色（如「井野」）没写
+            #    platform/account，已持久化在账本里 ⇒ 重载后依然坏，发言报
+            #    「平台身份缺失」。恢复时按 member_id 补账号（稳定，不裂名片），
+            #    并回写账本，让所有实例都拿到同一份修复。
+            fixed = False
+            for mid, member in self._members.items():
+                if member.get("kind") == "user_role" and not str(member.get("account") or "").strip():
+                    member["platform"] = DEFAULT_PLATFORM
+                    member["account"] = account_of(mid)
+                    fixed = True
             self._my_role_order = list(state.get("my_role_order") or [])
             self._peer_order = list(state.get("peer_order") or [])
             # 「最近使用的角色」存在 meta 表（save_state 碰不到它）
             self._last_used_role = str(
                 await self._alread(ledger.get_meta, "last_used_role") or ""
             )
+            if fixed:
+                await self.persist_state()   # 回写账本，修一次永久生效
+                _log.info("[聊天室] 已为 %s 个旧自建角色补齐平台身份", sum(
+                    1 for m in self._members.values()
+                    if m.get("kind") == "user_role" and str(m.get("account") or "").startswith("user.custom")
+                ))
             return True
         # ⚠️ 第一次写账本（迁移）必须在「按真实名单清理完假 Bot」**之后**做
         #    —— 否则账本里会存下一份带假 Bot 的出厂数据。
@@ -700,6 +716,12 @@ class ChatroomService:
             "avatar": (avatar or "").strip() or "🧑",
             "editable": True,
             "custom": True,
+            # ⚠️ 平台身份（2026-11-27 修复）：「我的角色」面板新建走这条路，
+            #    不是 shell_create_member（上一条路已修）。漏了这两项 ⇒ 私聊发言
+            #    报「发言角色没有账号（平台身份缺失）」。与预置口径一致：
+            #    account = user.custom_001（account_of(member_id)），member_id 稳定不裂名片。
+            "platform": DEFAULT_PLATFORM,
+            "account": account_of(member_id),
         }
         self._members[member_id] = member
         self._my_role_order.append(member_id)

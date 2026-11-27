@@ -77,33 +77,73 @@ def test_planning() -> None:
     check("分波是合法划分（每人恰好一次）", ok_partition)
     check("确实出现过『波内多人』（并行成分）", saw_multi)
 
-    print("== 4b. ★ 权重随机（2026-11-27 拍板：合流 50 / 并行 30 / 串行 20）==")
+    print("== 4b. ★ 人数分支概率（2026-11-28 重新拍板）==")
     import collections
-    dist = collections.Counter()
-    for seed in range(1000):
-        dist[formation.plan_formation(seed, ["a", "b"]).formation] += 1
-    check("复合占大头（40%~60%）", 400 <= dist["composite"] <= 600, f"实际 {dict(dist)}")
-    check("并行居中（20%~40%）", 200 <= dist["parallel"] <= 400, f"实际 {dict(dist)}")
-    check("串行最小（10%~30%）", 100 <= dist["serial"] <= 300, f"实际 {dict(dist)}")
-    check("复合 > 并行 > 串行",
-          dist["composite"] > dist["parallel"] > dist["serial"], f"实际 {dict(dist)}")
-
-    print("== 4c. ★ 两 Bot 复合恒 1 波（不退化成串行）==")
-    two_bot_comp = [
-        formation.plan_formation(s, ["a", "b"], formation="composite")
-        for s in range(30)
-    ]
-    check("30 个 seed 全是单波（真并行）", all(p.wave_count == 1 for p in two_bot_comp),
-          f"实际波数 {[p.wave_count for p in two_bot_comp[:10]]}")
-    # 名义权重 20% 串行 + 复合不再退化 ⇒ 「实际逐个接话」应≈20%
-    stepwise = sum(
-        1 for s in range(1000)
-        if (lambda p: p.formation == "serial" or
-            (p.formation == "composite" and p.wave_count == 2))(
-                formation.plan_formation(s, ["a", "b"]))
+    # 2 Bot：并行/串行各 50%，**没有复合**
+    dist2 = collections.Counter(
+        formation.plan_formation(seed, ["a", "b"]).formation for seed in range(1000)
     )
-    check("★ 逐个接话占比降到 ~20%（原 ~50%）", 150 <= stepwise <= 300,
-          f"实际 {stepwise}/1000")
+    check("2 Bot 无复合", dist2["composite"] == 0, f"实际 {dict(dist2)}")
+    check("2 Bot 并行/串行各 ~50%",
+          430 <= dist2["parallel"] <= 570 and 430 <= dist2["serial"] <= 570,
+          f"实际 {dict(dist2)}")
+    # >=3 Bot：三选一等概率
+    dist3 = collections.Counter(
+        formation.plan_formation(seed, ["a", "b", "c"]).formation for seed in range(3000)
+    )
+    check("3 Bot 三阵型各 ~1/3",
+          all(900 <= dist3[k] <= 1100 for k in ("parallel", "serial", "composite")),
+          f"实际 {dict(dist3)}")
+
+    print("== 4c. ★ 1 Bot 防呆：直接发言，不抽阵型 ==")
+    one = formation.plan_formation(123, ["a"])
+    check("1 Bot 一波一人", one.waves == [["a"]] and one.formation == "parallel",
+          f"实际 {one.waves} {one.formation}")
+
+    print("== 4c2. ★ 新复合算法：只挪 1、不动 2 / 允许多个并行波 / 串行可落单 ==")
+    for size in (3, 4, 5, 6):
+        bots = [f"b{i}" for i in range(size)]
+        ok = True
+        detail = ""
+        for seed in range(300):
+            p = formation.plan_formation(seed, bots, formation="composite")
+            flat = [m for w in p.waves for m in w]
+            if sorted(flat) != sorted(bots):
+                ok = False; detail = f"seed={seed} 划分不合法 {p.waves}"; break
+            # 每个 len>=2 的波必须是「连续的并行组」；len==1 的波随便（可能是落单 1 或任意 2）
+            # 关键：不能出现「一个波里混着并行和串行」——本算法天然不会（同组连续才合并）。
+            # 还有一个硬约束：**至少有一个 len>=2 的波**（并行组>=2 且挪完后至少成一对）
+            big = [w for w in p.waves if len(w) >= 2]
+            if not big:
+                ok = False; detail = f"seed={seed} 没有并行波 {p.waves}"; break
+        check(f"{size} Bot 复合：划分合法+至少一个并行波", ok, detail or f"合法 300/300")
+
+    print("== 4c2b. ★ 用户给的两个例子（单趟扫描结果）==")
+    # 直接把 queue+groups 喂给内部逻辑验证：
+    #   1212122 → 1122122（B1+B3 并行，其余落单）
+    #   1122122 → 1122122（B1+B2 并行，B3~B7 落单）
+    # 这里用真实 split_into_waves 跑足够多 seed，确认「存在多个并行波」的形态
+    bots8 = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    multi_parallel_waves = 0
+    for seed in range(2000):
+        p = formation.plan_formation(seed, bots8, formation="composite")
+        if sum(1 for w in p.waves if len(w) >= 2) >= 2:
+            multi_parallel_waves += 1
+    check("★ 8 Bot 中存在『两个以上并行波』的形态", multi_parallel_waves > 100,
+          f"实际 {multi_parallel_waves}/2000")
+
+    print("== 4c3. ★ 复合里并行波位置不固定（头/尾/中间都出现）==")
+    bots = ["a", "b", "c", "d", "e", "f"]
+    head = mid = tail = 0
+    for seed in range(600):
+        p = formation.plan_formation(seed, bots, formation="composite")
+        big = [i for i, w in enumerate(p.waves) if len(w) >= 2]
+        if not big: continue
+        if 0 in big: head += 1
+        if len(p.waves) - 1 in big: tail += 1
+        if any(0 < i < len(p.waves) - 1 for i in big): mid += 1
+    check("并行波在头/中/尾都出现", head > 30 and mid > 30 and tail > 30,
+          f"头 {head} 中 {mid} 尾 {tail}")
 
     print("== 4d. ★ 5% 沉默掷骰（无勾选轮次；全中重掷）==")
     import random as _rnd
@@ -128,8 +168,9 @@ def test_planning() -> None:
     forms = [formation.plan_formation(s, ["a", "b"]).formation for s in seeds]
     from collections import Counter as _C
     dist2 = _C(forms)
-    check("★ 阵型分布仍 50/30/20（复合占大头）",
-          dist2["composite"] > dist2["parallel"] > dist2["serial"], f"实际 {dict(dist2)}")
+    check("★ 2 Bot 阵型只有并行/串行（无复合）",
+          dist2["composite"] == 0 and dist2["parallel"] > 0 and dist2["serial"] > 0,
+          f"实际 {dict(dist2)}")
 
     print("== 5. ★ 同一 seed 必得同一计划（可复现）==")
     a = formation.plan_formation(999, ["x", "y", "z"], formation="composite").to_dict()

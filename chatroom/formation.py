@@ -52,16 +52,11 @@ FORMATION_COMPOSITE = "composite"
 #: 全部阵型（随机时从中挑）
 ALL_FORMATIONS = (FORMATION_SERIAL, FORMATION_PARALLEL, FORMATION_COMPOSITE)
 
-#: ★ 随机权重（2026-11-27 用户拍板）：合流为主、并行次之、串行最小。
-#:    原因：等概率时「逐个接话」的实际占比≈50%（串行 1/3 + 复合在两 Bot 时
-#:    有一半概率随机切成每人一波 = 行为退化成串行）⇒ 第二个 Bot 总要等前面的
-#:    思考完（实测宿主单轮 planner+replyer 可达 3 分钟）。
-#:    改权重 + 两 Bot 复合恒 1 波后，「实际逐个接话」降到 ~20%。
-FORMATION_WEIGHTS: Dict[str, int] = {
-    FORMATION_COMPOSITE: 50,    # 串并合流（主流）
-    FORMATION_PARALLEL: 30,     # 并行
-    FORMATION_SERIAL: 20,       # 随机串行（最小）
-}
+#: ★ 阵型概率（2026-11-28 用户重新拍板，**取代旧的 50/30/20 权重**）：
+#:    - 2 个 Bot：并行 50% / 随机串行 50%（**没有复合**——两人复合无意义）；
+#:    - ≥3 个 Bot：并行 / 随机串行 / 随机复合 **等概率 1/3**。
+#:    ⚠️ 不再用 rng.choices 的权重表：按人数分支更直接，也更贴合用户口径。
+FORMATION_WEIGHTS: Dict[str, int] = {}   # 兼容旧引用；实际概率见 pick_formation(n=)
 
 #: 阵型的中文标签（给日志与调试面板看；**界面上不出现阵型选项**）
 FORMATION_LABELS = {
@@ -128,19 +123,28 @@ class FormationPlan:
         )
 
 
-def pick_formation(rng: random.Random) -> str:
-    """按权重随机挑一个阵型（2026-11-27 用户拍板）。
+def pick_formation(rng: random.Random, bot_count: int = 0) -> str:
+    """按**人数**随机挑阵型（2026-11-28 用户重新拍板）。
 
-    ★ 不再等概率 —— 用户要求「串并合流为主、并行次之、随机串行最小」
-    （串行让后答 Bot 干等，体感很慢）。权重见 ``FORMATION_WEIGHTS``：
-    复合 50% / 并行 30% / 串行 20%。
+    - ``bot_count == 2`` → 并行 / 随机串行 **各 50%**（无复合）；
+    - ``bot_count >= 3`` → 并行 / 随机串行 / 随机复合 **各 1/3**；
+    - ``bot_count <= 1`` → 直接给 ``parallel``（单 Bot 一波，等价单人发言）。
 
-    ⚠️ 用 ``rng.choices`` 而不是手写累计概率：同一 seed 仍必得同一结果
-    （``random.Random`` 的采样序列可复现），FR-05 / FR-14 的重演契约不破。
+    ⚠️ 用 ``rng.random()`` 一次掷骰 ⇒ 同一 seed 必得同一结果（FR-05 可复现）。
+    ⚠️ 旧版 50/30/20 权重已作废（见 09 开发进度）。
     """
-    names = list(FORMATION_WEIGHTS)
-    weights = [FORMATION_WEIGHTS[n] for n in names]
-    return rng.choices(names, weights=weights, k=1)[0]
+    n = int(bot_count or 0)
+    if n <= 1:
+        return FORMATION_PARALLEL
+    if n == 2:
+        return FORMATION_PARALLEL if rng.random() < 0.5 else FORMATION_SERIAL
+    # n >= 3：三选一等概率
+    roll = rng.random()
+    if roll < 1.0 / 3.0:
+        return FORMATION_PARALLEL
+    if roll < 2.0 / 3.0:
+        return FORMATION_SERIAL
+    return FORMATION_COMPOSITE
 
 
 #: 无勾选轮次里，单个 Bot「这轮不发言」的概率（2026-11-27 用户拍板 5%）
@@ -176,31 +180,71 @@ def apply_silence_roll(
 
 
 def split_into_waves(rng: random.Random, speakers: Sequence[str]) -> List[List[str]]:
-    """把接话者随机分波（**复合阵型**用）。
+    """**随机复合**的分波（2026-11-28 用户重新拍板的完整算法）。
 
-    ⚠️ 分波是**随机切分**：洗牌后随机决定波数（1..n），再切成若干段。
-    ⇒ 会出现「Bot1+Bot2 并行，Bot3 在后面串行」这种形态。
+    ⚠️ 新算法（跟旧的「随机切点」完全不同）：
+      1. 每个 Bot 随机进**并行组(1)** 或 **串行组(2)**，各 50%；
+         约束：**并行组 >= 2 且 < 总数**（否则不是真正的复合）——
+         **纯重掷**直到合法，**不加次数上限**（n>=3 时合法解必存在，
+         期望重掷 <= 2.7 次，性能可忽略；也没有针对特定人数的特判）。
+      2. 随机打乱队列；
+      3. 从左到右遍历：当前位置的元素往后找**同类**，用**相邻交换**挪到紧邻
+         位置，处理完再走下一个 ⇒「按首次出现顺序聚同组」
+         （谁在队列第一位，谁的组就整体聚到前面）；
+      4. 切波：并行组 = **一波**（波内并行、互相不感知本轮发言）；
+         串行组 = **每人一波**（后者看得见前面所有波的本轮发言）。
+
+    ⚠️ 入参 n<=2 不该走到这里（plan_formation 已拦）；n<3 直接返回每人一波兜底。
     """
-    items = list(speakers)
-    if not items:
+    items = [str(x) for x in speakers if str(x)]
+    n = len(items)
+    if n == 0:
         return []
-    if len(items) == 1:
+    if n == 1:
         return [[items[0]]]
-    # ★ 两 Bot 时恒 1 波（2026-11-27 用户拍板）：
-    #    原来的 randint(1,2) 有一半概率切成每人一波 ⇒ 行为跟纯串行完全一样，
-    #    导致「名义复合 33% + 退化一半 = 实际逐个接话 50%」的体感。
-    #    两 Bot 就两个，合流 = 一起说，分波没有中间形态。
-    if len(items) == 2:
+    if n == 2:
+        # 兜底：真复合不会传两个进来；万一传了，就两人并行（不退化成串行）
         return [items]
+
+    # ① 随机分组：并行组(1) 至少 2 个、且不能全员（< n）——纯重掷，无上限
+    while True:
+        groups = {m: (1 if rng.random() < 0.5 else 2) for m in items}
+        parallel_count = sum(1 for g in groups.values() if g == 1)
+        if 2 <= parallel_count < n:
+            break
+
+    # ② 随机打乱队列
     rng.shuffle(items)
-    wave_count = rng.randint(1, len(items))
-    # 随机切点（保证每波至少一个）
-    cuts = sorted(rng.sample(range(1, len(items)), wave_count - 1)) if wave_count > 1 else []
+
+    # ③ 单趟扫描（2026-11-28 用户重定义）：**只挪并行组(1)，不动串行组(2)**。
+    #    从左到右看每个 1：已经和同类相邻 ⇒ 跳过；落单 ⇒ 往后找最近的同类，
+    #    用相邻交换把它挪到紧邻位置。往后找不到 ⇒ **留它单独一波**
+    #    （用户拍板：串行组允许单个 Bot 独自一波，落单的 1 等同串行，不重掷不往前找）。
+    #    ⚠️ 单趟即止，**不做全局聚拢** ⇒ 会出现多个并行波（如 12121212 → 有两个并行波）。
+    for i in range(len(items)):
+        if groups[items[i]] != 1:
+            continue
+        has_left = i > 0 and groups[items[i - 1]] == 1
+        has_right = i + 1 < len(items) and groups[items[i + 1]] == 1
+        if has_left or has_right:
+            continue
+        # 落单 ⇒ 往后找最近的同类 1，相邻交换挪到 i+1
+        for j in range(i + 2, len(items)):
+            if groups[items[j]] == 1:
+                while j > i + 1:
+                    items[j], items[j - 1] = items[j - 1], items[j]
+                    j -= 1
+                break
+        # 找不到同类 ⇒ 保持原样（单独一波，等同串行）
+
+    # ④ 切波：**连续的 1 合成一个并行波**；其余（单个 1 或任意 2）各自一波。
+    #    ⚠️ 2 即使相邻也不合并（用户拍板：串行组允许单个 Bot 独自一波）。
     waves: List[List[str]] = []
-    prev = 0
-    for cut in list(cuts) + [len(items)]:
-        waves.append(items[prev:cut])
-        prev = cut
+    for member in items:
+        if groups[member] == 1 and waves and groups[waves[-1][0]] == 1:
+            waves[-1].append(member)      # 连续并行组 → 一波
+        else:
+            waves.append([member])        # 单个 1 落单 / 任意 2 → 独自一波
     return [w for w in waves if w]
 
 
@@ -235,8 +279,9 @@ def plan_formation(
             named=list(named_ids),
         )
 
-    # ② 随机轮次
-    chosen = formation or pick_formation(rng)
+    # ② 随机轮次 —— 按**在场人数**选阵型（2 Bot 二选一；>=3 三选一）
+    #    ⚠️ 显式指定 formation 的调用（测试/重演）仍然尊重指定值。
+    chosen = formation or pick_formation(rng, len(candidates))
     if chosen == FORMATION_PARALLEL:
         speakers = list(candidates)
         waves = [list(speakers)] if speakers else []

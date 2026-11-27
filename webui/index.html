@@ -1203,6 +1203,13 @@
     lastTurn: null,
     privateTurn: null,
     privateLastTurn: null,
+    // ⚠️ 异常/超时后的「持续锁定」（2026-11-28 用户拍板）：
+    //    意外中断（Bot 缺人/上游错误）⇒ 提示点「回到此处」重试；
+    //    超时（思考慢）⇒ 提示仍是「等待中」，让用户自己查聊天流/日志。
+    //    两者都**保持发送窗口禁用**，直到用户点「回到此处」截断剧情（=重试入口）。
+    //    按归属存（房间 / 私聊对），不影响其他房间/角色继续发。
+    turnLock: null,          // { room_id, kind: "interrupted"|"timeout", note }
+    privateTurnLock: null,   // { peer_member_id, my_member_id, kind, note }
     turnToken: 0,
     privateTurnToken: 0,
     elapsedTimer: null,
@@ -2558,6 +2565,11 @@
       state.truncateTarget = null;
     }
     state.stageNote = { scope: scope, seq: seq };
+    // ⚠️ 点「回到此处」= 用户主动重试入口 ⇒ 清掉对应窗口的异常/超时锁定
+    //    （2026-11-28 用户拍板：剧情截断重来后，才允许继续发送新消息）。
+    if (scope === "group") { state.turnLock = null; }
+    else { state.privateTurnLock = null; }
+    updateSubmitButtons();
     if (!state.memoryNoticeShown) {
       state.memoryNoticeShown = true;
       showMemoryNotice();
@@ -2815,7 +2827,7 @@
   }
   function renderTimeline(keepScroll) {
     var box = $("timeline");
-    var saved = keepScroll ? box.scrollTop : null;
+    var saved = savedScrollTop(box, keepScroll);
     box.innerHTML = "";
     var room = currentRoom();
     // 顶栏标题直接显示房间名，不加「群聊 ·」前缀（视图本身已经说明了当前模式）
@@ -2967,7 +2979,11 @@
   function messageRow(message, merged) {
     var member = memberById(message.speaker_member_id);
     var isNarrator = message.speaker_kind === "narrator" || message.kind === "narrator";
-    var isBot = isNarrator ? false : (member ? member.kind === "bot" : message.speaker_kind === "bot");
+    // ⚠️ peer. 前缀 = 别的 Bot 的台词（广播来的）——按 Bot 侧显示，不能当「我方」
+    var isPeer = message.kind === "peer"
+      || String(message.speaker_member_id || "").indexOf("peer.") === 0;
+    var isBot = isNarrator ? false
+      : (isPeer ? true : (member ? member.kind === "bot" : message.speaker_kind === "bot"));
     var isMine = !isBot && !isNarrator;
 
     var row = document.createElement("div");
@@ -3056,9 +3072,25 @@
     box.scrollTop = box.scrollHeight;
   }
 
+  // ⚠️ 用户在看老剧情吗？（2026-11-28 用户拍板修复）
+  //    判定：距底部超过 80px 就算「正在回顾」——后台轮询重绘时必须保住位置，
+  //    不能再无条件 scrollToBottom 把人拽回最新消息（8s 一次，非常烦人）。
+  //    在底部附近（≤80px）才跟随新消息滚到底，符合聊天软件惯例。
+  function userScrollingBack(box) {
+    if (!box) { return false; }
+    return (box.scrollHeight - box.scrollTop - box.clientHeight) > 80;
+  }
+
+  // 重绘前的滚动位置：keepScroll 显式要求 或 用户正在回顾老剧情 ⇒ 保住；
+  // 否则 null ⇒ 末尾会 scrollToBottom（正常跟随新消息）。
+  function savedScrollTop(box, keepScroll) {
+    if (!box) { return null; }
+    return (keepScroll || userScrollingBack(box)) ? box.scrollTop : null;
+  }
+
   function renderPrivate(keepScroll) {
     var box = $("private-timeline");
-    var saved = keepScroll ? box.scrollTop : null;
+    var saved = savedScrollTop(box, keepScroll);
     box.innerHTML = "";
     // 标题按「对方 × 我方角色」拼，跟有没有线程无关。
     // 对方从受管 Bot / 成员池里找（私聊列表的数据源），不再依赖 state.peers。
@@ -3244,12 +3276,19 @@
   // 归属就是当前房间（群聊）或当前「对方 × 我的角色」这一对（私聊）。
   // 切到哪里，判据就跟着换：锁的是正在等的那个窗口，不是整个页面。
   function busyRoom() {
-    return state.turn && state.turn.room_id === state.currentRoomId ? state.turn : null;
+    var t = state.turn;
+    if (t && t.room_id === state.currentRoomId) { return t; }
+    // ⚠️ 异常/超时后的持续锁定也算「忙」⇒ 发送窗口一直禁用，直到回到此处重试。
+    var lock = state.turnLock;
+    return lock && lock.room_id === state.currentRoomId ? lock : null;
   }
   function busyPrivate() {
     var t = state.privateTurn;
-    return t && t.peer_member_id === state.currentPeerId
-      && t.my_member_id === state.privateSpeaker ? t : null;
+    if (t && t.peer_member_id === state.currentPeerId
+        && t.my_member_id === state.privateSpeaker) { return t; }
+    var lock = state.privateTurnLock;
+    return lock && lock.peer_member_id === state.currentPeerId
+      && lock.my_member_id === state.privateSpeaker ? lock : null;
   }
 
   // 「开演」「发送」在内容为空时直接禁用（不点就没提示）；
@@ -3520,8 +3559,19 @@
       });
       _stillMissing = (state.turn.expected || []).some(function (id) { return !_repliedLate[id]; });
     }
-    finishTurn(token, token !== state.turnToken ? null
-      : (_stillMissing ? "本轮接话已超时，部分角色未回复；晚到的回复仍会显示。" : "本轮接话已结束，可以开始下一幕。"));
+    if (token === state.turnToken && _stillMissing) {
+      // ⚠️ 缺人 ⇒ 中断/超时：设锁 + 对应提示，窗口保持禁用（用户拍板 2026-11-28）
+      var _aborted = hadUpstreamError();
+      state.turnLock = {
+        room_id: targetRoom,
+        kind: _aborted ? "interrupted" : "timeout",
+        note: _aborted ? groupAbortNote() : groupTimeoutNote()
+      };
+      finishTurn(token, state.turnLock.note);
+    } else {
+      state.turnLock = null;
+      finishTurn(token, token !== state.turnToken ? null : "本轮接话已结束，可以开始下一幕。");
+    }
   }
 
   /* ── 提交（私聊）──────────────────────────────────────── */
@@ -3577,8 +3627,18 @@
       });
       _missing = _expected.length > 0 && _expected.some(function (id) { return !_repliedLate[id]; });
     }
-    finishTurn(token, token !== state.turnToken ? null
-      : (_missing ? "本轮接话已超时，部分角色未回复；晚到的回复仍会显示。" : "本轮接话已结束，可以开始下一幕。"));
+    if (token === state.turnToken && _missing) {
+      var _aborted2 = hadUpstreamError();
+      state.turnLock = {
+        room_id: roomId,
+        kind: _aborted2 ? "interrupted" : "timeout",
+        note: _aborted2 ? groupAbortNote() : groupTimeoutNote()
+      };
+      finishTurn(token, state.turnLock.note);
+    } else {
+      state.turnLock = null;
+      finishTurn(token, token !== state.turnToken ? null : "本轮接话已结束，可以开始下一幕。");
+    }
   }
 
   async function submitPrivate() {
@@ -3773,6 +3833,27 @@
     window.maibot.action("clear_active_turn", { turn_id: turnId }).catch(function () {});
   }
 
+  // ⚠️ 异常/超时判定（2026-11-28 用户拍板）：
+  //    - 中断（Bot 缺人 / 上游错误）⇒ 提示点「回到此处」重试，并持续锁定该窗口；
+  //    - 超时（思考慢、没错误）⇒ 提示仍是「等待中…自己查聊天流/日志」，同样持续锁定。
+  //    两者都**不解锁**，直到用户点「回到此处」截断剧情（confirmTruncate 成功时清锁）。
+  function groupAbortNote() {
+    return "本轮异常中断，部分角色没有接话（剧情已残缺）。请点聊天流里对应幕的「回到此处」重试；在此之前不能发送新消息。";
+  }
+  function groupTimeoutNote() {
+    return "等待中——麦麦思考超时，尚未回复。请到聊天流或日志查找原因；也可点「回到此处」重试。";
+  }
+  function privateAbortNote() {
+    return "本轮异常中断，对方没有接话（剧情已残缺）。请点聊天流里对应幕的「回到此处」重试；在此之前不能发送新消息。";
+  }
+  function privateTimeoutNote() {
+    return "等待中——对方思考超时，尚未回复。请到聊天流或日志查找原因；也可点「回到此处」重试。";
+  }
+  // 有上游错误报告（429/5xx 等）⇒ 中断；否则 ⇒ 超时
+  function hadUpstreamError() {
+    return (state.errors || []).length > 0;
+  }
+
   function finishTurn(token, note) {
     if (token !== state.turnToken) { return; }
     if (state.turn) {
@@ -3824,10 +3905,15 @@
     // ⚠️ 收尾提示（㉞）：本轮结束/异常的说明要显示在状态条里 ——
     //    ㉜ 精简时把「说明」项删了，但那是常驻的「已递话，等麦麦接话……」，
     //    这里的收尾结论（正常/异常）是用户要的，必须露出来。
-    if (note) {
+    // ⚠️ 异常/超时锁定期间，即使无参重绘（切房间/重载）也要把提示留在状态条上。
+    var shownNote = note;
+    if (!shownNote && state.turnLock && state.turnLock.room_id === state.currentRoomId) {
+      shownNote = state.turnLock.note;
+    }
+    if (shownNote) {
       var noteNode = document.createElement("span");
       noteNode.className = "turn-note";
-      noteNode.textContent = note;
+      noteNode.textContent = shownNote;
       box.appendChild(noteNode);
     }
   }
@@ -3849,7 +3935,7 @@
       real: true
     };
     $("stop-private-turn").hidden = false;
-    renderPrivateTurnState("已发出，等麦麦回复……");
+    renderPrivateTurnState();   // 等待中只显示「已等待 X.Xs」（用户拍板 2026-11-27）
     state.privateElapsedTimer = setInterval(updatePrivateElapsed, 250);
     updateSubmitButtons();   // 开始等 ⇒ 锁住这一对的发送框
     // ⚠️ **封顶 300 秒**（原 160 秒）+ **2 秒一轮**（原 3 秒）：理由同群聊 pollRealBeat ——
@@ -3871,7 +3957,21 @@
       }
       await new Promise(function (resolve) { setTimeout(resolve, 2000); });
     }
-    finishPrivateTurn(token, token === state.privateTurnToken ? "本轮结束。" : null);
+    // ⚠️ 300s 封顶：没收到真回复 ⇒ 中断/超时（用户拍板 2026-11-28）
+    //    不再无脑报「已结束」——那会让用户在 Bot 缺人时误以为聊完了。
+    if (token === state.privateTurnToken && !hasRealReply) {
+      var _pAbort = hadUpstreamError();
+      state.privateTurnLock = {
+        peer_member_id: state.currentPeerId,
+        my_member_id: state.privateSpeaker,
+        kind: _pAbort ? "interrupted" : "timeout",
+        note: _pAbort ? privateAbortNote() : privateTimeoutNote()
+      };
+      finishPrivateTurn(token, state.privateTurnLock.note);
+    } else {
+      state.privateTurnLock = null;
+      finishPrivateTurn(token, token === state.privateTurnToken ? "本轮接话已结束，可以开始发送新消息。" : null);
+    }
   }
 
   function finishPrivateTurn(token, note) {
@@ -3883,7 +3983,7 @@
     state.privateTurn = null;
     if (state.privateElapsedTimer) { clearInterval(state.privateElapsedTimer); state.privateElapsedTimer = null; }
     $("stop-private-turn").hidden = true;
-    renderPrivateTurnState(note || "本轮结束。");
+    renderPrivateTurnState(note || "本轮接话已结束，可以开始发送新消息。");
     renderPrivatePeers(); // 刚聊过，把对方排到最上面
     updateSubmitButtons();   // 等完了 ⇒ 解锁这一对
   }
@@ -3910,12 +4010,29 @@
     box.innerHTML = "";
     state.privateElapsedNode = null;
     if (turn) {
-      addState(box, "对方", turn.peer_name);
-      addState(box, "seed", turn.seed);
-      state.privateElapsedNode = addState(box, "已等待",
-        (turn.final_elapsed !== undefined ? turn.final_elapsed : 0).toFixed(1) + "s");
+      // ⚠️ 2026-11-27 用户拍板精简：私聊等待中只留「已等待 X.Xs」——
+      //    对方 / seed / 常驻说明（「已发出，等麦麦回复……」）都撤掉。
+      //    seed 与对方仍完整存在账本里，排障能查，只是不占界面。
+      // ⚠️ 结束态（有 final_elapsed）改叫「本轮耗时」——都结束了还写「已等待」会误导
+      //    （2026-11-28 用户拍板）；等待中才叫「已等待」。
+      var _done = turn.final_elapsed !== undefined;
+      state.privateElapsedNode = addState(box, _done ? "本轮耗时" : "已等待",
+        (_done ? turn.final_elapsed : 0).toFixed(1) + "s");
     }
-    if (note) { addState(box, "说明", note); }
+    // ⚠️ 锁定期间无参重绘（切角色/重载）也要把提示留在状态条上
+    var shownNote = note;
+    if (!shownNote && state.privateTurnLock
+        && state.privateTurnLock.peer_member_id === state.currentPeerId
+        && state.privateTurnLock.my_member_id === state.privateSpeaker) {
+      shownNote = state.privateTurnLock.note;
+    }
+    if (shownNote) {
+      // 收尾结论用独立的 note 节点（不叫「说明」，跟群聊状态条一致）
+      var noteNode = document.createElement("span");
+      noteNode.className = "turn-note";
+      noteNode.textContent = shownNote;
+      box.appendChild(noteNode);
+    }
   }
 
   function updatePrivateElapsed() {
