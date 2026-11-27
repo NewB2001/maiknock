@@ -9,8 +9,11 @@
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import random
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .mock_data import (
@@ -31,10 +34,12 @@ from .mock_data import (
     _build_segment,
 )
 from .errorscan import describe_report
-from .hostinfo import read_bot_config, read_bots
-from .identity import DEFAULT_PLATFORM, session_id_for_private, virtual_group_id
+from .hostinfo import bot_working_dir, read_bot_config, read_bots
+from .identity import DEFAULT_PLATFORM, account_of, session_id_for_private, virtual_group_id
 from .roster import build_roster
-from . import export as export_mod, formation, narrator
+from . import export as export_mod, formation, forget, narrator
+
+_log = logging.getLogger("plugin.maiknock.webui_companion")
 
 # 聊天室子模块自己的版本号（插件总版本见 plugin.py 的 VERSION 常量）
 CHATROOM_VERSION = "0.1.0"
@@ -240,12 +245,17 @@ class ChatroomService:
         room_count = len(self._rooms)
         return formation.next_seed(counter, room_count)
 
-    async def _set_active_turn(self, turn_id: str, room_id: str, label: str) -> None:
+    async def _set_active_turn(
+        self, turn_id: str, room_id: str, label: str,
+        expected_bots: Optional[List[str]] = None, segment_id: str = "",
+    ) -> None:
         """记下「正在进行的轮次」快照（状态条跨 iframe 重建恢复用）。
 
         ⚠️ 为什么用账本 meta：插件页是 sandbox iframe（opaque origin），
         localStorage 不可用；宿主切走插件页再回来会**重建 iframe**
         （实测探针消失）⇒ 前端 state 全丢。只有账本能跨这个存活。
+        ⚠️ expected_bots/segment_id（2026-11-27）：恢复路径的收尾判定要用——
+        否则重载页面后「任意一条 reply 就算本轮结束」，把还没开口的 Bot 误判掉。
         """
         ledger = self._ledger()
         if ledger is None:
@@ -260,6 +270,8 @@ class ChatroomService:
                     "room_id": room_id,
                     "label": label,
                     "started_ms": int(time.time() * 1000),
+                    "expected_bots": [str(x) for x in (expected_bots or [])],
+                    "segment_id": str(segment_id or ""),
                 }, ensure_ascii=False),
             )
         except Exception:  # noqa: BLE001
@@ -297,6 +309,8 @@ class ChatroomService:
                 "room_id": str(snap.get("room_id") or ""),
                 "label": str(snap.get("label") or "等待接话"),
                 "started_ms": started,
+                "expected_bots": [str(x) for x in (snap.get("expected_bots") or [])],
+                "segment_id": str(snap.get("segment_id") or ""),
             }
         except Exception:  # noqa: BLE001
             return {}
@@ -892,27 +906,118 @@ class ChatroomService:
         }
 
     async def shell_delete_my_role(self, member_id: str) -> Dict[str, Any]:
-        """删除一个「我的角色」。
+        """删除一个「我的角色」= 从舞台撤走 + 彻底遗忘（2026-11-27 用户拍板）。
 
-        会同时从群员登记表、我的角色顺序表、以及**所有房间**的成员名单里移除它
-        —— 不然房间里会留一个查不到人的悬空成员。
+        ① 聊天室账本：成员表 / 角色顺序 / 所有房间名单（可逆的部分）；
+        ② 宿主库：通讯录 + 聊天流 + 消息 + 长期记忆（**不可逆**：用户口径
+           「删角色 = 彻底遗忘，删出孤儿数据还不如不删」）。
+
+        ⚠️ 清理失败**不静默**：写 ledger.report_error（前端提示栏可见）+ 插件日志，
+        返回报告里带 forget.ok / forget.errors，让用户明确知道没删干净。
         """
         member = self._member_map().get(member_id)
         if member is None:
             return {"ok": False, "error": f"角色不存在：{member_id}"}
         if member.get("kind") != "user_role":
             return {"ok": False, "error": "只能删除「我的角色」，Bot 群员不在这里管"}
+
+        # ① 账本层：先算出身份再删（删了 member 就拿不到 account 了）
+        account = str(member.get("account") or "")
+        platform = str(member.get("platform") or DEFAULT_PLATFORM)
+        display_name = str(member.get("display_name") or "")
         self._members.pop(member_id, None)
         self._my_role_order = [item for item in self._my_role_order if item != member_id]
         for room in self._rooms:
             if member_id in room.get("member_ids", []):
                 room["member_ids"].remove(member_id)
+
+        # ② 宿主层：彻底遗忘（遍历所有 Bot 实例的两张库）
+        forget_report: Dict[str, Any] = {"ok": True, "skipped": True}
+        if account:
+            forget_report = await self._forget_account(account, platform, display_name)
+
         return {
             "ok": True,
             "my_roles": self._my_role_list(),
             "rooms": self._rooms,
             "member_pool": [await self._resolve_member(item) for item in self._member_pool()],
+            "forget": forget_report,
         }
+
+    async def _forget_account(self, account: str, platform: str, display_name: str) -> Dict[str, Any]:
+        """按账号彻底遗忘：算 person_id/session_id → 收集别名 → 遍历两库清理。
+
+        同步 SQLite 全部走 ledger.run（线程池）⇒ 不阻塞事件循环。
+        失败写 error_report（前端可见）+ logger，返回报告。
+        """
+        workspace = self._workspace()
+        ledger = self._ledger()
+        if workspace is None:
+            return {"ok": False, "errors": ["找不到工作区根，无法清理宿主数据"], "skipped": False}
+        try:
+            person_id = hashlib.md5(f"{platform}_{account}".encode()).hexdigest()
+            session_id = hashlib.md5(f"{platform}_{account}_private".encode()).hexdigest()
+            bots = read_bots(workspace)
+            bot_dirs = [bot_working_dir(workspace, str(b.get("directory") or ".")) for b in bots]
+            if not bot_dirs:
+                bot_dirs = [Path(workspace)]
+
+            def _do() -> Dict[str, Any]:
+                # 别名从每个实例的库里捞（一号/二号昵称可能不同，取并集）
+                aliases: List[str] = [display_name]
+                alias_errors: List[str] = []
+                for work in bot_dirs:
+                    found, errs = forget.collect_aliases(
+                        memory_db=work / "data" / "a-memorix" / "metadata" / "metadata.db",
+                        main_db=work / "data" / "MaiBot.db",
+                        person_id=person_id, user_id=account,
+                    )
+                    for item in found:
+                        if item not in aliases:
+                            aliases.append(item)
+                    alias_errors.extend(errs)
+                res = forget.forget_account_all(
+                    workspace=Path(workspace), bot_dirs=bot_dirs,
+                    person_id=person_id, user_id=account, session_id=session_id,
+                    aliases=aliases,
+                )
+                if alias_errors:
+                    res["errors"].extend(alias_errors)
+                    res["ok"] = False
+                res["aliases"] = aliases
+                return res
+
+            if ledger is not None and hasattr(ledger, "run"):
+                report = await ledger.run(_do)
+            else:
+                report = _do()   # 兜底：无账本时同步跑（离线场景）
+        except Exception as exc:  # noqa: BLE001
+            report = {"ok": False, "errors": [f"彻底遗忘异常：{type(exc).__name__}: {exc}"]}
+
+        report["skipped"] = False
+        # ⚠️ 失败必须留痕：日志 + 共享账本（前端提示栏可见）
+        if not report.get("ok"):
+            reason = "；".join(str(e) for e in report.get("errors", []))[:500]
+            _log.error("[聊天室] 彻底遗忘失败（account=%s）：%s", account, reason)
+            if ledger is not None:
+                try:
+                    import uuid
+                    ledger.report_error({
+                        "report_id": f"forget_{uuid.uuid4().hex[:16]}",
+                        "bot_id": str(getattr(self._plugin, "_chatroom_bot_id", "") or ""),
+                        "kind": "forget_failed",
+                        "task": "彻底遗忘",
+                        "message": f"删除角色「{display_name}」({account}) 清理失败：{reason}",
+                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    _log.error("[聊天室] 写遗忘失败报告也失败：%r", exc)
+        else:
+            _log.info(
+                "[聊天室] 彻底遗忘完成（account=%s，别名=%s）：%s",
+                account, report.get("aliases"), report.get("counts"),
+            )
+        return report
 
     async def shell_create_room(self, name: str) -> Dict[str, Any]:
         """新建房间；只存在于内存，插件重载即消失。
@@ -1219,6 +1324,12 @@ class ChatroomService:
             "avatar": (avatar or "").strip() or ("🧑" if kind == "user_role" else "🤖"),
             "editable": kind == "user_role",
             "custom": True,
+            # ⚠️ 平台身份（2026-11-27 修复）：预置角色在 mock_data._IDENTITY 里写死了
+            #    platform/account，自建角色原来没这两项 ⇒ 发言时报「平台身份缺失」。
+            #    用 account_of(member_id) 推导（= user.custom_001），与预置口径一致；
+            #    member_id 一旦生成就不变 ⇒ 账号稳定，麦麦认成同一个人（不裂名片）。
+            "platform": DEFAULT_PLATFORM if kind == "user_role" else "",
+            "account": account_of(member_id) if kind == "user_role" else "",
         }
         self._members[member_id] = member
         if kind == "user_role":
@@ -1575,6 +1686,7 @@ class ChatroomService:
         use_mention: bool,
         mention_name_of: Any = None,
         deliver_texts: Optional[List[str]] = None,
+        seed_text: str = "",
     ) -> Dict[str, Any]:
         """把「一行一条发言」排成一轮并投递 —— **台词与旁白共用这一套**。
 
@@ -1590,6 +1702,11 @@ class ChatroomService:
         :param named_in_room: 显式点名的 member_id（旁白恒空 ⇒ 默认语义）
         :param use_mention: 是否给勾选者正文加 ``@显示名``（旁白恒 False）
         :param mention_name_of: 可选，按 member_id 取显示名的函数
+        :param deliver_texts: 段里展示原文、投递给 Bot 的正文（时光机=mk 命令）
+        :param seed_text: 可选，每条命令**之前**先排一条同身份的普通消息，
+             给 Planner 当 reply_target（2026-11-27：/mk 命令被标 is_command，
+             Planner 找不到真实消息 ⇒「没有可回复的真实消息」⇒ Bot 哑巴）。
+             种子走同一条 gateway（带 group_id）⇒ 进群聊流，不像 ctx.send.text 进私聊流。
         :returns: 排阵/建轮结果（seed / turn_id / expected_bots / waves ...）
         """
         # ① 排阵：默认语义 = 先 5% 沉默掷骰（全中重掷）再抽阵型（50/30/20）。
@@ -1645,6 +1762,32 @@ class ChatroomService:
                 # ⚠️ 时光机：段里展示剧情原文，递给 Bot 的却是拼好的 mk 命令
                 #    （deliver_texts 由调用方给；台词入口不给 ⇒ 沿用 line["text"]）。
                 body = str(deliver_texts[index]) if deliver_texts and index < len(deliver_texts) else line["text"]
+                # ⚠️ 群聊时光机：命令被宿主标 is_command ⇒ 不算 Planner 的 reply_target
+                #    ⇒「没有可回复的真实消息」⇒ Bot 哑巴。种子必须先于命令进**同一条群流**。
+                #    用与命令完全相同的身份/group_id，走同一条 gateway（worker 递话）。
+                #    collector 只收 bot(self/bot.) 的回复 ⇒ 旁白账号的种子不会被当假台词。
+                if seed_text and member_wave:
+                    for bot in bots:
+                        bot_member_id = str(bot.get("member_id") or "")
+                        if bot_member_id not in member_wave:
+                            continue
+                        ledger.enqueue_delivery(
+                            delivery_id=f"{segment_id}_seed{index}_{bot_member_id}",
+                            target_bot_id=str(bot.get("bot_id") or ""),
+                            content=seed_text,
+                            room_id=str(room["room_id"]),
+                            segment_id=segment_id,
+                            sender_member_id=str(line["member_id"]),
+                            sender_platform=str(line.get("platform") or DEFAULT_PLATFORM),
+                            sender_account=str(line.get("account") or ""),
+                            sender_nickname=str(line["display_name"]),
+                            group_id=group_id,
+                            group_name=str(room.get("name") or ""),
+                            seq=seq,
+                            turn_id="",
+                            wave=int(member_wave.get(bot_member_id, 0)),
+                        )
+                        seq += 1
                 for bot in bots:
                     bot_member_id = str(bot.get("member_id") or "")
                     if bot_member_id not in member_wave or bot_member_id not in allowed_speakers:
@@ -1676,7 +1819,10 @@ class ChatroomService:
         queued = await ledger.run(_do)
 
         # ④ 进行中轮次快照（状态条跨 iframe 重建恢复用）
-        await self._set_active_turn(turn_id, str(room["room_id"]), "调度：" + plan.label)
+        await self._set_active_turn(
+            turn_id, str(room["room_id"]), "调度：" + plan.label,
+            expected_bots=[str(x) for x in plan.speakers], segment_id=segment_id,
+        )
         return {
             "ok": True,
             "stage": "real",
@@ -1956,12 +2102,17 @@ class ChatroomService:
         anchor = float(anchor_ts or 0.0) or time.time()
         command_texts = narrator.build_mk_lines(clean_lines, anchor, number, unit, direction)
 
+        # ⚠️ 群聊旁白按房间独立身份（2026-11-27 用户拍板）：每个虚拟群一个账号
+        #    ⇒ 麦麦的长期记忆按 person_id 隔离，汤屋/学校的剧情互不串台。
+        #    member_id 仍用固定 "narrator"（账本/前端按 kind 认旁白，不靠 member_id 认人）。
         narrator_member = dict(NARRATOR)
+        narrator_member["account"] = narrator.narrator_account_for_room(str(room_id))
+        room_name = str(room.get("name") or "")
+        narrator_member["display_name"] = narrator.narrator_display_for_room(room_name)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         segment_id = f"seg_{int(time.time() * 1000)}"
-        # ⚠️ 旁白身份**永久固定**：平台/账号/昵称都从 NARRATOR 取，不查真名单
-        #    （改了会裂成两张名片）。它现在被当成「我的角色」的一句话 ⇒ 必须
-        #    跟台词走同一套排阵/建轮/投递，才不会again出现「不开阀⇒静默吞掉」。
+        # ⚠️ 旁白平台/账号/昵称按房间生成，不查真名单。它现在被当成「我的角色」
+        #    的一句话 ⇒ 必须跟台词走同一套排阵/建轮/投递，才不会again出现「不开阀⇒静默吞掉」。
         lines_for_plan = [
             {
                 "member_id": str(narrator_member["member_id"]),
@@ -1987,6 +2138,7 @@ class ChatroomService:
                 message_kind="narrator",
                 use_mention=False,
                 deliver_texts=command_texts,   # ★ 段里是剧情原文，投递给 Bot 的是 mk 命令
+                seed_text="（剧情时间已更新）",  # ★ 命令前先投普通消息当 Planner 的 reply_target
             )
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"写旁白投递失败：{exc}"}

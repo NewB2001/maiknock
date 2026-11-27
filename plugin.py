@@ -1512,18 +1512,19 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         # 自动绑定（0.2.3）：私聊里敲任何 /mk 命令 ⇒ 该流自动成为「麦麦主动找你」的目标，
         # 不再有手动绑定命令（PM 2026-11-23 拍板：能删的命令就删）。
         # 校验失败（拿不到私聊清单/不是私聊流）一律静默跳过，绝不挡命令。
-        # ⚠️ 时光机群发的命令（g1_narrator）不参与绑定——它是虚拟群，不是私聊。
+        # ⚠️ 时光机群发的命令（g1_narrator* —— 群聊旁白按房间独立账号，
+        #    每个账号都带 g1_narrator 前缀）不参与绑定——它是虚拟群，不是私聊。
         bind_note = ""
         parts = text.split(maxsplit=2)  # ["/mk", 子命令, 其余]
         sub = parts[1].lower() if len(parts) >= 2 else ""
         rest = parts[2].strip() if len(parts) >= 3 else ""
         # ⚠️ now 是纯读取：跳过 auto_bind（不写 bindings.json）
         _is_now = sub == "now"
-        if str(user_id or "") != "g1_narrator" and not _is_now:
+        if not str(user_id or "").startswith("g1_narrator") and not _is_now:
             bind_note = await self._auto_bind(stream_id, platform, user_id)
 
         if sub == "hi":
-            reply = await self._cmd_hi(rest, stream_id)
+            reply = await self._cmd_hi(rest, stream_id, user_id)
         elif sub in ("now", "add", "back", "set"):
             reply = await self._cmd_timeline(sub, rest, stream_id, user_id)
         else:
@@ -1541,7 +1542,9 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         #    否则「【MaiKnock】回退 2160 小时完成」那种回执会顶着 Bot 名片
         #    进聊天室时间线，盖掉正常剧情台词（2026-11-27 用户拍板）。
         #    用户在私聊手敲 /mk 仍是普通 user_id ⇒ 回执照常，习惯不变。
-        from_chatroom_narrator = str(user_id or "") == "g1_narrator"
+        # ⚠️ 群聊旁白按房间独立账号（g1_narrator_room_<房间id>）⇒ 用前缀识别，
+        #    精确等于会漏判，回执会顶着 Bot 名片进聊天流（踩过）。
+        from_chatroom_narrator = str(user_id or "").startswith("g1_narrator")
 
         if bind_note and not from_chatroom_narrator:
             reply = bind_note + "\n" + reply
@@ -1939,11 +1942,21 @@ class MaiKnockPlugin(_CHATROOM_BASE, MaiBotPlugin):
         self._write_json(self._RUNTIME_FILE, runtime)
         logger.info("[MaiKnock] 触发失败，已回滚锁位（stream=%s manual=%s）", target, manual)
 
-    async def _cmd_hi(self, rest: str, stream_id: str) -> str:
+    async def _cmd_hi(self, rest: str, stream_id: str, user_id_hint: str = "") -> str:
         state = self._load_state()
         target = stream_id or str(state.get("bound_stream_id") or "")
         if not target:
             return "触发失败：找不到目标聊天流。请在 WebUI 私聊窗口里执行 /mk hi"
+
+        # ⚠️ 聊天室时光机「不选时间」⇒ /mk hi 命令（比如 /mk hi 大家正在一起聚餐）。
+        #    命令消息被宿主标 is_command ⇒ 不算 Planner 的 reply_target ⇒ 报
+        #    「Planner 请求快照中没有可回复的真实消息」⇒ Bot 哑巴（2026-11-27 实测）。
+        #    跟 _cmd_timeline 同款修法：触发前投一条中性种子消息当 target。
+        #    collector 按精确文本跳过它 ⇒ 不当假台词、不提前收尾。
+        #    真人手敲 WebUI 私聊的 /mk hi（internal_account:*）不需要——命令自己就是 target。
+        if str(user_id_hint or "").startswith("user.") or str(user_id_hint or "").startswith("g1_narrator"):
+            if not await self._send_text("（剧情时间已更新）", target):
+                return "触发失败：种子消息投递失败（聊天室流需要一条真实消息当回复目标）"
 
         # 0.3.2 起 /mk hi 不再设冷却（PM 拍板：手动技能不该有冷却）；
         # 防叠触发靠 pending 锁位 + 回读窗口（_do_proactive_trigger 原有）。

@@ -2329,7 +2329,40 @@
   }
 
   function deleteMyRole(memberId) {
-    myRoleAction("delete_my_role", { member_id: memberId });
+    var member = memberById(memberId);
+    var name = member ? member.display_name : "这个角色";
+    // ⚠️ 彻底遗忘不可恢复（2026-11-27 用户拍板）：删角色 = 舞台撤走 + 宿主记忆清空，
+    //    没有归档、没有恢复入口。确认文案必须说清，别让用户以为能反悔。
+    askConfirm(
+      "彻底删除角色「" + name + "」",
+      "这会从聊天室移除该角色，并清空麦麦对它的通讯录、聊天流、历史消息和长期记忆（含提到它的所有剧情段落）。此操作不可恢复，删完无法复活。确定继续吗？",
+      function () {
+        window.maibot.action("delete_my_role", { member_id: memberId }).then(function (result) {
+          var failure = businessError(result);
+          if (failure) { showError("删除角色失败：" + failure); return; }
+          applyMemberResult(result);
+          clearError();
+          renderMyRoles();
+          renderPrivatePeers();
+          renderPrivateSpeaker();
+          renderMembers();
+          renderSpeakerChecks();
+          updateTurnHint();
+          renderScriptRows();
+          renderTimeline();
+          // ⚠️ 清理失败必须让用户看见（后端也会写 error_report，这里是即时反馈）
+          var forget = result.forget || {};
+          if (forget.skipped) {
+            showError("角色已从聊天室移除，但该账号没有平台身份，宿主数据未清理。");
+          } else if (!forget.ok) {
+            var reasons = (forget.errors || []).join("；").slice(0, 200);
+            showError("角色已移除，但宿主数据清理失败：" + reasons + "（详情已记入错误报告，可重试删除或手动处理）");
+          }
+        }).catch(function (error) {
+          showError("删除角色失败：" + error.message);
+        });
+      }
+    );
   }
 
   function saveMyRoleName(memberId, value) {
@@ -2803,12 +2836,14 @@
       empty.className = "empty";
       empty.textContent = "这个房间还没有台词。写一幕「选角色 + 台词」，点「发送消息」试试。";
       box.appendChild(empty);
+      renderTruncateBubble("group");   // 重绘后恢复「回到此处」确认气泡（轮询兜底会重绘）
       return;
     }
     segments.forEach(function (segment, index) {
       box.appendChild(segmentElement(segment, index, "group"));
     });
     if (saved === null) { scrollToBottom(box); } else { box.scrollTop = saved; }
+    renderTruncateBubble("group");     // ⚠️ 任何重绘都要恢复气泡：8s 低频拉时间线会冲掉它
   }
 
   // 一段的 DOM：分隔线 + 这段的所有消息
@@ -2856,8 +2891,9 @@
 
   // 确认气泡挂在对应分隔线的后面
   function renderScope(scope, keepScroll) {
+    // 气泡重建已并入 renderTimeline/renderPrivate 末尾 —— 所有重绘路径都能恢复，
+    // 不再只靠 renderScope 这一条（轮询的 loadRoomTimeline 直接调 renderTimeline 会冲掉气泡）。
     if (scope === "private") { renderPrivate(keepScroll); } else { renderTimeline(keepScroll); }
-    renderTruncateBubble(scope);
   }
 
   function renderTruncateBubble(scope) {
@@ -3059,12 +3095,14 @@
           ? "和「" + peer.display_name + "」还没有聊天记录。"
           : "还没有私聊线程。");
       box.appendChild(empty2);
+      renderTruncateBubble("private");  // 同群聊：重绘后恢复确认气泡
       return;
     }
     segments.forEach(function (segment, index) {
       box.appendChild(segmentElement(segment, index, "private"));
     });
     if (saved === null) { scrollToBottom(box); } else { box.scrollTop = saved; }
+    renderTruncateBubble("private");    // ⚠️ 任何重绘都要恢复气泡
   }
 
   // 「最近和当前操作角色聊过」的时间：取该线程最后一条消息的 time（HH:MM），
@@ -3504,11 +3542,43 @@
       for (var i = segs.length - 1; i >= 0; i -= 1) {
         if (!segs[i].voided) { last = segs[i]; break; }
       }
-      if (last && (last.messages || []).some(function (m) { return m.kind === "reply"; })) {
+      // ⚠️ 收尾判定跟 pollRealBeat 一致（2026-11-27 修复）：按 expected_bots
+      //    全员到齐才算本轮结束。旧逻辑「最后一段有任意 reply 就 break」会在
+      //    重载页面后把还没开口的 Bot 误判掉（小樱回了、雏田没回 ⇒ 提前提示结束）。
+      var mine = (state.timeline[roomId] || []).filter(function (s) {
+        return s.voided ? false : (state.turn && state.turn.segment_id
+          ? s.segment_id === state.turn.segment_id : true);
+      });
+      var replied = {};
+      mine.forEach(function (s) {
+        (s.messages || []).forEach(function (m) {
+          if (m.kind === "reply") { replied[m.speaker_member_id] = true; }
+        });
+      });
+      var expected = (state.turn && state.turn.expected) || [];
+      var allReplied = expected.length > 0 && expected.every(function (id) { return replied[id]; });
+      if (allReplied) { break; }
+      // 老快照没带 expected_bots ⇒ 回退到「任意 reply 即收尾」，避免一直等到 600s
+      if (!expected.length && last && (last.messages || []).some(function (m) { return m.kind === "reply"; })) {
         break;
       }
     }
-    finishTurn(token, token === state.turnToken ? "本轮结束。" : null);
+    var _missing = false;
+    if (state.turn && token === state.turnToken) {
+      var _expected = state.turn.expected || [];
+      var _mineLate = (state.timeline[roomId] || []).filter(function (s) {
+        return s.voided ? false : (state.turn.segment_id ? s.segment_id === state.turn.segment_id : true);
+      });
+      var _repliedLate = {};
+      _mineLate.forEach(function (s) {
+        (s.messages || []).forEach(function (m) {
+          if (m.kind === "reply") { _repliedLate[m.speaker_member_id] = true; }
+        });
+      });
+      _missing = _expected.length > 0 && _expected.some(function (id) { return !_repliedLate[id]; });
+    }
+    finishTurn(token, token !== state.turnToken ? null
+      : (_missing ? "本轮接话已超时，部分角色未回复；晚到的回复仍会显示。" : "本轮接话已结束，可以开始下一幕。"));
   }
 
   async function submitPrivate() {
@@ -3873,12 +3943,16 @@
     return state.currentView === "private" ? $("private-script-error") : $("script-error");
   }
 
-  function setNotice(box, kind, text) {
+  // source: "user"（用户操作提示，如「已经有叫佐助的角色了」）/ "upstream"（上游错误轮询）
+  // ⚠️ 两类共用一个 DOM 节点，但**不能互相清掉**：8s 的 pollErrors 拉到空错误列表时
+  //    只清自己写的 upstream 提示，不许把用户操作提示顺手清掉（2026-11-27 修复）。
+  function setNotice(box, kind, text, source) {
     if (!box) { return; }
     box.classList.remove("err", "ok");
     box.classList.add("head-notice", kind);
     box.textContent = text;
     box.title = text;
+    box.dataset.noticeSource = source || "user";
     box.hidden = false;
   }
 
@@ -3887,6 +3961,7 @@
     box.hidden = true;
     box.textContent = "";
     box.title = "";
+    delete box.dataset.noticeSource;
   }
 
   function showError(text) {
@@ -3914,13 +3989,21 @@
 
   function renderErrorNotice() {
     var errs = state.errors || [];
-    if (!errs.length) { clearError(); return; }
+    if (!errs.length) {
+      // ⚠️ 只清「上游错误」自己写的提示；用户操作提示（重名/参数错等）要常驻，
+      //    直到被新消息顶掉或用户点掉——不许被 8s 轮询误清（2026-11-27 修复）。
+      ["script-error", "private-script-error"].forEach(function (id) {
+        var box = $(id);
+        if (box && box.dataset.noticeSource === "upstream") { clearNotice(box); }
+      });
+      return;
+    }
     var latest = errs[0] || {};
     var text = latest.text || ("上游出错：" + (latest.kind || "未知错误"));
     if (errs.length > 1) {
       text = text + "（另有 " + (errs.length - 1) + " 条同类报错）";
     }
-    setNotice(errorBox(), "err", text);
+    setNotice(errorBox(), "err", text, "upstream");
   }
 
   async function ackErrors() {
@@ -4120,6 +4203,8 @@
           turn_id: activeTurn.turn_id,
           strategy_label: activeTurn.label || "等待接话",
           started_at: activeTurn.started_ms,
+          expected: activeTurn.expected_bots || [],   // 收尾要按「本轮该回的 Bot」全员到齐判定
+          segment_id: activeTurn.segment_id || "",
           silenced: [],
           ordered: [],
           real: true,

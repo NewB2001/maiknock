@@ -101,6 +101,28 @@ def build_narrator_texts(
     return clean
 
 
+#: 群聊旁白账号前缀（每个房间一个固定身份 ⇒ 长期记忆互不串台）。
+#: ⚠️ 前缀必须保留 ``g1_narrator`` —— plugin.py 用它识别「时光机命令」：
+#:    静默回执 + 跳过 auto_bind；改了前缀会把「【MaiKnock】…」回执顶进聊天流。
+NARRATOR_ROOM_ACCOUNT_PREFIX = "g1_narrator_room_"
+
+
+def narrator_account_for_room(room_id: str) -> str:
+    """房间 id → 该房间专属的旁白账号（群聊）。
+
+    ⚠️ 一个房间一个固定账号：麦麦按 ``md5(平台_账号)`` 认人 ⇒
+    房间之间不会互相记得对方的剧情（不串台）。账号一旦定下就别改，
+    改了等于换人、又裂一张名片（02 文档「平台身份固定」铁则）。
+    """
+    return f"{NARRATOR_ROOM_ACCOUNT_PREFIX}{room_id}"
+
+
+def narrator_display_for_room(room_name: str) -> str:
+    """房间名 → 旁白显示名：``【群聊】<房间名>的旁白``。"""
+    name = str(room_name or "").strip() or "未命名房间"
+    return f"【群聊】{name}的旁白"
+
+
 def duration_seconds(number: Any, unit: str) -> float:
     """把「数字 + 单位」换成秒。单位只认 日/时/分/秒（或 d/h/m/s）。
 

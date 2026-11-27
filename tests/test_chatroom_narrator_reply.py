@@ -9,8 +9,9 @@
    （旧实现 turn_id="" ⇒ 不开阀 ⇒ 宿主频率 0 时旁白被静默吞掉）；
 ② 旁白走**默认语义**：无勾选 ⇒ 5% 沉默掷骰 + 阵型随机（跟剧本窗口啥也不勾同款）；
 ③ 旁白**不带 @**（它是「我的角色」发的寻常消息，不是点名）；
-④ 旁白段类型仍是 plot、发言人仍是固定身份 g1_narrator（不裂名片）；
-⑤ 超窗按 timeout 收口 ⇒ 进 collector 的 30 分钟宽限期（迟到回复不丢）。
+④ 旁白段类型仍是 plot、发言人仍是固定 member_id=narrator（账本按 kind 认人）；
+⑤ 超窗按 timeout 收口 ⇒ 进 collector 的 30 分钟宽限期（迟到回复不丢）；
+⑥ 群聊旁白按房间独立账号：每房间一个 person_id（不串台），显示名带房间名。
 """
 from __future__ import annotations
 
@@ -25,7 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chatroom import formation  # noqa: E402
 from chatroom.ledger import ChatroomLedger  # noqa: E402
 from chatroom.mock_data import NARRATOR  # noqa: E402
-from chatroom.narrator import build_narrator_texts  # noqa: E402
+from chatroom.narrator import (  # noqa: E402
+    build_narrator_texts,
+    narrator_account_for_room,
+    narrator_display_for_room,
+)
 
 FAILED: list[str] = []
 
@@ -55,7 +60,19 @@ async def main() -> int:
     texts = build_narrator_texts(["木叶村的集会广场上……", "谁都没说话"], 3, "日")
     check("相对时间并进第一条", texts[0].startswith("三天后，"), texts[0])
     check("第二条原样", texts[1] == "谁都没说话", texts[1])
-    check("固定身份账号 g1_narrator", NARRATOR["account"] == "g1_narrator")
+
+    print("== 2b. 群聊旁白按房间独立身份（不串台）==")
+    acct_a = narrator_account_for_room("room_mock_tangwu")
+    acct_b = narrator_account_for_room("room_mock_school")
+    check("每房间账号不同", acct_a != acct_b, f"{acct_a} / {acct_b}")
+    check("账号带 g1_narrator 前缀（命令识别用）",
+          all(a.startswith("g1_narrator") for a in (acct_a, acct_b)))
+    check("同房间账号稳定", acct_a == narrator_account_for_room("room_mock_tangwu"))
+    check("显示名带房间名",
+          narrator_display_for_room("汤屋") == "【群聊】汤屋的旁白",
+          narrator_display_for_room("汤屋"))
+    check("空房间名有兜底", "旁白" in narrator_display_for_room(""))
+    check("NARRATOR 基座的 member_id 不变", NARRATOR["member_id"] == "narrator")
 
     print("== 3. 建轮 + 带 wave 的投递 ⇒ worker 认在途、开阀 ==")
     with tempfile.TemporaryDirectory() as tmp:
@@ -85,8 +102,8 @@ async def main() -> int:
             led.enqueue_delivery(
                 f"{segment_id}_d{i}", "bot_v", texts[0], room_id=room_id,
                 segment_id=segment_id, sender_member_id=NARRATOR["member_id"],
-                sender_platform=NARRATOR["platform"], sender_account=NARRATOR["account"],
-                sender_nickname=NARRATOR["display_name"],
+                sender_platform=NARRATOR["platform"], sender_account=acct_a,
+                sender_nickname=narrator_display_for_room("汤屋"),
                 group_id=group_id, seq=i, turn_id=turn_id, wave=0,
             )
         rows = led.turn_deliveries(turn_id)
@@ -106,6 +123,7 @@ async def main() -> int:
         check("旁白超窗记 timeout", n == 2, f"实际 {n}")
         grace = led.recent_collect_targets("bot_v", within_seconds=1800.0)
         check("★ 迟到的旁白回复仍在宽限期里", len(grace) == 2, f"实际 {len(grace)}")
+        led.close()   # Windows 上不关连接 ⇒ 临时目录删 t.db 会被锁住（退出码假失败）
 
     print("\n=== 全部通过 ===" if not FAILED else f"\n=== 失败 {len(FAILED)} 项 ===")
     return 1 if FAILED else 0
